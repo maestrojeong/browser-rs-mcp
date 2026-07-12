@@ -58,15 +58,26 @@ const click = await send("tools/call", {
   name: "browser_click",
   arguments: { page: "p1", ref: "e1" },
 });
-console.log("--- browser_click ---");
-console.log(click.result?.content?.[0]?.text || JSON.stringify(click.error));
+const clickResult = click.result?.content?.[0]?.text || JSON.stringify(click.error);
+console.log("--- browser_click (with settle-diff) ---");
+console.log(clickResult.split("\n").slice(0, 8).join("\n"));
 
 const url = await send("tools/call", {
   name: "browser_evaluate",
   arguments: { page: "p1", expression: "location.href" },
 });
-console.log("--- location after click ---");
+console.log("--- location after click (settle-diff shown above) ---");
 console.log(url.result?.content?.[0]?.text || JSON.stringify(url.error));
+
+const fp = await send("tools/call", {
+  name: "browser_fingerprint_check",
+  arguments: { page: "p1" },
+});
+console.log("--- fingerprint check ---");
+console.log(fp.result?.content?.[0]?.text || JSON.stringify(fp.error));
+
+console.log("=== click settle-diff (raw) ===");
+console.log((clickResult || "").split("\n").slice(0, 10).join("\n"));
 
 child.kill();
 process.exit(0);

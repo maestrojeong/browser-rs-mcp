@@ -61,6 +61,8 @@ impl Default for LaunchOptions {
 pub struct Browser {
     client: CdpClient,
     child: Child,
+    /// UA with the "Headless" token stripped, applied to every new page.
+    user_agent: String,
     _user_data_dir: Option<tempfile::TempDir>,
 }
 
@@ -123,9 +125,19 @@ impl Browser {
             )
             .await?;
 
+        // Fetch the real UA and strip the "Headless" token (a common tell).
+        let user_agent = client
+            .send("Browser.getVersion", json!({}))
+            .await
+            .ok()
+            .and_then(|v| v.get("userAgent").and_then(Value::as_str).map(String::from))
+            .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
+            .unwrap_or_default();
+
         Ok(Self {
             client,
             child,
+            user_agent,
             _user_data_dir: tmp,
         })
     }
@@ -161,6 +173,9 @@ impl Browser {
             target_id,
         };
         page.init_stealth().await?;
+        if !self.user_agent.is_empty() {
+            page.set_user_agent(&self.user_agent).await?;
+        }
         if !url.is_empty() && url != "about:blank" {
             page.navigate(url).await?;
         }
@@ -194,6 +209,18 @@ impl Page {
                 &self.session_id,
                 "Page.addScriptToEvaluateOnNewDocument",
                 json!({ "source": stealth::STEALTH_INIT_SCRIPT }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Override the User-Agent for this page (session-scoped, not page-visible).
+    pub async fn set_user_agent(&self, ua: &str) -> Result<()> {
+        self.client
+            .send_on(
+                &self.session_id,
+                "Emulation.setUserAgentOverride",
+                json!({ "userAgent": ua }),
             )
             .await?;
         Ok(())
@@ -424,6 +451,36 @@ impl Page {
             )
             .await?;
         Ok(())
+    }
+
+    /// Wait for the page to settle after an action: if a navigation starts,
+    /// wait for its load; otherwise apply a short DOM grace period. This is the
+    /// cheap "did something happen" signal the act tools read back.
+    pub async fn settle(&self) {
+        let mut rx = self.client.events();
+        let sid = self.session_id.clone();
+        // Phase 1: within a short window, detect whether a navigation began.
+        let detected = tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) if ev.session_id.as_deref() == Some(&sid) => match ev.method.as_str() {
+                        "Page.loadEventFired" => return Some(true),
+                        "Page.frameStartedLoading" | "Page.frameRequestedNavigation"
+                        | "Page.navigatedWithinDocument" => return Some(false),
+                        _ => {}
+                    },
+                    Ok(_) => {}
+                    Err(_) => return None,
+                }
+            }
+        })
+        .await;
+
+        match detected {
+            Ok(Some(true)) => {}                        // already loaded
+            Ok(Some(false)) => self.wait_for_load().await.unwrap_or(()), // nav in flight
+            _ => tokio::time::sleep(Duration::from_millis(350)).await, // no nav: DOM grace
+        }
     }
 
     /// Press a single named key (e.g. "Enter", "Tab", "Escape").
