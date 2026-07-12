@@ -15,15 +15,48 @@ capability* — the browser an agent can actually use well.
 | Browser control | Playwright abstraction | **raw CDP** over one multiplexed WebSocket |
 | CDP domain control | library decides | **we do** — never send `Runtime.enable` (the #1 automation tell) |
 | Agent view | HTML / DOM dump | **accessibility snapshot** with `[ref=eN]` handles |
-| Stealth | runtime patching of stock binary | launch flags + pre-document injection, source-patchable later |
+| Stealth | don't fake it — **be a real browser** | headful + real profile + no JS patching (patchright philosophy) |
 | Serving | MCP | **MCP only** (stdio + streamable HTTP) |
 | License | — | **Apache-2.0** |
 
 ## Design in one line
 
-> Never enable the detectable CDP domains. Drive the browser through raw CDP,
-> hand the agent a token-efficient accessibility tree, keep the whole hot path
-> in Rust.
+> Don't patch the leaks — don't create them. Run a real headful Chrome with a
+> real profile and touch nothing on the page, never enable the detectable CDP
+> domains, and hand the agent a token-efficient accessibility tree — all in Rust.
+
+## Stealth philosophy: be a real browser
+
+The reliable way to be undetectable is to **not differ from a human's Chrome in
+the first place**. Injecting JS to override `navigator.webdriver`,
+`Function.prototype.toString`, `screen`, WebGL, `deviceMemory`, etc. passes naive
+detectors but each override is itself an anomaly — and an *inconsistent* one
+(e.g. a clamped `deviceMemory` that no longer matches the real machine). Advanced
+defenses (Akamai, Kasada, DataDome) flag exactly those abnormal combinations.
+
+So by default agent-browser:
+
+- runs **headful** on real hardware (headless is the single biggest tell),
+- uses a **persistent real profile** (aged cookies/history look human; a fresh
+  temp profile every run does not),
+- **injects nothing** into the page — the fingerprint is a real Chrome's because
+  it *is* one,
+- only sets the `AutomationControlled` launch flag (so `navigator.webdriver` is
+  natively false) and never enables the `Runtime`/`Console` CDP domains.
+
+Result: it passes [bot.sannysoft.com](https://bot.sannysoft.com) with **0
+failures without touching a single page property**.
+
+### Modes
+
+| Mode | How | Fingerprint |
+|---|---|---|
+| **Default** | headful launch, persistent profile, no patching | a real Chrome's |
+| **Connect** (strongest) | `AB_CONNECT=9222` → attach to a Chrome you launched with `--remote-debugging-port=9222` | *literally your everyday browser* |
+| **Headless fallback** | `AB_HEADLESS=1 AB_STEALTH=1` → opt-in JS patch layer | best-effort; use only where headful is impossible |
+
+Env: `AB_PROFILE=<dir>` sets the profile location; `AB_CHROME=<path>` picks the
+browser.
 
 ## Status
 
@@ -76,12 +109,12 @@ cargo run -p ab-browser --example smoke -- https://example.com
 ## Stealth benchmark (browser + detector co-evolve)
 
 The repo ships its own **bot detector** — a single page whose only job is to
-detect automation — plus a runner that drives agent-browser against it and
-grades the result. They grow together: a new detector check that fails must be
-met by a stealth fix **in the same commit**. CI gates on it.
+detect automation — plus two runners. They grow together: a new detector check
+that fails must be met by a fix **in the same commit**. CI gates on it.
 
 ```bash
-node bench/run.mjs target/release/agent-browser
+node bench/run.mjs target/release/agent-browser        # headless fallback layer (CI gate)
+node bench/external.mjs target/release/agent-browser   # default headful mode vs bot.sannysoft.com
 ```
 
 ```
@@ -107,13 +140,12 @@ GPU-less CI). The CDP-console probe stays **informational** — reliable CDP
 self-detection from JS doesn't exist; agent-browser's defense is architectural
 (it never enables the Runtime/Console domains).
 
-## How the stealth works
+## Headless fallback patch layer
 
-The guiding rule is **stealth by omission**: the strongest CDP tell (enabling the
-`Runtime`/`Console` domains) is simply never sent. `Runtime.evaluate` works
-one-shot without `enable`; the accessibility tree needs only
-`Accessibility.enable`, which the page cannot observe. On top of that, a small
-pre-document script normalizes the residual signals a page can read:
+In the default headful mode none of this is needed — the values below are all
+naturally correct. But when you're forced to run headless (`AB_HEADLESS=1
+AB_STEALTH=1`), an opt-in pre-document script normalizes the signals headless
+Chrome gets wrong. It's a best-effort compromise, not the recommended path:
 
 | Signal a site reads | Headless / automated tell | What agent-browser does |
 |---|---|---|
@@ -129,7 +161,8 @@ pre-document script normalizes the residual signals a page can read:
 | hooked fn `.toString()` | reveals JS source | masked as `[native code]` |
 | CDP `Runtime.enable` | detectable | never sent (architectural) |
 
-Every row is guarded by the `bench/` detector so a regression turns CI red.
+Every row is guarded by the `bench/` detector (run in fallback mode) so a
+regression turns CI red.
 
 ## Layout (monorepo)
 

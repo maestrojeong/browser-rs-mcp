@@ -124,6 +124,24 @@ struct EvalArgs {
     expression: String,
 }
 
+/// Build the browser per environment. Default: headful, real profile, no JS
+/// patching (fingerprint == a real human Chrome). Overrides:
+///   AB_CONNECT=<port>  attach to a Chrome the user already launched (strongest)
+///   AB_HEADLESS=1      run headless (a tell; enable AB_STEALTH to compensate)
+///   AB_STEALTH=1       inject the JS stealth-patch fallback (headless only)
+///   AB_PROFILE=<dir>   persistent profile location
+async fn make_browser() -> ab_browser::Result<Browser> {
+    if let Ok(port) = std::env::var("AB_CONNECT") {
+        return Browser::connect(port.trim().parse().unwrap_or(9222)).await;
+    }
+    Browser::launch(LaunchOptions {
+        headless: std::env::var("AB_HEADLESS").is_ok(),
+        inject_stealth: std::env::var("AB_STEALTH").is_ok(),
+        ..Default::default()
+    })
+    .await
+}
+
 fn ok(s: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(s.into())])
 }
@@ -198,9 +216,7 @@ impl BrowserServer {
     ) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().await;
         if st.browser.is_none() {
-            let b = Browser::launch(LaunchOptions::default())
-                .await
-                .map_err(fail)?;
+            let b = make_browser().await.map_err(fail)?;
             st.browser = Some(b);
         }
         let page = st

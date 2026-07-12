@@ -12,7 +12,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const bin = process.argv[2] || resolve(here, "../target/release/agent-browser");
 const detector = "file://" + resolve(here, "detector.html");
 
-const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
+// This bench validates the *headless injection fallback* (AB_STEALTH), which
+// must be deterministic across machines/CI. The recommended default mode is
+// headful with no injection — proven against a real detector by external.mjs.
+const child = spawn(bin, [], {
+  stdio: ["pipe", "pipe", "inherit"],
+  env: { ...process.env, AB_HEADLESS: "1", AB_STEALTH: "1" },
+});
 let buf = "";
 const waiters = new Map();
 child.stdout.on("data", (d) => {

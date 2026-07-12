@@ -23,11 +23,17 @@ delivered as a lean Rust MCP server driving stock Chrome.
 
 1. **Raw CDP > Playwright** for both performance and control. One WebSocket
    multiplexes the browser target and every page session ("flatten" mode).
-2. **Stealth by omission.** The strongest automation tell Patchright removes is
-   `Runtime.enable` / `Console.enable`. We simply never send them. `Runtime.evaluate`
-   works one-shot without `enable`; the accessibility tree needs only
-   `Accessibility.enable` (not page-visible). Nothing to hide because nothing
-   detectable was turned on.
+2. **Be a real browser, don't fake one.** The reliable path to an undetectable
+   fingerprint is to not differ from a human's Chrome at all: run **headful**
+   with a **persistent real profile** and inject **nothing** into the page.
+   Overriding properties from JS (webdriver, toString, screen, WebGL,
+   deviceMemory) passes naive detectors but creates anomalous, mutually
+   inconsistent combinations that advanced defenses flag. On top of that,
+   **stealth by omission** at the protocol level: never send the detectable
+   `Runtime.enable` / `Console.enable` (`Runtime.evaluate` works one-shot
+   without `enable`; the accessibility tree needs only the non-page-visible
+   `Accessibility.enable`). The JS patch layer still exists but is an opt-in
+   *headless fallback*, not the default.
 3. **The agent's world model is the accessibility tree,** not raw HTML. It is
    smaller (fewer tokens), more stable across re-renders, and maps cleanly to
    "act by ref". Interactive nodes carry `[ref=eN]` → backendDOMNodeId.

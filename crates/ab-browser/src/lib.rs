@@ -36,8 +36,17 @@ pub type Result<T> = std::result::Result<T, BrowserError>;
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
+    /// Headless is a strong fingerprint tell. Off by default — a real headful
+    /// window on real hardware is what makes the fingerprint match a human's.
     pub headless: bool,
+    /// Inject the JS stealth-patching layer. Off by default: patching each
+    /// property is itself an anomaly that sophisticated defenses flag. Only
+    /// turn this on as a best-effort fallback when forced to run headless.
+    pub inject_stealth: bool,
     pub chrome_path: Option<PathBuf>,
+    /// Persistent profile directory. A stable, aged profile (cookies, history)
+    /// looks human; a fresh temp profile every run is itself suspicious. When
+    /// None, a persistent per-user default is used (not a temp dir).
     pub user_data_dir: Option<PathBuf>,
     pub port: u16,
     pub extra_args: Vec<String>,
@@ -47,7 +56,8 @@ pub struct LaunchOptions {
 impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
-            headless: true,
+            headless: false,
+            inject_stealth: false,
             chrome_path: None,
             user_data_dir: None,
             port: 0, // 0 => let Chrome pick, we read it back from DevToolsActivePort
@@ -60,10 +70,11 @@ impl Default for LaunchOptions {
 /// The browser process + CDP client.
 pub struct Browser {
     client: CdpClient,
-    child: Child,
-    /// UA with the "Headless" token stripped, applied to every new page.
+    child: Option<Child>,
+    /// UA override applied to new pages (only set in headless+stealth mode).
     user_agent: String,
-    _user_data_dir: Option<tempfile::TempDir>,
+    /// Whether to inject the JS stealth-patching layer into new pages.
+    inject_stealth: bool,
 }
 
 impl Browser {
@@ -72,6 +83,11 @@ impl Browser {
     }
 
     /// Launch Chrome and connect over CDP.
+    ///
+    /// Default mode is headful with a persistent profile and NO JS patching, so
+    /// the page's fingerprint is that of a real, human-driven Chrome. Only the
+    /// `AutomationControlled` blink feature is disabled (a launch flag, not a
+    /// page-visible patch) so `navigator.webdriver` is naturally false.
     pub async fn launch(opts: LaunchOptions) -> Result<Self> {
         let chrome = opts
             .chrome_path
@@ -79,15 +95,10 @@ impl Browser {
             .or_else(detect_chrome)
             .ok_or(BrowserError::ChromeNotFound)?;
 
-        let tmp = if opts.user_data_dir.is_none() {
-            Some(tempfile::TempDir::new().map_err(|e| BrowserError::Launch(e.to_string()))?)
-        } else {
-            None
+        let data_dir = match &opts.user_data_dir {
+            Some(d) => d.clone(),
+            None => default_profile_dir()?,
         };
-        let data_dir = opts
-            .user_data_dir
-            .clone()
-            .unwrap_or_else(|| tmp.as_ref().unwrap().path().to_path_buf());
 
         let mut args: Vec<String> = vec![
             format!("--remote-debugging-port={}", opts.port),
@@ -98,7 +109,7 @@ impl Browser {
         if opts.headless {
             args.push("--headless=new".to_string());
         }
-        args.extend(stealth::stealth_flags());
+        args.extend(stealth::launch_flags());
         args.extend(opts.extra_args.clone());
         // Extra flags from the environment (e.g. `--no-sandbox` when running as
         // root in CI/containers). Space-separated.
@@ -122,28 +133,48 @@ impl Browser {
         info!("connecting to devtools: {ws_url}");
         let client = CdpClient::connect(&ws_url).await?;
 
-        // Enable target auto-attach so page sessions are ready in flatten mode.
         client
-            .send(
-                "Target.setDiscoverTargets",
-                json!({ "discover": true }),
-            )
+            .send("Target.setDiscoverTargets", json!({ "discover": true }))
             .await?;
 
-        // Fetch the real UA and strip the "Headless" token (a common tell).
-        let user_agent = client
-            .send("Browser.getVersion", json!({}))
-            .await
-            .ok()
-            .and_then(|v| v.get("userAgent").and_then(Value::as_str).map(String::from))
-            .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
-            .unwrap_or_default();
+        // A UA override is only needed to hide the "Headless" token, i.e. only
+        // when we're forced to run headless. Headful reports a real UA.
+        let user_agent = if opts.inject_stealth && opts.headless {
+            client
+                .send("Browser.getVersion", json!({}))
+                .await
+                .ok()
+                .and_then(|v| v.get("userAgent").and_then(Value::as_str).map(String::from))
+                .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         Ok(Self {
             client,
-            child,
+            child: Some(child),
             user_agent,
-            _user_data_dir: tmp,
+            inject_stealth: opts.inject_stealth,
+        })
+    }
+
+    /// Attach to a Chrome the user is already running with
+    /// `--remote-debugging-port=<port>`. This is the strongest identity mode:
+    /// the fingerprint is exactly that of the user's own everyday browser,
+    /// because it *is* their browser. No process is spawned or killed by us.
+    pub async fn connect(port: u16) -> Result<Self> {
+        let ws_url = discover_ws_url(port).await?;
+        info!("attaching to existing chrome: {ws_url}");
+        let client = CdpClient::connect(&ws_url).await?;
+        client
+            .send("Target.setDiscoverTargets", json!({ "discover": true }))
+            .await?;
+        Ok(Self {
+            client,
+            child: None,
+            user_agent: String::new(),
+            inject_stealth: false,
         })
     }
 
@@ -177,9 +208,12 @@ impl Browser {
             session_id,
             target_id,
         };
-        page.init_stealth().await?;
-        if !self.user_agent.is_empty() {
-            page.set_user_agent(&self.user_agent).await?;
+        // No page patching by default: an untouched real Chrome is the goal.
+        if self.inject_stealth {
+            page.init_stealth().await?;
+            if !self.user_agent.is_empty() {
+                page.set_user_agent(&self.user_agent).await?;
+            }
         }
         if !url.is_empty() && url != "about:blank" {
             page.navigate(url).await?;
@@ -187,10 +221,12 @@ impl Browser {
         Ok(page)
     }
 
-    /// Terminate the browser process.
+    /// Terminate the browser process (only if we launched it; connect() no-op).
     pub async fn close(mut self) {
         let _ = self.client.send("Browser.close", json!({})).await;
-        let _ = self.child.kill().await;
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill().await;
+        }
     }
 }
 
@@ -561,6 +597,22 @@ impl Page {
         }
         Ok(())
     }
+}
+
+/// Persistent per-user profile directory (aged profiles look human). Override
+/// with `AB_PROFILE`. We deliberately avoid a throwaway temp dir.
+fn default_profile_dir() -> Result<PathBuf> {
+    let base = std::env::var("AB_PROFILE")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".agent-browser").join("profile"))
+        })
+        .ok_or_else(|| BrowserError::Launch("cannot resolve profile dir; set AB_PROFILE".into()))?;
+    std::fs::create_dir_all(&base).map_err(|e| BrowserError::Launch(e.to_string()))?;
+    Ok(base)
 }
 
 fn detect_chrome() -> Option<PathBuf> {

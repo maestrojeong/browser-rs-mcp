@@ -11,8 +11,12 @@
 //! done **without** calling `Runtime.enable` / `Console.enable`, which are the
 //! high-signal CDP tells Patchright removes. Not enabling them = nothing to hide.
 
-/// Command-line flags that reduce the automation fingerprint.
-pub fn stealth_flags() -> Vec<String> {
+/// Minimal launch flags. The only fingerprint-relevant one is
+/// `--disable-blink-features=AutomationControlled`, which keeps
+/// `navigator.webdriver` naturally false without any page-visible patch. The
+/// rest just suppress first-run/keychain noise. We intentionally keep this list
+/// short: every extra flag is a way the launch can differ from a human's Chrome.
+pub fn launch_flags() -> Vec<String> {
     [
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
@@ -20,15 +24,6 @@ pub fn stealth_flags() -> Vec<String> {
         "--no-service-autorun",
         "--password-store=basic",
         "--use-mock-keychain",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-features=Translate,OptimizationHints,MediaRouter",
-        "--disable-hang-monitor",
-        "--disable-popup-blocking",
-        "--disable-prompt-on-repost",
-        "--disable-sync",
-        "--metrics-recording-only",
-        "--mute-audio",
     ]
     .iter()
     .map(|s| s.to_string())
