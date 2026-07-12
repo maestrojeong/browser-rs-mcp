@@ -137,7 +137,14 @@ that fails must be met by a fix **in the same commit**. CI gates on it.
 ```bash
 node bench/run.mjs target/release/agent-browser        # headless fallback layer (CI gate)
 node bench/external.mjs target/release/agent-browser   # default headful mode vs bot.sannysoft.com
+node bench/rebrowser.mjs target/release/agent-browser  # CDP-automation tells vs rebrowser-bot-detector.net
 ```
+
+Against **rebrowser-bot-detector.net** (which targets Playwright/Puppeteer CDP
+leaks) agent-browser shows **no 🔴 detections**: `navigatorWebdriver`,
+`runtimeEnableLeak`, `pwInitScripts`, `viewport`, `useragent` all green, and the
+interactive `mainWorldExecution` / `dummyFn` probes stay untriggered because
+`browser_evaluate` runs in an isolated world.
 
 ```
 ✓  navigator.webdriver      undefined
