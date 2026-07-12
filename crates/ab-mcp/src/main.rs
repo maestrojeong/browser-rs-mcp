@@ -234,6 +234,54 @@ struct ResizeArgs {
     height: u32,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CookieSetArgs {
+    page: String,
+    name: String,
+    value: String,
+    /// Target URL (or provide domain). One of url/domain is required by Chrome.
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    secure: Option<bool>,
+    #[serde(default)]
+    http_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CookieDeleteArgs {
+    page: String,
+    name: String,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CookieGetArgs {
+    page: String,
+    /// Cookie name to fetch.
+    name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StorageKeyArgs {
+    page: String,
+    key: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StorageSetArgs {
+    page: String,
+    key: String,
+    value: String,
+}
+
 /// Build the browser per environment. Default: headful, real profile, no JS
 /// patching (fingerprint == a real human Chrome). Overrides:
 ///   AB_CONNECT=<port>  attach to a Chrome the user already launched (strongest)
@@ -329,6 +377,33 @@ impl BrowserServer {
     async fn netlog_of(&self, id: &str) -> Option<NetworkLog> {
         let st = self.state.lock().await;
         st.pages.get(id).and_then(|e| e.netlog.clone())
+    }
+
+    // Web-storage helpers shared by the localStorage/sessionStorage tools.
+    async fn storage_list(&self, page_id: &str, kind: &str) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(page_id).await?;
+        let v = page.web_storage_list(kind).await.map_err(fail)?;
+        Ok(ok(serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())))
+    }
+    async fn storage_get(&self, page_id: &str, kind: &str, key: &str) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(page_id).await?;
+        let v = page.web_storage_get(kind, key).await.map_err(fail)?;
+        Ok(ok(v.as_str().map(str::to_string).unwrap_or_else(|| "(null)".into())))
+    }
+    async fn storage_set(&self, page_id: &str, kind: &str, key: &str, value: &str) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(page_id).await?;
+        page.web_storage_set(kind, key, value).await.map_err(fail)?;
+        Ok(ok(format!("set {kind}[{key}]")))
+    }
+    async fn storage_delete(&self, page_id: &str, kind: &str, key: &str) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(page_id).await?;
+        page.web_storage_delete(kind, key).await.map_err(fail)?;
+        Ok(ok(format!("deleted {kind}[{key}]")))
+    }
+    async fn storage_clear(&self, page_id: &str, kind: &str) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(page_id).await?;
+        page.web_storage_clear(kind).await.map_err(fail)?;
+        Ok(ok(format!("cleared {kind}")))
     }
 
     /// Open a fresh tab (launching the browser if needed), navigate it, and
@@ -508,6 +583,138 @@ impl BrowserServer {
             a.page,
             a.patterns.join(", ")
         )))
+    }
+
+    // ---- cookies (granular) ----
+    /// List cookies for a page (optionally filtered by name).
+    #[tool(description = "List cookies (all, or one by name)")]
+    async fn browser_cookie_list(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let c = page.cookies().await.map_err(fail)?;
+        Ok(ok(serde_json::to_string_pretty(&c).unwrap_or_else(|_| "[]".into())))
+    }
+
+    /// Get a single cookie's value by name.
+    #[tool(description = "Get a cookie by name")]
+    async fn browser_cookie_get(
+        &self,
+        Parameters(a): Parameters<CookieGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let c = page.cookies().await.map_err(fail)?;
+        let found = c
+            .as_array()
+            .and_then(|arr| arr.iter().find(|ck| ck.get("name").and_then(|n| n.as_str()) == Some(&a.name)));
+        Ok(ok(match found {
+            Some(ck) => serde_json::to_string_pretty(ck).unwrap_or_default(),
+            None => format!("(no cookie named {:?})", a.name),
+        }))
+    }
+
+    /// Set a cookie.
+    #[tool(description = "Set a cookie (name, value, url or domain)")]
+    async fn browser_cookie_set(
+        &self,
+        Parameters(a): Parameters<CookieSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let mut ck = serde_json::json!({ "name": a.name, "value": a.value });
+        if let Some(u) = &a.url {
+            ck["url"] = serde_json::json!(u);
+        }
+        if let Some(d) = &a.domain {
+            ck["domain"] = serde_json::json!(d);
+        }
+        if let Some(p) = &a.path {
+            ck["path"] = serde_json::json!(p);
+        }
+        if let Some(s) = a.secure {
+            ck["secure"] = serde_json::json!(s);
+        }
+        if let Some(h) = a.http_only {
+            ck["httpOnly"] = serde_json::json!(h);
+        }
+        page.cookie_set(&ck).await.map_err(fail)?;
+        Ok(ok(format!("set cookie {}", a.name)))
+    }
+
+    /// Delete cookies by name (+ optional domain/path).
+    #[tool(description = "Delete a cookie by name (optional domain/path)")]
+    async fn browser_cookie_delete(
+        &self,
+        Parameters(a): Parameters<CookieDeleteArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        page.cookie_delete(&a.name, a.domain.as_deref(), a.path.as_deref())
+            .await
+            .map_err(fail)?;
+        Ok(ok(format!("deleted cookie {}", a.name)))
+    }
+
+    /// Clear all cookies.
+    #[tool(description = "Clear all browser cookies")]
+    async fn browser_cookie_clear(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        page.cookie_clear().await.map_err(fail)?;
+        Ok(ok("cleared cookies".to_string()))
+    }
+
+    // ---- localStorage / sessionStorage (granular) ----
+    /// List all localStorage entries.
+    #[tool(description = "List localStorage entries")]
+    async fn browser_localstorage_list(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+        self.storage_list(&a.page, "localStorage").await
+    }
+    /// Get a localStorage value.
+    #[tool(description = "Get a localStorage item by key")]
+    async fn browser_localstorage_get(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+        self.storage_get(&a.page, "localStorage", &a.key).await
+    }
+    /// Set a localStorage value.
+    #[tool(description = "Set a localStorage item")]
+    async fn browser_localstorage_set(&self, Parameters(a): Parameters<StorageSetArgs>) -> Result<CallToolResult, McpError> {
+        self.storage_set(&a.page, "localStorage", &a.key, &a.value).await
+    }
+    /// Delete a localStorage key.
+    #[tool(description = "Delete a localStorage item by key")]
+    async fn browser_localstorage_delete(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+        self.storage_delete(&a.page, "localStorage", &a.key).await
+    }
+    /// Clear localStorage.
+    #[tool(description = "Clear all localStorage")]
+    async fn browser_localstorage_clear(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+        self.storage_clear(&a.page, "localStorage").await
+    }
+    /// List all sessionStorage entries.
+    #[tool(description = "List sessionStorage entries")]
+    async fn browser_sessionstorage_list(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+        self.storage_list(&a.page, "sessionStorage").await
+    }
+    /// Get a sessionStorage value.
+    #[tool(description = "Get a sessionStorage item by key")]
+    async fn browser_sessionstorage_get(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+        self.storage_get(&a.page, "sessionStorage", &a.key).await
+    }
+    /// Set a sessionStorage value.
+    #[tool(description = "Set a sessionStorage item")]
+    async fn browser_sessionstorage_set(&self, Parameters(a): Parameters<StorageSetArgs>) -> Result<CallToolResult, McpError> {
+        self.storage_set(&a.page, "sessionStorage", &a.key, &a.value).await
+    }
+    /// Delete a sessionStorage key.
+    #[tool(description = "Delete a sessionStorage item by key")]
+    async fn browser_sessionstorage_delete(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+        self.storage_delete(&a.page, "sessionStorage", &a.key).await
+    }
+    /// Clear sessionStorage.
+    #[tool(description = "Clear all sessionStorage")]
+    async fn browser_sessionstorage_clear(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+        self.storage_clear(&a.page, "sessionStorage").await
     }
 
     /// Save cookies + localStorage of a page to a JSON file (session capture).

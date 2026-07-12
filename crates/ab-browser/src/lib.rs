@@ -1014,6 +1014,77 @@ impl Page {
         Ok(())
     }
 
+    /// Set a single cookie from a CDP cookie object (name/value + url or domain).
+    pub async fn cookie_set(&self, cookie: &Value) -> Result<()> {
+        self.client
+            .send_on(&self.session_id, "Network.enable", json!({}))
+            .await?;
+        self.client
+            .send_on(&self.session_id, "Network.setCookie", cookie.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Delete cookies matching name (+ optional domain/path).
+    pub async fn cookie_delete(&self, name: &str, domain: Option<&str>, path: Option<&str>) -> Result<()> {
+        let mut p = json!({ "name": name });
+        if let Some(d) = domain {
+            p["domain"] = json!(d);
+        }
+        if let Some(pp) = path {
+            p["path"] = json!(pp);
+        }
+        self.client
+            .send_on(&self.session_id, "Network.deleteCookies", p)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear all browser cookies.
+    pub async fn cookie_clear(&self) -> Result<()> {
+        self.client
+            .send_on(&self.session_id, "Network.clearBrowserCookies", json!({}))
+            .await?;
+        Ok(())
+    }
+
+    // --- Web storage (localStorage / sessionStorage). `kind` is validated by
+    // the caller (only "localStorage" | "sessionStorage"), so it's injection-safe.
+    pub async fn web_storage_get(&self, kind: &str, key: &str) -> Result<Value> {
+        self.evaluate_main(&format!(
+            "window.{kind}.getItem({})",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into())
+        ))
+        .await
+    }
+    pub async fn web_storage_set(&self, kind: &str, key: &str, value: &str) -> Result<()> {
+        self.evaluate_main(&format!(
+            "window.{kind}.setItem({},{})",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+        ))
+        .await?;
+        Ok(())
+    }
+    pub async fn web_storage_list(&self, kind: &str) -> Result<Value> {
+        self.evaluate_main(&format!(
+            "JSON.parse(JSON.stringify(Object.fromEntries(Object.entries(window.{kind}))))"
+        ))
+        .await
+    }
+    pub async fn web_storage_delete(&self, kind: &str, key: &str) -> Result<()> {
+        self.evaluate_main(&format!(
+            "window.{kind}.removeItem({})",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into())
+        ))
+        .await?;
+        Ok(())
+    }
+    pub async fn web_storage_clear(&self, kind: &str) -> Result<()> {
+        self.evaluate_main(&format!("window.{kind}.clear()")).await?;
+        Ok(())
+    }
+
     /// localStorage of the current origin as a `{ key: value }` object.
     pub async fn local_storage(&self) -> Result<Value> {
         self.evaluate_main(
