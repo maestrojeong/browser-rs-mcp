@@ -118,8 +118,9 @@ bench/
 ## Distribution
 
 - **Primary:** ship the MCP server binary. `cargo build --release` →
-  `target/release/agent-browser`, or grab it from GitHub Releases (planned:
-  cross-compiled binaries via CI).
+  `target/release/agent-browser`, or grab a prebuilt binary from GitHub
+  Releases — pushing a `v*` tag builds macOS-arm64 and Linux-x64 binaries
+  (with SHA-256 sums) and attaches them to the release.
 - **Detector:** stays in this monorepo. It is valuable first as a **CI
   regression gate**; publishing it as a public benchmark page (GitHub Pages
   from `bench/detector.html`) is an optional, zero-infra follow-up.
