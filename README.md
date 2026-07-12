@@ -132,6 +132,22 @@ bench/         # the bot-detection page + runners (CI regression gate)
 install.sh     # curl | sh installer (downloads the prebuilt binary)
 ```
 
+## Releasing
+
+Cutting a new version is one commit + one tag — CI builds the binaries and the
+`curl | sh` installer picks up the latest release automatically:
+
+```bash
+# bump the version in Cargo.toml (workspace.package.version), then:
+git commit -am "Release vX.Y.Z"
+git tag vX.Y.Z && git push origin main vX.Y.Z
+```
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds
+macOS-arm64 + Linux-x64 binaries (with SHA-256 sums) and attaches them to the
+GitHub Release. `install.sh` defaults to `releases/latest`, so no other change
+is needed (pin a version with `AB_VERSION=vX.Y.Z`).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
