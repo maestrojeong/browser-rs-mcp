@@ -1331,15 +1331,89 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // AB_HTTP=<port|host:port> → serve over streamable HTTP; otherwise stdio.
-    if let Ok(addr) = std::env::var("AB_HTTP") {
-        return serve_http(&addr).await;
+    let cli = parse_cli();
+    if cli.help {
+        print!("{USAGE}");
+        return Ok(());
+    }
+
+    // HTTP mode if --port (or AB_HTTP) is given; otherwise stdio.
+    let port = cli
+        .port
+        .or_else(|| std::env::var("AB_HTTP").ok().and_then(|v| v.split(':').last()?.parse().ok()));
+    if let Some(port) = port {
+        return serve_http(&format!("{}:{}", cli.host, port)).await;
     }
 
     info!("agent-browser MCP server starting on stdio");
     let service = BrowserServer::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+const USAGE: &str = "agent-browser — stealth MCP browser (stdio or HTTP)\n\
+\n\
+Usage:\n\
+  agent-browser                          # stdio MCP transport\n\
+  agent-browser --port 9321 [options]    # HTTP MCP transport at /mcp\n\
+\n\
+Options:\n\
+  --host <host>            HTTP bind host (default 127.0.0.1)\n\
+  --port <port>            Enable HTTP mode on this port\n\
+  --user-data-dir <path>   Persistent browser profile directory\n\
+  --headless / --headed    Run headless or headful (default headful)\n\
+  --stealth                Inject the JS stealth-patch layer (for headless)\n\
+  --connect <port|url>     Attach to a Chrome already running with\n\
+                           --remote-debugging-port (identical fingerprint)\n\
+  -h, --help               Show this help\n\
+\n\
+Env equivalents: AB_HTTP, AB_PROFILE, AB_HEADLESS, AB_STEALTH, AB_CONNECT, AB_CHROME.\n";
+
+struct Cli {
+    port: Option<u16>,
+    host: String,
+    help: bool,
+}
+
+/// Parse patchright-style CLI flags, mapping them onto the AB_* env vars that
+/// `make_browser` reads. This makes agent-browser a drop-in for hosts that
+/// allocate a port + profile and spawn the server (like clawgram does for
+/// playwright): `agent-browser --port N --user-data-dir <dir> --headless`.
+fn parse_cli() -> Cli {
+    let mut c = Cli {
+        port: None,
+        host: "127.0.0.1".to_string(),
+        help: false,
+    };
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--port" => c.port = it.next().and_then(|v| v.parse().ok()),
+            "--host" => {
+                if let Some(h) = it.next() {
+                    c.host = h;
+                }
+            }
+            "--user-data-dir" | "--profile" => {
+                if let Some(p) = it.next() {
+                    std::env::set_var("AB_PROFILE", p);
+                }
+            }
+            "--headless" => std::env::set_var("AB_HEADLESS", "1"),
+            "--headed" => std::env::remove_var("AB_HEADLESS"),
+            "--stealth" => std::env::set_var("AB_STEALTH", "1"),
+            "--connect" | "--cdp-endpoint" => {
+                if let Some(v) = it.next() {
+                    // Accept "9222" or "http://host:9222" → keep the port.
+                    let port = v.rsplit(':').next().unwrap_or(&v).trim_end_matches('/');
+                    std::env::set_var("AB_CONNECT", port);
+                }
+            }
+            "-h" | "--help" => c.help = true,
+            _ => {}
+        }
+    }
+    c
 }
 
 /// Serve over the MCP Streamable HTTP transport (endpoint: `/mcp`). Each client

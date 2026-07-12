@@ -129,16 +129,38 @@ Register with an MCP client (e.g. Claude Code / Cursor):
 
 Set a specific browser with `AB_CHROME=/path/to/chrome`.
 
-### Transports
+### Transports & CLI (patchright-compatible)
 
-- **stdio** (default) — the config above.
-- **Streamable HTTP / SSE** — set `AB_HTTP=<port>` (or `host:port`). The server
-  listens on `http://<host>:<port>/mcp`; each client session gets its own
-  browser. Point an HTTP MCP client at that URL:
+```
+agent-browser                          # stdio MCP transport
+agent-browser --port 9321 [options]    # HTTP MCP transport at /mcp
+  --host <host>            HTTP bind host (default 127.0.0.1)
+  --user-data-dir <path>   persistent browser profile directory
+  --headless / --headed    run headless or headful (default headful)
+  --connect <port|url>     attach to a Chrome on --remote-debugging-port
+  --stealth                inject the headless JS stealth-patch layer
+```
 
-  ```bash
-  AB_HTTP=8931 agent-browser        # -> http://127.0.0.1:8931/mcp
-  ```
+- **stdio** (default) — the `command` config above.
+- **Streamable HTTP / SSE** — `--port <n>` (or `AB_HTTP=<port>`) serves on
+  `http://<host>:<port>/mcp`; each client session gets its own browser.
+
+This mirrors `mcp-patchright --port … --user-data-dir …`, so a host that
+allocates a port + profile per session can spawn it and connect by URL:
+
+```jsonc
+// e.g. clawgram's mcp catalog, like its playwright entry:
+"agent-browser": {
+  build({ port, profileDir }) {
+    return { type: "http", url: `http://127.0.0.1:${port}/mcp` };
+    // where the host spawned:
+    //   agent-browser --port <port> --user-data-dir <profileDir> --headless
+  }
+}
+```
+
+Every flag also has an env equivalent (`AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`,
+`AB_CONNECT`, `AB_STEALTH`, `AB_CHROME`).
 
 ## Try the core directly (no MCP)
 
