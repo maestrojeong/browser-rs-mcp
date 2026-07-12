@@ -638,21 +638,44 @@ impl Page {
             .and_then(|r| r.get("object").and_then(|o| o.get("objectId")).and_then(Value::as_str).map(String::from)))
     }
 
-    /// Move the pointer to (x, y) along a short, slightly-curved, multi-step
-    /// path instead of teleporting — behavioral realism (a bot jumps; a human
-    /// glides). No-op-safe: falls through if events fail.
+    /// Move the pointer to (x, y) like a human: a curved (cubic-Bézier) path
+    /// with many small steps (~1 per few px, matching a real ~60-120 Hz
+    /// pointer), an ease-in-out velocity profile, per-step jitter, and a final
+    /// settle. Behavioral detectors flag the sparse, uniform jumps a naive
+    /// automation makes; this produces dense, non-uniform, curved motion.
     async fn human_move_to(&self, x: f64, y: f64) -> Result<()> {
-        // Start a little away from the target so there is actual motion.
-        let sx = x - 60.0 + rand_f64(30.0);
-        let sy = y - 40.0 + rand_f64(20.0);
-        let steps = 6 + (rand_u64(0, 3) as usize);
+        // Start offset from the target so there is real travel.
+        let sx = x - 90.0 + rand_f64(60.0);
+        let sy = y - 60.0 + rand_f64(40.0);
+        let dx = x - sx;
+        let dy = y - sy;
+        let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+        let steps = ((dist / 4.0) as usize).clamp(14, 64);
+
+        // Perpendicular unit vector, for a curved (not straight) path.
+        let nx = -dy / dist;
+        let ny = dx / dist;
+        let bow = rand_f64(0.22 * dist); // curvature magnitude (signed)
+        let c1x = sx + dx * 0.3 + nx * bow;
+        let c1y = sy + dy * 0.3 + ny * bow;
+        let c2x = sx + dx * 0.7 + nx * bow * 0.6;
+        let c2y = sy + dy * 0.7 + ny * bow * 0.6;
+
         for i in 1..=steps {
-            let t = i as f64 / steps as f64;
-            // ease-in-out + small perpendicular wobble
-            let ease = t * t * (3.0 - 2.0 * t);
-            let wobble = (t * std::f64::consts::PI).sin() * rand_f64(6.0);
-            let px = sx + (x - sx) * ease;
-            let py = sy + (y - sy) * ease + wobble;
+            let raw = i as f64 / steps as f64;
+            // ease-in-out → slow start, fast middle, slow end (human velocity)
+            let t = raw * raw * (3.0 - 2.0 * raw);
+            let mt = 1.0 - t;
+            let px = mt * mt * mt * sx
+                + 3.0 * mt * mt * t * c1x
+                + 3.0 * mt * t * t * c2x
+                + t * t * t * x
+                + rand_f64(1.1);
+            let py = mt * mt * mt * sy
+                + 3.0 * mt * mt * t * c1y
+                + 3.0 * mt * t * t * c2y
+                + t * t * t * y
+                + rand_f64(1.1);
             self.client
                 .send_on(
                     &self.session_id,
@@ -660,8 +683,21 @@ impl Page {
                     json!({ "type": "mouseMoved", "x": px, "y": py }),
                 )
                 .await?;
-            tokio::time::sleep(Duration::from_millis(rand_u64(6, 20))).await;
+            // Occasional longer dwell, like a human hesitating mid-move.
+            let mut ms = rand_u64(3, 13);
+            if rand_u64(0, 100) < 8 {
+                ms += rand_u64(20, 70);
+            }
+            tokio::time::sleep(Duration::from_millis(ms)).await;
         }
+        // Land exactly on the target.
+        self.client
+            .send_on(
+                &self.session_id,
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseMoved", "x": x, "y": y }),
+            )
+            .await?;
         Ok(())
     }
 
@@ -746,6 +782,8 @@ impl Page {
                     json!({ "type": "keyDown", "text": s, "key": s, "unmodifiedText": s }),
                 )
                 .await?;
+            // Key hold time (press duration), then release.
+            tokio::time::sleep(Duration::from_millis(rand_u64(25, 75))).await;
             self.client
                 .send_on(
                     &self.session_id,
@@ -753,7 +791,12 @@ impl Page {
                     json!({ "type": "keyUp", "key": s }),
                 )
                 .await?;
-            tokio::time::sleep(Duration::from_millis(rand_u64(30, 90))).await;
+            // Inter-key gap: variable, with occasional human "thinking" pauses.
+            let mut gap = rand_u64(40, 150);
+            if rand_u64(0, 100) < 12 {
+                gap += rand_u64(160, 440);
+            }
+            tokio::time::sleep(Duration::from_millis(gap)).await;
         }
         Ok(())
     }
