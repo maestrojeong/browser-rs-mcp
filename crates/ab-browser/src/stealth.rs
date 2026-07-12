@@ -41,12 +41,45 @@ pub fn stealth_flags() -> Vec<String> {
 /// the handful of properties headless/automated Chrome gets wrong.
 pub const STEALTH_INIT_SCRIPT: &str = r#"
 (() => {
+  // --- toString hardening -------------------------------------------------
+  // Our hooks are plain JS functions; a detector that reads their .toString()
+  // sees source instead of "[native code]" and flags automation. Route
+  // Function.prototype.toString through a proxy that returns a native-looking
+  // string for functions we mark (and for toString itself). Proven pattern
+  // (puppeteer-extra-stealth); guarded against recursion.
+  let mark, markProp;
+  try {
+    const nativeToString = Function.prototype.toString;
+    const nativeToStringStr = nativeToString.call(nativeToString); // "function toString() { [native code] }"
+    const faux = new WeakMap();
+    const proxy = new Proxy(nativeToString, {
+      apply(target, thisArg, args) {
+        if (faux.has(thisArg)) return faux.get(thisArg);
+        if (thisArg === proxy) return nativeToStringStr;
+        return Reflect.apply(target, thisArg, args);
+      },
+    });
+    Function.prototype.toString = proxy;
+    mark = (fn, name) => {
+      if (typeof fn === 'function') faux.set(fn, 'function ' + name + '() { [native code] }');
+      return fn;
+    };
+    markProp = (obj, prop, name) => {
+      const d = Object.getOwnPropertyDescriptor(obj, prop);
+      if (d && d.get) mark(d.get, name);
+    };
+  } catch (_) {
+    mark = (fn) => fn;
+    markProp = () => {};
+  }
+
   // navigator.webdriver -> undefined
   try {
     Object.defineProperty(Navigator.prototype, 'webdriver', {
       get: () => undefined,
       configurable: true,
     });
+    markProp(Navigator.prototype, 'webdriver', 'get webdriver');
   } catch (_) {}
 
   // A non-empty, plausible plugins/mimeTypes surface.
@@ -63,6 +96,7 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
         { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: '' },
       ]);
       Object.defineProperty(navigator, 'plugins', { get: () => plugins, configurable: true });
+      markProp(navigator, 'plugins', 'get plugins');
     }
   } catch (_) {}
 
@@ -73,6 +107,7 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
         get: () => ['en-US', 'en'],
         configurable: true,
       });
+      markProp(navigator, 'languages', 'get languages');
     }
   } catch (_) {}
 
@@ -117,13 +152,13 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
     const patch = (proto) => {
       if (!proto || !proto.getParameter) return;
       const orig = proto.getParameter;
-      proto.getParameter = function (p) {
+      proto.getParameter = mark(function getParameter(p) {
         const real = orig.call(this, p);
         if (p === UNMASKED_RENDERER && isSoftware(real)) return FAKE_RENDERER;
         if (p === UNMASKED_VENDOR && isSoftware(orig.call(this, UNMASKED_RENDERER)))
           return FAKE_VENDOR;
         return real;
-      };
+      }, 'getParameter');
     };
     patch(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
     patch(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
@@ -145,10 +180,11 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
   try {
     const orig = window.navigator.permissions && window.navigator.permissions.query;
     if (orig) {
-      window.navigator.permissions.query = (params) =>
-        params && params.name === 'notifications'
+      window.navigator.permissions.query = mark(function query(params) {
+        return params && params.name === 'notifications'
           ? Promise.resolve({ state: Notification.permission })
-          : orig(params);
+          : orig.call(this, params);
+      }, 'query');
     }
   } catch (_) {}
 })();

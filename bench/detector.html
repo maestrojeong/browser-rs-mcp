@@ -64,7 +64,23 @@ this detector co-evolve: add a check, close the leak, repeat.</p>
   } catch (e) { permDetail = "err"; }
   add("permissions consistent", permOk, permDetail);
 
-  // 9. Screen/viewport plausibility (headless reports outerWidth === 0)
+  // 9. Hooked functions must still look native under .toString() probing.
+  //    webdriver getter and permissions.query are always patched by the browser.
+  let leak = "";
+  try {
+    const probes = [
+      ["webdriver getter", Object.getOwnPropertyDescriptor(Navigator.prototype, "webdriver")?.get],
+      ["permissions.query", navigator.permissions && navigator.permissions.query],
+    ];
+    for (const [pname, fn] of probes) {
+      if (fn && !/\[native code\]/.test(Function.prototype.toString.call(fn))) leak += pname + " ";
+    }
+    // toString itself must not be self-revealing.
+    if (!/\[native code\]/.test(Function.prototype.toString.toString())) leak += "toString ";
+  } catch (e) { leak = "err"; }
+  add("no toString leak", leak === "", leak === "" ? "native" : ("leaks: " + leak));
+
+  // 10. Screen/viewport plausibility (headless reports outerWidth === 0)
   add("viewport plausible", window.outerWidth > 0 && screen.width >= window.innerWidth,
       "outer " + window.outerWidth + "x" + window.outerHeight + ", screen " + screen.width + "x" + screen.height);
 
