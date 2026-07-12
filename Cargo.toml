@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/ab-cdp", "crates/ab-browser", "crates/ab-mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/maestrojeong/agent-browser"
+authors = ["Yeonwoo Jeong <aadd4020@gmail.com>"]
+
+[workspace.dependencies]
+ab-cdp = { path = "crates/ab-cdp" }
+ab-browser = { path = "crates/ab-browser" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "process", "signal", "fs"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+tempfile = "3"
+rmcp = { version = "2.2", features = ["server", "transport-io"] }
+schemars = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

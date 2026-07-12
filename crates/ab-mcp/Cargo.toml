@@ -1,0 +1,23 @@
+[package]
+name = "ab-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agent-browser"
+path = "src/main.rs"
+
+[dependencies]
+ab-browser.workspace = true
+ab-cdp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rmcp = { workspace = true, features = ["server", "transport-io", "macros"] }
+schemars.workspace = true
