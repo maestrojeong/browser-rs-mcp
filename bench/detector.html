@@ -43,17 +43,16 @@ this detector co-evolve: add a check, close the leak, repeat.</p>
   // 6. UA has no "headless" token
   add("userAgent !headless", !/headless/i.test(navigator.userAgent), navigator.userAgent.slice(0, 60));
 
-  // WebGL renderer (INFORMATIONAL, unscored): a software rasterizer
-  // (SwiftShader / llvmpipe) is a headless tell, but it is also the legitimate
-  // renderer on GPU-less CI, so scoring it would be environment-dependent.
-  // Spoofing the renderer is a tracked growth item.
+  // 7. WebGL renderer must not be a software rasterizer (SwiftShader / llvmpipe
+  //    = headless tell). agent-browser spoofs a hardware GPU when the real one
+  //    is software, so this is now environment-independent.
   let renderer = "n/a";
   try {
     const gl = document.createElement("canvas").getContext("webgl");
     const ext = gl && gl.getExtension("WEBGL_debug_renderer_info");
     renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : "no-ext";
   } catch (e) { renderer = "err"; }
-  addInfo("webgl renderer (unscored)", renderer);
+  add("webgl !software", !/swiftshader|llvmpipe|software|mesa/i.test(renderer), renderer);
 
   // 8. Permissions consistency: query('notifications') must match Notification.permission
   //    (headless Chrome classically reports 'denied' while permission is 'default')

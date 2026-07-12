@@ -93,9 +93,11 @@ node bench/run.mjs target/release/agent-browser
 score: 8/8 — looks human ✓
 ```
 
-Scored checks are environment-independent; GPU/renderer and CDP-console probes
-are shown as **informational** (they vary by machine or are inherently
-unreliable from JS). Growth TODO: WebGL renderer spoofing.
+Scored checks are environment-independent (WebGL renderer is spoofed to a
+hardware GPU when the real one is software, so it scores consistently on
+GPU-less CI). The CDP-console probe stays **informational** — reliable CDP
+self-detection from JS doesn't exist; agent-browser's defense is architectural
+(it never enables the Runtime/Console domains).
 
 ## Layout (monorepo)
 

@@ -103,6 +103,32 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
     }
   } catch (_) {}
 
+  // WebGL renderer: headless/GPU-less Chrome reports a software rasterizer
+  // (SwiftShader / llvmpipe) — a strong automation tell. When (and only when)
+  // the real renderer is software, present a common hardware GPU instead. On a
+  // real GPU we leave the true values untouched to stay consistent.
+  try {
+    const UNMASKED_VENDOR = 0x9245;   // 37445
+    const UNMASKED_RENDERER = 0x9246; // 37446
+    const FAKE_VENDOR = 'Google Inc. (Intel)';
+    const FAKE_RENDERER =
+      'ANGLE (Intel, Intel(R) UHD Graphics (0x00009BC4) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+    const isSoftware = (s) => /swiftshader|llvmpipe|software|mesa/i.test(String(s));
+    const patch = (proto) => {
+      if (!proto || !proto.getParameter) return;
+      const orig = proto.getParameter;
+      proto.getParameter = function (p) {
+        const real = orig.call(this, p);
+        if (p === UNMASKED_RENDERER && isSoftware(real)) return FAKE_RENDERER;
+        if (p === UNMASKED_VENDOR && isSoftware(orig.call(this, UNMASKED_RENDERER)))
+          return FAKE_VENDOR;
+        return real;
+      };
+    };
+    patch(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+    patch(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  } catch (_) {}
+
   // Headless screen defaults to 800x600, which can be smaller than the window
   // (an implausible combination). Normalize the screen to at least the window.
   try {
