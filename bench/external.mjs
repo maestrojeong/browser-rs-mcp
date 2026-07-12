@@ -1,8 +1,8 @@
-// Informational: run agent-browser against a real-world bot detector and
+// Informational: run browser-rs against a real-world bot detector and
 // summarize its verdict. Not a scored gate (external site, needs network).
 // Usage: node bench/external.mjs [binary] [url]
 import { spawn } from "node:child_process";
-const bin = process.argv[2] || "target/release/agent-browser";
+const bin = process.argv[2] || "target/release/browser-rs";
 const url = process.argv[3] || "https://bot.sannysoft.com/";
 const child = spawn(bin, [], { stdio: ["pipe","pipe","inherit"] });
 let buf=""; const w=new Map();

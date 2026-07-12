@@ -1,4 +1,4 @@
-# agent-browser
+# browser-rs
 
 A high-performance, **stealth-first** browser served only over **MCP** — no
 bundled agent, no LLM, no chat UI. Point any MCP client (Claude Code, Cursor,
@@ -10,29 +10,29 @@ actually use well, in a single ~5 MB binary.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/agent-browser-mcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 
-agent-browser --port 9321         # HTTP MCP at http://127.0.0.1:9321/mcp
-agent-browser                     # or stdio
+browser-rs --port 9321         # HTTP MCP at http://127.0.0.1:9321/mcp
+browser-rs                     # or stdio
 ```
 
 No npm/Node/Rust needed — the script downloads the prebuilt binary for your
 platform. Alternatives: grab a binary from [Releases](../../releases), or
-`cargo install --git https://github.com/maestrojeong/agent-browser-mcp ab-mcp`.
+`cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp`.
 
 Register with an MCP client:
 
 ```jsonc
-{ "mcpServers": { "agent-browser": {
-  "command": "agent-browser"                    // stdio
+{ "mcpServers": { "browser-rs": {
+  "command": "browser-rs"                    // stdio
 } } }
-// HTTP: run `agent-browser --port 9321` and point the client at
+// HTTP: run `browser-rs --port 9321` and point the client at
 //   http://127.0.0.1:9321/mcp
 ```
 
 ## vs mcp-patchright
 
-| | mcp-patchright | **agent-browser** |
+| | mcp-patchright | **browser-rs** |
 |---|---|---|
 | Language / runtime | Node + Playwright | **Rust**, single static binary |
 | Browser control | Playwright (Patchright) | **raw CDP**, one multiplexed WebSocket |
@@ -57,7 +57,7 @@ the first place**. Injecting JS to override `navigator.webdriver`, `toString`,
 itself an anomaly — and detectors (Akamai, Kasada, DataDome, and open ones like
 CreepJS / incolumitas) flag exactly those inconsistent combinations.
 
-So by default agent-browser **injects nothing**: it runs **headful** on real
+So by default browser-rs **injects nothing**: it runs **headful** on real
 hardware with a **persistent real profile**, sets only the
 `AutomationControlled` launch flag (so `navigator.webdriver` is natively false),
 never enables the detectable `Runtime`/`Console` CDP domains, and evaluates JS in
@@ -96,8 +96,8 @@ signal. Clicks/typing use human-like mouse paths and key timing.
 ## CLI / flags (patchright-compatible)
 
 ```
-agent-browser                          # stdio MCP transport
-agent-browser --port 9321 [options]    # HTTP MCP transport at /mcp
+browser-rs                          # stdio MCP transport
+browser-rs --port 9321 [options]    # HTTP MCP transport at /mcp
   --host <host>            HTTP bind host (default 127.0.0.1)
   --user-data-dir <path>   persistent browser profile directory
   --headless | --headed    run headless or headful (default headful)
@@ -116,9 +116,9 @@ The repo ships its own bot detector and CI gates on it — a new detector check
 that fails must be met by a stealth fix in the same commit.
 
 ```bash
-node bench/run.mjs        target/release/agent-browser   # headless fallback layer (CI gate)
-node bench/external.mjs   target/release/agent-browser   # headful vs bot.sannysoft.com
-node bench/rebrowser.mjs  target/release/agent-browser   # CDP tells vs rebrowser-bot-detector.net
+node bench/run.mjs        target/release/browser-rs   # headless fallback layer (CI gate)
+node bench/external.mjs   target/release/browser-rs   # headful vs bot.sannysoft.com
+node bench/rebrowser.mjs  target/release/browser-rs   # CDP tells vs rebrowser-bot-detector.net
 ```
 
 ## Layout

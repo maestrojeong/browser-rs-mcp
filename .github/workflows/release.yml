@@ -15,10 +15,10 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-            asset: agent-browser-macos-arm64
+            asset: browser-rs-macos-arm64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: agent-browser-linux-x64
+            asset: browser-rs-linux-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
 
       - name: Package
         run: |
-          cp "target/${{ matrix.target }}/release/agent-browser" "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/browser-rs" "${{ matrix.asset }}"
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
 
       - name: Upload to release

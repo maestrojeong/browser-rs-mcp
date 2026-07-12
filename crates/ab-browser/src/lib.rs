@@ -1502,7 +1502,7 @@ fn default_profile_dir() -> Result<PathBuf> {
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
-                .map(|h| PathBuf::from(h).join(".agent-browser").join("profile"))
+                .map(|h| PathBuf::from(h).join(".browser-rs").join("profile"))
         })
         .ok_or_else(|| BrowserError::Launch("cannot resolve profile dir; set AB_PROFILE".into()))?;
     std::fs::create_dir_all(&base).map_err(|e| BrowserError::Launch(e.to_string()))?;

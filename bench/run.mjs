@@ -1,15 +1,15 @@
-// Stealth benchmark: drive agent-browser (over MCP) against the bot detector,
+// Stealth benchmark: drive browser-rs (over MCP) against the bot detector,
 // scrape its verdict, print a scorecard. Exit nonzero on any failed check so it
 // can gate CI — this is the regression guard that makes browser + detector grow
 // together.
 //
-// Usage: bun bench/run.mjs [path-to-agent-browser-binary]
+// Usage: bun bench/run.mjs [path-to-browser-rs-binary]
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const bin = process.argv[2] || resolve(here, "../target/release/agent-browser");
+const bin = process.argv[2] || resolve(here, "../target/release/browser-rs");
 const detector = "file://" + resolve(here, "detector.html");
 
 // This bench validates the *headless injection fallback* (AB_STEALTH), which
@@ -72,7 +72,7 @@ if (!result) {
   process.exit(2);
 }
 
-console.log(`\n  agent-browser stealth benchmark — ${detector}\n`);
+console.log(`\n  browser-rs stealth benchmark — ${detector}\n`);
 for (const c of result.checks) {
   console.log(`  ${c.pass ? "✓" : "✗"}  ${c.name.padEnd(24)} ${c.detail}`);
 }

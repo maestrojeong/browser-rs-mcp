@@ -3,11 +3,11 @@ resolver = "2"
 members = ["crates/ab-cdp", "crates/ab-browser", "crates/ab-mcp"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/maestrojeong/agent-browser"
+repository = "https://github.com/maestrojeong/browser-rs-mcp"
 authors = ["Yeonwoo Jeong <aadd4020@gmail.com>"]
 
 [workspace.dependencies]

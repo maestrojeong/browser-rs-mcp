@@ -1,10 +1,10 @@
 // Regression guard against rebrowser-bot-detector.net (CDP-automation tells).
-// Drives agent-browser in the default headful "be-real" mode, triggers the
+// Drives browser-rs in the default headful "be-real" mode, triggers the
 // interactive tests via isolated-world evaluate, then asserts no test is 🔴.
 // Needs network + a display (headful). Usage: node bench/rebrowser.mjs [binary]
 import { spawn } from "node:child_process";
 
-const bin = process.argv[2] || "target/release/agent-browser";
+const bin = process.argv[2] || "target/release/browser-rs";
 const c = spawn(bin, [], { stdio: ["pipe", "pipe", "ignore"] });
 let b = "";
 const w = new Map();
@@ -54,7 +54,7 @@ c.kill();
 
 if (!rows.length) { console.error("no test rows scraped"); process.exit(2); }
 
-console.log("\n  rebrowser-bot-detector — agent-browser (be-real)\n");
+console.log("\n  rebrowser-bot-detector — browser-rs (be-real)\n");
 const red = [];
 for (const r of rows) {
   const name = r.split(/\s+/).slice(1).join(" ").slice(0, 60);

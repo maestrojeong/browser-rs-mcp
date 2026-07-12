@@ -1,17 +1,17 @@
 #!/bin/sh
-# Install the agent-browser prebuilt binary from GitHub Releases.
-#   curl -fsSL https://raw.githubusercontent.com/maestrojeong/agent-browser-mcp/main/install.sh | sh
+# Install the browser-rs prebuilt binary from GitHub Releases.
+#   curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 # Env: AB_VERSION (default: latest), AB_BIN_DIR (default: /usr/local/bin or ~/.local/bin)
 set -e
 
-REPO="maestrojeong/agent-browser-mcp"
+REPO="maestrojeong/browser-rs-mcp"
 VERSION="${AB_VERSION:-latest}"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS-$ARCH" in
-  Darwin-arm64)      ASSET="agent-browser-macos-arm64" ;;
-  Linux-x86_64)      ASSET="agent-browser-linux-x64" ;;
+  Darwin-arm64)      ASSET="browser-rs-macos-arm64" ;;
+  Linux-x86_64)      ASSET="browser-rs-linux-x64" ;;
   Linux-aarch64)     echo "No prebuilt Linux-arm64 yet."; NEED_SRC=1 ;;
   Darwin-x86_64)     echo "No prebuilt Intel-mac yet."; NEED_SRC=1 ;;
   *)                 echo "Unsupported: $OS-$ARCH"; NEED_SRC=1 ;;
@@ -39,12 +39,12 @@ else
   fi
 fi
 
-echo "Downloading $ASSET ($VERSION) -> $DEST/agent-browser"
-curl -fsSL "$URL" -o "$DEST/agent-browser"
-chmod +x "$DEST/agent-browser"
-echo "Installed: $DEST/agent-browser"
+echo "Downloading $ASSET ($VERSION) -> $DEST/browser-rs"
+curl -fsSL "$URL" -o "$DEST/browser-rs"
+chmod +x "$DEST/browser-rs"
+echo "Installed: $DEST/browser-rs"
 
 case ":$PATH:" in
-  *":$DEST:"*) echo "Run: agent-browser --help" ;;
-  *) echo "Add to PATH:  export PATH=\"$DEST:\$PATH\"   then: agent-browser --help" ;;
+  *":$DEST:"*) echo "Run: browser-rs --help" ;;
+  *) echo "Add to PATH:  export PATH=\"$DEST:\$PATH\"   then: browser-rs --help" ;;
 esac

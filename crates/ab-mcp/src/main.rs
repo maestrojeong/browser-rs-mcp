@@ -1,4 +1,4 @@
-//! agent-browser MCP server.
+//! browser-rs MCP server.
 //!
 //! Exposes the ab-browser core as `browser_*` MCP tools over stdio. No agent,
 //! no LLM — just the browser, driven by whatever MCP client connects.
@@ -17,7 +17,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::info;
 
-const INSTRUCTIONS: &str = r#"agent-browser — a real Chrome driven over CDP, no bundled agent.
+const INSTRUCTIONS: &str = r#"browser-rs — a real Chrome driven over CDP, no bundled agent.
 
 Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to verify.
 - snapshot renders the page as an accessibility tree; interactive nodes carry [ref=eN] handles.
@@ -1314,7 +1314,7 @@ impl BrowserServer {
 impl rmcp::ServerHandler for BrowserServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
-        info.server_info.name = "agent-browser".to_string();
+        info.server_info.name = "browser-rs".to_string();
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
@@ -1345,17 +1345,17 @@ async fn main() -> anyhow::Result<()> {
         return serve_http(&format!("{}:{}", cli.host, port)).await;
     }
 
-    info!("agent-browser MCP server starting on stdio");
+    info!("browser-rs MCP server starting on stdio");
     let service = BrowserServer::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
 
-const USAGE: &str = "agent-browser — stealth MCP browser (stdio or HTTP)\n\
+const USAGE: &str = "browser-rs — stealth MCP browser (stdio or HTTP)\n\
 \n\
 Usage:\n\
-  agent-browser                          # stdio MCP transport\n\
-  agent-browser --port 9321 [options]    # HTTP MCP transport at /mcp\n\
+  browser-rs                          # stdio MCP transport\n\
+  browser-rs --port 9321 [options]    # HTTP MCP transport at /mcp\n\
 \n\
 Options:\n\
   --host <host>            HTTP bind host (default 127.0.0.1)\n\
@@ -1376,9 +1376,9 @@ struct Cli {
 }
 
 /// Parse patchright-style CLI flags, mapping them onto the AB_* env vars that
-/// `make_browser` reads. This makes agent-browser a drop-in for hosts that
+/// `make_browser` reads. This makes browser-rs a drop-in for hosts that
 /// allocate a port + profile and spawn the server (like clawgram does for
-/// playwright): `agent-browser --port N --user-data-dir <dir> --headless`.
+/// playwright): `browser-rs --port N --user-data-dir <dir> --headless`.
 fn parse_cli() -> Cli {
     let mut c = Cli {
         port: None,
@@ -1438,7 +1438,7 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
 
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    info!("agent-browser MCP server on http://{bind}/mcp (streamable HTTP)");
+    info!("browser-rs MCP server on http://{bind}/mcp (streamable HTTP)");
     axum::serve(listener, router).await?;
     Ok(())
 }

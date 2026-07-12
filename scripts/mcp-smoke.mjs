@@ -1,8 +1,8 @@
-// Minimal MCP stdio client to smoke-test the agent-browser server.
+// Minimal MCP stdio client to smoke-test the browser-rs server.
 // Sends: initialize -> initialized -> tools/list -> tools/call browser_navigate
 import { spawn } from "node:child_process";
 
-const bin = process.argv[2] || "target/debug/agent-browser";
+const bin = process.argv[2] || "target/debug/browser-rs";
 const child = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
 
 let buf = "";

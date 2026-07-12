@@ -1,4 +1,4 @@
-# agent-browser — Design
+# browser-rs — Design
 
 ## Goal
 

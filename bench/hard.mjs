@@ -1,7 +1,7 @@
-// Run agent-browser (default headful "be-real" mode) against a hard detector
+// Run browser-rs (default headful "be-real" mode) against a hard detector
 // and dump a verdict excerpt. Usage: node bench/hard.mjs <url> [waitMs]
 import { spawn } from "node:child_process";
-const bin = "target/release/agent-browser";
+const bin = "target/release/browser-rs";
 const url = process.argv[2];
 const waitMs = Number(process.argv[3] || 9000);
 const c = spawn(bin, [], { stdio: ["pipe", "pipe", "ignore"] }); // default = headful, no patching

@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "agent-browser"
+name = "browser-rs"
 path = "src/main.rs"
 
 [dependencies]
