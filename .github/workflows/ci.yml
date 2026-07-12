@@ -32,4 +32,6 @@ jobs:
       - name: Stealth benchmark
         env:
           AB_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          # Chromium runs as root in the CI container; the sandbox needs relaxing.
+          AB_CHROME_FLAGS: "--no-sandbox --disable-dev-shm-usage"
         run: node bench/run.mjs target/release/agent-browser

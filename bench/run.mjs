@@ -42,7 +42,10 @@ const callText = async (name, args) => {
 await send("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bench", version: "0" } });
 notify("notifications/initialized", {});
 
-await callText("browser_navigate", { url: detector });
+const navResult = await callText("browser_navigate", { url: detector });
+if (!navResult.startsWith("page ")) {
+  console.error("navigate did not return a page:\n" + navResult);
+}
 
 // Poll until the async checks have populated the global.
 let result = null;

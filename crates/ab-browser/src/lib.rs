@@ -100,6 +100,11 @@ impl Browser {
         }
         args.extend(stealth::stealth_flags());
         args.extend(opts.extra_args.clone());
+        // Extra flags from the environment (e.g. `--no-sandbox` when running as
+        // root in CI/containers). Space-separated.
+        if let Ok(flags) = std::env::var("AB_CHROME_FLAGS") {
+            args.extend(flags.split_whitespace().map(String::from));
+        }
         args.push("about:blank".to_string());
 
         debug!("launching chrome: {} {:?}", chrome.display(), args);
