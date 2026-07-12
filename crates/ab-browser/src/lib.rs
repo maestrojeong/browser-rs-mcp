@@ -554,6 +554,60 @@ impl Page {
         Ok(Some((cx, cy)))
     }
 
+    /// Resolve a CSS selector to a backendDOMNodeId (for act-by-selector).
+    pub async fn backend_for_selector(&self, selector: &str) -> Result<Option<i64>> {
+        let doc = self
+            .client
+            .send_on(&self.session_id, "DOM.getDocument", json!({ "depth": 0 }))
+            .await?;
+        let Some(root) = doc.get("root").and_then(|r| r.get("nodeId")).and_then(Value::as_i64)
+        else {
+            return Ok(None);
+        };
+        let q = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.querySelector",
+                json!({ "nodeId": root, "selector": selector }),
+            )
+            .await;
+        let nid = q
+            .ok()
+            .and_then(|v| v.get("nodeId").and_then(Value::as_i64))
+            .filter(|n| *n != 0);
+        let Some(nid) = nid else { return Ok(None) };
+        let d = self
+            .client
+            .send_on(&self.session_id, "DOM.describeNode", json!({ "nodeId": nid }))
+            .await?;
+        Ok(d.get("node").and_then(|n| n.get("backendNodeId")).and_then(Value::as_i64))
+    }
+
+    /// Search the page's visible text for a query; returns matching snippets.
+    pub async fn find(&self, query: &str, regex: bool, ignore_case: bool, max: usize) -> Result<Value> {
+        let js = format!(
+            r#"(() => {{
+              const q = {q}, rx = {rx}, ic = {ic}, max = {max};
+              let re = null; try {{ if (rx) re = new RegExp(q, ic ? 'i' : ''); }} catch (_) {{}}
+              const test = (s) => rx ? (re && re.test(s)) : (ic ? s.toLowerCase().includes(q.toLowerCase()) : s.includes(q));
+              const out = [];
+              for (const n of document.body ? document.body.querySelectorAll('*') : []) {{
+                if (n.children.length) continue;
+                const t = (n.innerText || n.textContent || '').trim();
+                if (t && t.length < 300 && test(t)) out.push(t);
+                if (out.length >= max * 3) break;
+              }}
+              return [...new Set(out)].slice(0, max);
+            }})()"#,
+            q = serde_json::to_string(query).unwrap_or_else(|_| "\"\"".into()),
+            rx = regex,
+            ic = ignore_case,
+            max = max,
+        );
+        self.evaluate(&js).await
+    }
+
     /// Resolve a backend node to a Runtime objectId (for JS calls on it).
     async fn resolve_object(&self, backend: i64) -> Result<Option<String>> {
         let res = self
@@ -717,6 +771,14 @@ impl Page {
             Ok(Some(false)) => self.wait_for_load().await.unwrap_or(()), // nav in flight
             _ => tokio::time::sleep(Duration::from_millis(350)).await, // no nav: DOM grace
         }
+    }
+
+    /// Focus an element by backend node id.
+    pub async fn focus(&self, backend: i64) -> Result<()> {
+        self.client
+            .send_on(&self.session_id, "DOM.focus", json!({ "backendNodeId": backend }))
+            .await?;
+        Ok(())
     }
 
     /// Press a single named key (e.g. "Enter", "Tab", "Escape").

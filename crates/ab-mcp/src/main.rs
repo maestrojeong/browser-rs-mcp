@@ -80,8 +80,32 @@ struct BrowserServer {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NavigateArgs {
-    /// URL to open (a new tab is created).
+    /// URL to open.
     url: String,
+    /// Existing page id to navigate. Omit to open a new tab.
+    #[serde(default)]
+    page: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct NewPageArgs {
+    /// URL to open in the new tab (default about:blank).
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindArgs {
+    page: String,
+    /// Text (or regex) to search for in the page's visible text.
+    query: String,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    ignore_case: bool,
+    /// Max matches to return (default 10).
+    #[serde(default)]
+    max: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -94,16 +118,21 @@ struct PageArg {
 struct RefArgs {
     /// Page id (e.g. "p1").
     page: String,
-    /// Element ref from the latest snapshot (e.g. "e3").
-    #[serde(rename = "ref")]
-    ref_: String,
+    /// Element ref from the latest snapshot (e.g. "e3"). Provide this OR selector.
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    /// CSS selector for the element. Provide this OR ref.
+    #[serde(default)]
+    selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct TypeArgs {
     page: String,
-    #[serde(rename = "ref")]
-    ref_: String,
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
     /// Text to type into the focused element.
     text: String,
     /// Replace existing content instead of appending.
@@ -116,6 +145,11 @@ struct PressArgs {
     page: String,
     /// Key name: Enter, Tab, Escape, Backspace, ArrowUp, ArrowDown, or a character.
     key: String,
+    /// Optionally focus this ref/selector before pressing.
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -132,8 +166,10 @@ struct EvalArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SelectArgs {
     page: String,
-    #[serde(rename = "ref")]
-    ref_: String,
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
     /// The option value to select.
     value: String,
 }
@@ -254,6 +290,28 @@ impl BrowserServer {
             .ok_or_else(|| fail(format!("unknown ref '{ref_}' (re-snapshot?)")))
     }
 
+    /// Resolve a target to a backend node id from either a snapshot ref or a
+    /// CSS selector (patchright-style: act tools accept either).
+    async fn resolve(
+        &self,
+        page_id: &str,
+        ref_: &Option<String>,
+        selector: &Option<String>,
+    ) -> Result<i64, McpError> {
+        if let Some(r) = ref_ {
+            return self.backend_of(page_id, r).await;
+        }
+        if let Some(sel) = selector {
+            let page = self.page_of(page_id).await?;
+            return page
+                .backend_for_selector(sel)
+                .await
+                .map_err(fail)?
+                .ok_or_else(|| fail(format!("no element matches selector {sel:?}")));
+        }
+        Err(fail("provide `ref` or `selector`"))
+    }
+
     /// Persist a fresh snapshot (refs + text) for a page.
     async fn store_snapshot(&self, id: &str, refs: HashMap<String, i64>, text: String) {
         let mut st = self.state.lock().await;
@@ -273,6 +331,41 @@ impl BrowserServer {
         st.pages.get(id).and_then(|e| e.netlog.clone())
     }
 
+    /// Open a fresh tab (launching the browser if needed), navigate it, and
+    /// register it. Returns (page_id, snapshot_text).
+    async fn open_page(&self, url: &str) -> Result<(String, String), McpError> {
+        let mut st = self.state.lock().await;
+        if st.browser.is_none() {
+            st.browser = Some(make_browser().await.map_err(fail)?);
+        }
+        // Blank page first so the network log captures the navigation itself.
+        let page = st
+            .browser
+            .as_ref()
+            .unwrap()
+            .new_page("about:blank")
+            .await
+            .map_err(fail)?;
+        let netlog = page.enable_network_log().await.ok();
+        let _ = page.enable_dialog_auto_accept().await;
+        if !url.is_empty() && url != "about:blank" {
+            page.navigate(url).await.map_err(fail)?;
+        }
+        let snap = page.snapshot().await.map_err(fail)?;
+        st.next += 1;
+        let id = format!("p{}", st.next);
+        st.pages.insert(
+            id.clone(),
+            PageEntry {
+                page,
+                refs: snap.refs.clone(),
+                last_text: snap.text.clone(),
+                netlog,
+            },
+        );
+        Ok((id, snap.text))
+    }
+
     /// After an action: wait for settle, re-snapshot, diff vs the previous
     /// snapshot, persist the new one, and return the diff for the agent.
     async fn settle_diff(&self, id: &str, page: &Page) -> Result<String, McpError> {
@@ -287,41 +380,32 @@ impl BrowserServer {
 
 #[tool_router(router = tool_router)]
 impl BrowserServer {
-    /// Open a URL in a new tab and return its page id plus an accessibility snapshot.
-    #[tool(description = "Open a URL in a new browser tab; returns page id + snapshot")]
+    /// Navigate: reuse an existing page (if `page` given) or open a new tab.
+    #[tool(description = "Navigate a page to a URL (reuses `page` if given, else opens a new tab)")]
     async fn browser_navigate(
         &self,
         Parameters(a): Parameters<NavigateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut st = self.state.lock().await;
-        if st.browser.is_none() {
-            let b = make_browser().await.map_err(fail)?;
-            st.browser = Some(b);
+        if let Some(pid) = &a.page {
+            let page = self.page_of(pid).await?;
+            page.navigate(&a.url).await.map_err(fail)?;
+            let snap = page.snapshot().await.map_err(fail)?;
+            self.store_snapshot(pid, snap.refs.clone(), snap.text.clone()).await;
+            return Ok(ok(format!("page {pid}\nurl {}\n\n{}", a.url, snap.text)));
         }
-        // Blank page first so the network log captures the navigation itself.
-        let page = st
-            .browser
-            .as_ref()
-            .unwrap()
-            .new_page("about:blank")
-            .await
-            .map_err(fail)?;
-        let netlog = page.enable_network_log().await.ok();
-        let _ = page.enable_dialog_auto_accept().await;
-        page.navigate(&a.url).await.map_err(fail)?;
-        let snap = page.snapshot().await.map_err(fail)?;
-        st.next += 1;
-        let id = format!("p{}", st.next);
-        st.pages.insert(
-            id.clone(),
-            PageEntry {
-                page,
-                refs: snap.refs.clone(),
-                last_text: snap.text.clone(),
-                netlog,
-            },
-        );
-        Ok(ok(format!("page {id}\nurl {}\n\n{}", a.url, snap.text)))
+        let (id, text) = self.open_page(&a.url).await?;
+        Ok(ok(format!("page {id}\nurl {}\n\n{}", a.url, text)))
+    }
+
+    /// Open a new tab (optionally at a URL); returns its page id + snapshot.
+    #[tool(description = "Open a new browser tab (optional url); returns page id + snapshot")]
+    async fn browser_new_page(
+        &self,
+        Parameters(a): Parameters<NewPageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let url = a.url.unwrap_or_default();
+        let (id, text) = self.open_page(&url).await?;
+        Ok(ok(format!("page {id}\n\n{text}")))
     }
 
     /// Re-render the accessibility snapshot for a page (refreshes [ref] handles).
@@ -343,11 +427,11 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<RefArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let backend = self.backend_of(&a.page, &a.ref_).await?;
+        let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let page = self.page_of(&a.page).await?;
         page.click(backend).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("clicked {} on {}\n\n{}", a.ref_, a.page, diff)))
+        Ok(ok(format!("clicked on {}\n\n{}", a.page, diff)))
     }
 
     /// Type text into an element by ref (optionally clearing it first).
@@ -356,13 +440,13 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<TypeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let backend = self.backend_of(&a.page, &a.ref_).await?;
+        let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let page = self.page_of(&a.page).await?;
         page.type_text(backend, &a.text, a.clear)
             .await
             .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("typed into {} on {}\n\n{}", a.ref_, a.page, diff)))
+        Ok(ok(format!("typed into {}\n\n{}", a.page, diff)))
     }
 
     /// Press a named key on a page, then report what changed.
@@ -372,6 +456,10 @@ impl BrowserServer {
         Parameters(a): Parameters<PressArgs>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
+        if a.ref_.is_some() || a.selector.is_some() {
+            let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
+            page.focus(backend).await.map_err(fail)?;
+        }
         page.press(&a.key).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("pressed {} on {}\n\n{}", a.key, a.page, diff)))
@@ -463,11 +551,11 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<RefArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let backend = self.backend_of(&a.page, &a.ref_).await?;
+        let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let page = self.page_of(&a.page).await?;
         page.hover(backend).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("hovered {} on {}\n\n{}", a.ref_, a.page, diff)))
+        Ok(ok(format!("hovered on {}\n\n{}", a.page, diff)))
     }
 
     /// Select an <option> in a dropdown by ref + value.
@@ -476,11 +564,11 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<SelectArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let backend = self.backend_of(&a.page, &a.ref_).await?;
+        let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let page = self.page_of(&a.page).await?;
         page.select_option(backend, &a.value).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("selected {:?} in {} on {}\n\n{}", a.value, a.ref_, a.page, diff)))
+        Ok(ok(format!("selected {:?} on {}\n\n{}", a.value, a.page, diff)))
     }
 
     /// Navigate back one entry in the page's history.
@@ -588,6 +676,66 @@ impl BrowserServer {
             html.push_str("\n… (truncated)");
         }
         Ok(ok(html))
+    }
+
+    /// Extract the page's visible text (innerText).
+    #[tool(description = "Get the page's visible text (innerText)")]
+    async fn browser_get_text(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let mut txt = page.text().await.map_err(fail)?;
+        const MAX: usize = 100_000;
+        if txt.len() > MAX {
+            txt.truncate(MAX);
+            txt.push_str("\n… (truncated)");
+        }
+        Ok(ok(txt))
+    }
+
+    /// Search a page's visible text for a query (substring or regex).
+    #[tool(description = "Find text on the page (substring or regex); returns matching snippets")]
+    async fn browser_find(
+        &self,
+        Parameters(a): Parameters<FindArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let v = page
+            .find(&a.query, a.regex, a.ignore_case, a.max.unwrap_or(10))
+            .await
+            .map_err(fail)?;
+        let matches = v.as_array().cloned().unwrap_or_default();
+        if matches.is_empty() {
+            return Ok(ok(format!("no matches for {:?}", a.query)));
+        }
+        let out: Vec<String> = matches
+            .iter()
+            .filter_map(|m| m.as_str().map(|s| format!("- {s}")))
+            .collect();
+        Ok(ok(out.join("\n")))
+    }
+
+    /// Report browser status: running, mode, open page count.
+    #[tool(description = "Browser status: running, mode, open pages")]
+    async fn browser_status(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().await;
+        let running = st.browser.is_some();
+        let mode = if std::env::var("AB_CONNECT").is_ok() {
+            "connect"
+        } else if std::env::var("AB_HEADLESS").is_ok() {
+            if std::env::var("AB_STEALTH").is_ok() {
+                "headless+stealth"
+            } else {
+                "headless"
+            }
+        } else {
+            "headful (be-real)"
+        };
+        Ok(ok(format!(
+            "running: {running}\nmode: {mode}\nopen pages: {}",
+            st.pages.len()
+        )))
     }
 
     /// Save a full-page PNG screenshot to a temp file; returns its path.
