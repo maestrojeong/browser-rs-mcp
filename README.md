@@ -10,17 +10,14 @@ actually use well, in a single ~5 MB binary.
 ## Install
 
 ```bash
-# curl (no npm/Rust needed — downloads the prebuilt binary)
 curl -fsSL https://raw.githubusercontent.com/maestrojeong/agent-browser-mcp/main/install.sh | sh
-
-# or npm
-npm i -g agent-browser-mcp
 
 agent-browser --port 9321         # HTTP MCP at http://127.0.0.1:9321/mcp
 agent-browser                     # or stdio
 ```
 
-Alternatives: grab a binary from [Releases](../../releases), or
+No npm/Node/Rust needed — the script downloads the prebuilt binary for your
+platform. Alternatives: grab a binary from [Releases](../../releases), or
 `cargo install --git https://github.com/maestrojeong/agent-browser-mcp ab-mcp`.
 
 Register with an MCP client:
@@ -132,7 +129,7 @@ crates/
   ab-browser/  # Browser + Page: launch, stealth, snapshot, act, network, storage
   ab-mcp/      # MCP server (rmcp) — stdio + HTTP/SSE, the only serving surface
 bench/         # the bot-detection page + runners (CI regression gate)
-npm/           # npm wrapper (downloads the prebuilt binary on install)
+install.sh     # curl | sh installer (downloads the prebuilt binary)
 ```
 
 ## License

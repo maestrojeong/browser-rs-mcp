@@ -3,6 +3,3 @@ target/
 .DS_Store
 /tmp/ab-*.png
 
-# npm wrapper: downloaded at install time
-npm/bin/agent-browser-native
-npm/node_modules/
