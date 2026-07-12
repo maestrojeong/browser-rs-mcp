@@ -804,13 +804,39 @@ impl Page {
                     .await?;
             }
         }
+        let mut shift_held = false;
         for ch in text.chars() {
             let s = ch.to_string();
+            let need_shift = needs_shift(ch);
+            // Real keyboards produce shifted chars (uppercase, @, !, …) only
+            // while Shift is physically held. Detectors flag e.g. "@ typed
+            // without a modifier". Press/release Shift around such characters.
+            if need_shift && !shift_held {
+                self.client
+                    .send_on(
+                        &self.session_id,
+                        "Input.dispatchKeyEvent",
+                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "modifiers": 8 }),
+                    )
+                    .await?;
+                shift_held = true;
+                tokio::time::sleep(Duration::from_millis(rand_u64(15, 45))).await;
+            } else if !need_shift && shift_held {
+                self.client
+                    .send_on(
+                        &self.session_id,
+                        "Input.dispatchKeyEvent",
+                        json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
+                    )
+                    .await?;
+                shift_held = false;
+            }
+            let modifiers = if need_shift { 8 } else { 0 };
             self.client
                 .send_on(
                     &self.session_id,
                     "Input.dispatchKeyEvent",
-                    json!({ "type": "keyDown", "text": s, "key": s, "unmodifiedText": s }),
+                    json!({ "type": "keyDown", "text": s, "key": s, "unmodifiedText": s, "modifiers": modifiers }),
                 )
                 .await?;
             // Key hold time (press duration), then release.
@@ -819,7 +845,7 @@ impl Page {
                 .send_on(
                     &self.session_id,
                     "Input.dispatchKeyEvent",
-                    json!({ "type": "keyUp", "key": s }),
+                    json!({ "type": "keyUp", "key": s, "modifiers": modifiers }),
                 )
                 .await?;
             // Inter-key gap with real human burstiness (bimodal): most keys are
@@ -834,6 +860,15 @@ impl Page {
                 rand_u64(55, 175) // normal
             };
             tokio::time::sleep(Duration::from_millis(gap)).await;
+        }
+        if shift_held {
+            self.client
+                .send_on(
+                    &self.session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -1497,6 +1532,13 @@ fn rand_u64(min: u64, max: u64) -> u64 {
 fn rand_f64(spread: f64) -> f64 {
     let r = rand_u64(0, 10_000) as f64 / 10_000.0; // 0..1
     (r * 2.0 - 1.0) * spread
+}
+
+/// Whether producing this character on a US keyboard requires the Shift key
+/// (uppercase letters and the shifted symbol row). Typing e.g. '@' without a
+/// modifier is physically impossible for a human — a behavioral tell.
+fn needs_shift(ch: char) -> bool {
+    ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
 }
 
 /// A signed offset that is clearly *off* the center of a box axis: 12–40 % of
