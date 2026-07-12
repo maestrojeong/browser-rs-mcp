@@ -300,6 +300,160 @@ impl Page {
             .decode(b64)
             .map_err(|e| BrowserError::Protocol(e.to_string()))
     }
+
+    /// Extract readable page text (best-effort, main content).
+    pub async fn text(&self) -> Result<String> {
+        Ok(self
+            .evaluate("document.body ? document.body.innerText : ''")
+            .await?
+            .as_str()
+            .unwrap_or("")
+            .to_string())
+    }
+}
+
+/// Actions driven by an accessibility `[ref]` (its backendDOMNodeId).
+impl Page {
+    /// Resolve the on-screen center of a node from its box model.
+    async fn node_center(&self, backend: i64) -> Result<Option<(f64, f64)>> {
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.getBoxModel",
+                json!({ "backendNodeId": backend }),
+            )
+            .await;
+        let Ok(res) = res else { return Ok(None) };
+        let quad = res
+            .get("model")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array);
+        let Some(q) = quad else { return Ok(None) };
+        if q.len() < 8 {
+            return Ok(None);
+        }
+        let xs = [q[0].as_f64(), q[2].as_f64(), q[4].as_f64(), q[6].as_f64()];
+        let ys = [q[1].as_f64(), q[3].as_f64(), q[5].as_f64(), q[7].as_f64()];
+        let cx = xs.iter().flatten().sum::<f64>() / 4.0;
+        let cy = ys.iter().flatten().sum::<f64>() / 4.0;
+        Ok(Some((cx, cy)))
+    }
+
+    /// Resolve a backend node to a Runtime objectId (for JS calls on it).
+    async fn resolve_object(&self, backend: i64) -> Result<Option<String>> {
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend }),
+            )
+            .await;
+        Ok(res
+            .ok()
+            .and_then(|r| r.get("object").and_then(|o| o.get("objectId")).and_then(Value::as_str).map(String::from)))
+    }
+
+    /// Click a node by ref. Prefers a real synthesized mouse click at the
+    /// element center; falls back to a DOM `.click()` when there is no box.
+    pub async fn click(&self, backend: i64) -> Result<()> {
+        if let Some((x, y)) = self.node_center(backend).await? {
+            for kind in ["mousePressed", "mouseReleased"] {
+                self.client
+                    .send_on(
+                        &self.session_id,
+                        "Input.dispatchMouseEvent",
+                        json!({
+                            "type": kind,
+                            "x": x,
+                            "y": y,
+                            "button": "left",
+                            "buttons": 1,
+                            "clickCount": 1,
+                        }),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        // Fallback: JS click via objectId.
+        if let Some(obj) = self.resolve_object(backend).await? {
+            self.client
+                .send_on(
+                    &self.session_id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": obj,
+                        "functionDeclaration": "function(){ this.click(); }",
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
+        Err(BrowserError::Protocol("element not clickable".into()))
+    }
+
+    /// Focus a node and type text via real key/insert events.
+    /// When `clear` is set, existing content is selected and replaced.
+    pub async fn type_text(&self, backend: i64, text: &str, clear: bool) -> Result<()> {
+        self.client
+            .send_on(&self.session_id, "DOM.focus", json!({ "backendNodeId": backend }))
+            .await?;
+        if clear {
+            if let Some(obj) = self.resolve_object(backend).await? {
+                // Select all existing text so insertText replaces it.
+                self.client
+                    .send_on(
+                        &self.session_id,
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "objectId": obj,
+                            "functionDeclaration":
+                                "function(){ if (this.select) this.select(); else if (this.setSelectionRange) this.setSelectionRange(0, (this.value||'').length); }",
+                        }),
+                    )
+                    .await?;
+            }
+        }
+        self.client
+            .send_on(
+                &self.session_id,
+                "Input.insertText",
+                json!({ "text": text }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Press a single named key (e.g. "Enter", "Tab", "Escape").
+    pub async fn press(&self, key: &str) -> Result<()> {
+        let (code, vk) = match key {
+            "Enter" => ("Enter", 13),
+            "Tab" => ("Tab", 9),
+            "Escape" => ("Escape", 27),
+            "Backspace" => ("Backspace", 8),
+            "ArrowDown" => ("ArrowDown", 40),
+            "ArrowUp" => ("ArrowUp", 38),
+            _ => (key, 0),
+        };
+        for kind in ["keyDown", "keyUp"] {
+            self.client
+                .send_on(
+                    &self.session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": kind,
+                        "key": code,
+                        "code": code,
+                        "windowsVirtualKeyCode": vk,
+                        "nativeVirtualKeyCode": vk,
+                    }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn detect_chrome() -> Option<PathBuf> {

@@ -29,20 +29,45 @@ capability* — the browser an agent can actually use well.
 
 - [x] `ab-cdp` — multiplexed CDP client (flatten sessions, event stream)
 - [x] `ab-browser` — Chrome launcher, stealth layer, `navigate` / `evaluate` /
-      `snapshot` / `screenshot`
-- [x] Verified end-to-end against real Chrome (`navigator.webdriver = undefined`)
-- [ ] `ab-mcp` — rmcp server exposing `browser_*` tools
-- [ ] `act` (click/type/fill by ref) + post-action settle diff
-- [ ] tabs / windows / network / download / pdf tools
-- [ ] fingerprint self-test tool
+      `snapshot` / `screenshot` + act (`click` / `type` / `press` by ref)
+- [x] `ab-mcp` — rmcp stdio server exposing 8 `browser_*` tools
+- [x] Verified end-to-end against real Chrome (`navigator.webdriver = undefined`,
+      click-by-ref navigates the page)
+- [ ] post-action settle diff (cheap "did it work" signal)
+- [ ] tabs / windows / network interception / download / pdf tools
+- [ ] `browser_fingerprint_check` self-test
+- [ ] streamable-HTTP transport
 
-## Try it
+## Tools
+
+`browser_navigate` · `browser_snapshot` · `browser_click` · `browser_type` ·
+`browser_press` · `browser_evaluate` · `browser_screenshot` · `browser_tabs`
+
+## Run as an MCP server
+
+```bash
+cargo build --release          # produces target/release/agent-browser
+```
+
+Register with an MCP client (e.g. Claude Code / Cursor):
+
+```json
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "/absolute/path/to/agent-browser/target/release/agent-browser"
+    }
+  }
+}
+```
+
+Set a specific browser with `AB_CHROME=/path/to/chrome`.
+
+## Try the core directly (no MCP)
 
 ```bash
 cargo run -p ab-browser --example smoke -- https://example.com
 ```
-
-Set a specific browser with `AB_CHROME=/path/to/chrome`.
 
 ## Layout
 
