@@ -30,7 +30,7 @@ capability* — the browser an agent can actually use well.
 - [x] `ab-cdp` — multiplexed CDP client (flatten sessions, event stream)
 - [x] `ab-browser` — Chrome launcher, stealth layer, `navigate` / `evaluate` /
       `snapshot` / `screenshot` + act (`click` / `type` / `press` by ref)
-- [x] `ab-mcp` — rmcp stdio server exposing 10 `browser_*` tools
+- [x] `ab-mcp` — rmcp stdio server exposing 11 `browser_*` tools
 - [x] Verified end-to-end against real Chrome (**5/5** fingerprint self-test,
       click-by-ref navigates the page)
 - [x] post-action **settle-diff** (act tools return the accessibility-tree delta)
@@ -40,9 +40,9 @@ capability* — the browser an agent can actually use well.
 
 ## Tools
 
-`browser_navigate` · `browser_snapshot` · `browser_click` · `browser_type` ·
-`browser_press` · `browser_evaluate` · `browser_screenshot` · `browser_tabs` ·
-`browser_close_page` · `browser_fingerprint_check`
+`browser_navigate` · `browser_snapshot` · `browser_read` · `browser_click` ·
+`browser_type` · `browser_press` · `browser_evaluate` · `browser_screenshot` ·
+`browser_tabs` · `browser_close_page` · `browser_fingerprint_check`
 
 Act tools (`click` / `type` / `press`) wait for the page to settle and return a
 **diff of the accessibility tree** — the cheap "did it work" signal.

@@ -288,6 +288,17 @@ impl BrowserServer {
         Ok(ok(serde_json::to_string(&v).unwrap_or_else(|_| "null".into())))
     }
 
+    /// Extract the page as Markdown (headings, links, lists, code).
+    #[tool(description = "Read the page as Markdown (token-efficient content extract)")]
+    async fn browser_read(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        let md = page.read_markdown().await.map_err(fail)?;
+        Ok(ok(md))
+    }
+
     /// Save a full-page PNG screenshot to a temp file; returns its path.
     #[tool(description = "Capture a full-page PNG screenshot; returns the file path")]
     async fn browser_screenshot(

@@ -342,6 +342,51 @@ impl Page {
             .unwrap_or("")
             .to_string())
     }
+
+    /// Extract the page as Markdown (headings, links, lists, code, quotes).
+    /// A pragmatic DOM walker — smaller and more stable than raw HTML.
+    pub async fn read_markdown(&self) -> Result<String> {
+        let js = r#"(() => {
+          const skip = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','CANVAS','IFRAME','HEAD','NAV','FOOTER']);
+          const out = [];
+          const inline = (el) => {
+            let s = '';
+            el.childNodes.forEach((n) => {
+              if (n.nodeType === 3) s += n.textContent;
+              else if (n.nodeType === 1) {
+                const t = n.tagName;
+                if (t === 'A' && n.getAttribute('href')) s += '[' + inline(n).trim() + '](' + n.href + ')';
+                else if (t === 'STRONG' || t === 'B') s += '**' + inline(n).trim() + '**';
+                else if (t === 'EM' || t === 'I') s += '*' + inline(n).trim() + '*';
+                else if (t === 'CODE') s += '`' + n.textContent + '`';
+                else if (t === 'BR') s += '\n';
+                else s += inline(n);
+              }
+            });
+            return s;
+          };
+          const walk = (el) => {
+            for (const n of el.children) {
+              const t = n.tagName;
+              if (skip.has(t)) continue;
+              if (/^H[1-6]$/.test(t)) { const s = inline(n).trim(); if (s) out.push('#'.repeat(+t[1]) + ' ' + s); }
+              else if (t === 'P') { const s = inline(n).trim(); if (s) out.push(s); }
+              else if (t === 'LI') { const s = inline(n).trim(); if (s) out.push('- ' + s); }
+              else if (t === 'PRE') { const s = n.textContent.trim(); if (s) out.push('```\n' + s + '\n```'); }
+              else if (t === 'BLOCKQUOTE') { const s = inline(n).trim(); if (s) out.push('> ' + s); }
+              else walk(n);
+            }
+          };
+          walk(document.body || document.documentElement);
+          return out.join('\n\n');
+        })()"#;
+        Ok(self
+            .evaluate(js)
+            .await?
+            .as_str()
+            .unwrap_or("")
+            .to_string())
+    }
 }
 
 /// Actions driven by an accessibility `[ref]` (its backendDOMNodeId).
