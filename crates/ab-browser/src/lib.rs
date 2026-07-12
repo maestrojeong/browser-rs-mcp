@@ -567,11 +567,28 @@ impl Page {
         if q.len() < 8 {
             return Ok(None);
         }
-        let xs = [q[0].as_f64(), q[2].as_f64(), q[4].as_f64(), q[6].as_f64()];
-        let ys = [q[1].as_f64(), q[3].as_f64(), q[5].as_f64(), q[7].as_f64()];
-        let cx = xs.iter().flatten().sum::<f64>() / 4.0;
-        let cy = ys.iter().flatten().sum::<f64>() / 4.0;
-        Ok(Some((cx, cy)))
+        let xs: Vec<f64> = [q[0].as_f64(), q[2].as_f64(), q[4].as_f64(), q[6].as_f64()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let ys: Vec<f64> = [q[1].as_f64(), q[3].as_f64(), q[5].as_f64(), q[7].as_f64()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if xs.len() < 4 || ys.len() < 4 {
+            return Ok(None);
+        }
+        let cx = xs.iter().sum::<f64>() / 4.0;
+        let cy = ys.iter().sum::<f64>() / 4.0;
+        // Humans never click the pixel-perfect center of a target — detectors
+        // flag `hasClickedExactCenter`. Aim at an off-center point inside the box.
+        let half_w = (xs.iter().cloned().fold(f64::MIN, f64::max)
+            - xs.iter().cloned().fold(f64::MAX, f64::min))
+            / 2.0;
+        let half_h = (ys.iter().cloned().fold(f64::MIN, f64::max)
+            - ys.iter().cloned().fold(f64::MAX, f64::min))
+            / 2.0;
+        Ok(Some((cx + off_center(half_w), cy + off_center(half_h))))
     }
 
     /// Resolve a CSS selector to a backendDOMNodeId (for act-by-selector).
@@ -1474,6 +1491,18 @@ fn rand_u64(min: u64, max: u64) -> u64 {
 fn rand_f64(spread: f64) -> f64 {
     let r = rand_u64(0, 10_000) as f64 / 10_000.0; // 0..1
     (r * 2.0 - 1.0) * spread
+}
+
+/// A signed offset that is clearly *off* the center of a box axis: 12–40 % of
+/// the half-dimension, so clicks land inside the element but never on its exact
+/// center (which behavioral detectors flag).
+fn off_center(half: f64) -> f64 {
+    if half < 3.0 {
+        return rand_f64(half.max(0.0));
+    }
+    let frac = 0.12 + (rand_u64(0, 28) as f64) / 100.0; // 0.12..0.40
+    let sign = if rand_u64(0, 1) == 0 { -1.0 } else { 1.0 };
+    sign * frac * half
 }
 
 fn detect_chrome() -> Option<PathBuf> {
