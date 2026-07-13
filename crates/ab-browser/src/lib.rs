@@ -814,10 +814,11 @@ impl Page {
 
     /// Click a node by ref: glide the pointer to it, then press/release with a
     /// human-like dwell. Falls back to a DOM `.click()` when there is no box.
-    pub async fn click(&self, backend: i64) -> Result<()> {
-        // Actionability, Playwright-style: scroll the target into view FIRST so
-        // its box-model coordinates are valid (an off-screen element yields a
-        // point the real mouse event can't reach). Then let layout settle.
+    /// Playwright-style pre-action: bring the node into the viewport so its
+    /// box-model coordinates are valid, then let layout settle briefly. Used by
+    /// every coordinate-based action (click/hover/drag) and by focus/type so
+    /// off-screen targets don't silently miss.
+    async fn scroll_into_view(&self, backend: i64) {
         let _ = self
             .client
             .send_on(
@@ -827,6 +828,51 @@ impl Page {
             )
             .await;
         tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
+    }
+
+    /// Fallback hover: dispatch pointer/mouse-over events directly on the node,
+    /// for when the real pointer move can't reach an occluded target.
+    async fn dispatch_hover_on_node(&self, backend: i64) -> Result<bool> {
+        let Some(obj) = self.resolve_object(backend).await? else {
+            return Ok(false);
+        };
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": obj,
+                    "returnByValue": true,
+                    "functionDeclaration": r#"function(){
+                        const el = this;
+                        el.scrollIntoView({block:'center', inline:'center'});
+                        const r = el.getBoundingClientRect();
+                        const cx = r.left + r.width/2, cy = r.top + r.height/2;
+                        const o = {bubbles:true, cancelable:true, composed:true,
+                            clientX:cx, clientY:cy, pointerId:1, pointerType:'mouse',
+                            isPrimary:true, view:window};
+                        el.dispatchEvent(new PointerEvent('pointerover', o));
+                        el.dispatchEvent(new PointerEvent('pointerenter', o));
+                        el.dispatchEvent(new MouseEvent('mouseover', o));
+                        el.dispatchEvent(new MouseEvent('mousemove', o));
+                        return true;
+                    }"#,
+                }),
+            )
+            .await?;
+        Ok(res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    pub async fn click(&self, backend: i64) -> Result<()> {
+        // Actionability, Playwright-style: scroll the target into view FIRST so
+        // its box-model coordinates are valid (an off-screen element yields a
+        // point the real mouse event can't reach).
+        self.scroll_into_view(backend).await;
 
         if let Some((x, y)) = self.node_center(backend).await? {
             // Only fire a real coordinate click if the point actually lands on
@@ -880,6 +926,7 @@ impl Page {
     /// random intervals. When `clear` is set, existing content is selected and
     /// replaced first.
     pub async fn type_text(&self, backend: i64, text: &str, clear: bool) -> Result<()> {
+        self.scroll_into_view(backend).await;
         self.client
             .send_on(&self.session_id, "DOM.focus", json!({ "backendNodeId": backend }))
             .await?;
@@ -1084,6 +1131,7 @@ impl Page {
 
     /// Focus an element by backend node id.
     pub async fn focus(&self, backend: i64) -> Result<()> {
+        self.scroll_into_view(backend).await;
         self.client
             .send_on(&self.session_id, "DOM.focus", json!({ "backendNodeId": backend }))
             .await?;
@@ -1124,15 +1172,23 @@ impl Page {
 impl Page {
     /// Hover the pointer over an element by ref — glides there continuously.
     pub async fn hover(&self, backend: i64) -> Result<()> {
+        self.scroll_into_view(backend).await;
         if let Some((x, y)) = self.node_center(backend).await? {
-            self.human_move_to(x, y).await
-        } else {
-            Err(BrowserError::Protocol("element has no box to hover".into()))
+            // Real pointer glide only if the point lands on the target;
+            // otherwise dispatch hover events on the node (occluded target).
+            if self.point_hits_node(backend, x, y).await.unwrap_or(true) {
+                return self.human_move_to(x, y).await;
+            }
         }
+        if self.dispatch_hover_on_node(backend).await? {
+            return Ok(());
+        }
+        Err(BrowserError::Protocol("element has no box to hover".into()))
     }
 
     /// Set the value of a <select> by ref and fire input/change events.
     pub async fn select_option(&self, backend: i64, value: &str) -> Result<()> {
+        self.scroll_into_view(backend).await;
         let obj = self
             .resolve_object(backend)
             .await?
@@ -1366,9 +1422,12 @@ impl Page {
 
     /// Drag from one element to another (press, glide, release).
     pub async fn drag(&self, from: i64, to: i64) -> Result<()> {
-        let (Some((fx, fy)), Some((tx, ty))) =
-            (self.node_center(from).await?, self.node_center(to).await?)
-        else {
+        // Bring both endpoints into view so their coordinates are valid.
+        self.scroll_into_view(from).await;
+        let from_pt = self.node_center(from).await?;
+        self.scroll_into_view(to).await;
+        let to_pt = self.node_center(to).await?;
+        let (Some((fx, fy)), Some((tx, ty))) = (from_pt, to_pt) else {
             return Err(BrowserError::Protocol("drag source/target has no box".into()));
         };
         self.human_move_to(fx, fy).await?;
