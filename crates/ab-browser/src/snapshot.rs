@@ -41,7 +41,10 @@ fn is_interactive(role: &str) -> bool {
 
 /// Roles that carry no useful structure on their own and can be flattened out.
 fn is_noise(role: &str) -> bool {
-    matches!(role, "none" | "generic" | "InlineTextBox" | "" | "presentation")
+    matches!(
+        role,
+        "none" | "generic" | "InlineTextBox" | "" | "presentation"
+    )
 }
 
 /// AXValue is `{ "type": ..., "value": <string> }`; the payload is one level in.

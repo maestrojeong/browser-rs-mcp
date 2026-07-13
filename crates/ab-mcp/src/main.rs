@@ -495,7 +495,10 @@ impl BrowserServer {
 
     async fn last_text(&self, id: &str) -> String {
         let st = self.state.lock().await;
-        st.pages.get(id).map(|e| e.last_text.clone()).unwrap_or_default()
+        st.pages
+            .get(id)
+            .map(|e| e.last_text.clone())
+            .unwrap_or_default()
     }
 
     async fn netlog_of(&self, id: &str) -> Option<NetworkLog> {
@@ -507,19 +510,40 @@ impl BrowserServer {
     async fn storage_list(&self, page_id: &str, kind: &str) -> Result<CallToolResult, McpError> {
         let page = self.page_of(page_id).await?;
         let v = page.web_storage_list(kind).await.map_err(fail)?;
-        Ok(ok(serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())))
+        Ok(ok(
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
+        ))
     }
-    async fn storage_get(&self, page_id: &str, kind: &str, key: &str) -> Result<CallToolResult, McpError> {
+    async fn storage_get(
+        &self,
+        page_id: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(page_id).await?;
         let v = page.web_storage_get(kind, key).await.map_err(fail)?;
-        Ok(ok(v.as_str().map(str::to_string).unwrap_or_else(|| "(null)".into())))
+        Ok(ok(v
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "(null)".into())))
     }
-    async fn storage_set(&self, page_id: &str, kind: &str, key: &str, value: &str) -> Result<CallToolResult, McpError> {
+    async fn storage_set(
+        &self,
+        page_id: &str,
+        kind: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(page_id).await?;
         page.web_storage_set(kind, key, value).await.map_err(fail)?;
         Ok(ok(format!("set {kind}[{key}]")))
     }
-    async fn storage_delete(&self, page_id: &str, kind: &str, key: &str) -> Result<CallToolResult, McpError> {
+    async fn storage_delete(
+        &self,
+        page_id: &str,
+        kind: &str,
+        key: &str,
+    ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(page_id).await?;
         page.web_storage_delete(kind, key).await.map_err(fail)?;
         Ok(ok(format!("deleted {kind}[{key}]")))
@@ -590,7 +614,8 @@ impl BrowserServer {
             let page = self.page_of(pid).await?;
             page.navigate(&a.url).await.map_err(fail)?;
             let snap = page.snapshot().await.map_err(fail)?;
-            self.store_snapshot(pid, snap.refs.clone(), snap.text.clone()).await;
+            self.store_snapshot(pid, snap.refs.clone(), snap.text.clone())
+                .await;
             return Ok(ok(format!("page {pid}\nurl {}\n\n{}", a.url, snap.text)));
         }
         let (id, text) = self.open_page(&a.url).await?;
@@ -684,7 +709,9 @@ impl BrowserServer {
             let status = if e.failed {
                 "FAIL".to_string()
             } else {
-                e.status.map(|s| s.to_string()).unwrap_or_else(|| "…".into())
+                e.status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "…".into())
             };
             out.push_str(&format!(
                 "{:>4} {:<6} {:<10} {}\n",
@@ -771,7 +798,9 @@ impl BrowserServer {
     }
 
     /// Draw a highlight box over an element (debug aid).
-    #[tool(description = "Highlight an element by ref/selector with an overlay box (debug/inspection)")]
+    #[tool(
+        description = "Highlight an element by ref/selector with an overlay box (debug/inspection)"
+    )]
     async fn browser_highlight(
         &self,
         Parameters(a): Parameters<RefArgs>,
@@ -809,7 +838,9 @@ impl BrowserServer {
     }
 
     /// Make an HTTP request from the page context (sends the page's cookies).
-    #[tool(description = "HTTP request from the page context (uses session cookies); returns status + body")]
+    #[tool(
+        description = "HTTP request from the page context (uses session cookies); returns status + body"
+    )]
     async fn browser_api_request(
         &self,
         Parameters(a): Parameters<ApiRequestArgs>,
@@ -817,10 +848,18 @@ impl BrowserServer {
         let page = self.page_of(&a.page).await?;
         let headers = a.headers.unwrap_or_else(|| serde_json::json!({}));
         let v = page
-            .api_request(&a.url, a.method.as_deref().unwrap_or("GET"), &headers, a.data.as_deref())
+            .api_request(
+                &a.url,
+                a.method.as_deref().unwrap_or("GET"),
+                &headers,
+                a.data.as_deref(),
+            )
             .await
             .map_err(fail)?;
-        Ok(ok(v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+        Ok(ok(v
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| v.to_string())))
     }
 
     /// Set files on a file input (by ref or selector).
@@ -836,13 +875,19 @@ impl BrowserServer {
     }
 
     /// Drag from one element to another (by ref or selector).
-    #[tool(description = "Drag from source to target (each by ref or selector); returns settle-diff")]
+    #[tool(
+        description = "Drag from source to target (each by ref or selector); returns settle-diff"
+    )]
     async fn browser_drag(
         &self,
         Parameters(a): Parameters<DragArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let from = self.resolve(&a.page, &a.source_ref, &a.source_selector).await?;
-        let to = self.resolve(&a.page, &a.target_ref, &a.target_selector).await?;
+        let from = self
+            .resolve(&a.page, &a.source_ref, &a.source_selector)
+            .await?;
+        let to = self
+            .resolve(&a.page, &a.target_ref, &a.target_selector)
+            .await?;
         let page = self.page_of(&a.page).await?;
         page.drag(from, to).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
@@ -858,7 +903,9 @@ impl BrowserServer {
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
         let c = page.cookies().await.map_err(fail)?;
-        Ok(ok(serde_json::to_string_pretty(&c).unwrap_or_else(|_| "[]".into())))
+        Ok(ok(
+            serde_json::to_string_pretty(&c).unwrap_or_else(|_| "[]".into())
+        ))
     }
 
     /// Get a single cookie's value by name.
@@ -869,9 +916,10 @@ impl BrowserServer {
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
         let c = page.cookies().await.map_err(fail)?;
-        let found = c
-            .as_array()
-            .and_then(|arr| arr.iter().find(|ck| ck.get("name").and_then(|n| n.as_str()) == Some(&a.name)));
+        let found = c.as_array().and_then(|arr| {
+            arr.iter()
+                .find(|ck| ck.get("name").and_then(|n| n.as_str()) == Some(&a.name))
+        });
         Ok(ok(match found {
             Some(ck) => serde_json::to_string_pretty(ck).unwrap_or_default(),
             None => format!("(no cookie named {:?})", a.name),
@@ -932,52 +980,84 @@ impl BrowserServer {
     // ---- localStorage / sessionStorage (granular) ----
     /// List all localStorage entries.
     #[tool(description = "List localStorage entries")]
-    async fn browser_localstorage_list(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+    async fn browser_localstorage_list(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_list(&a.page, "localStorage").await
     }
     /// Get a localStorage value.
     #[tool(description = "Get a localStorage item by key")]
-    async fn browser_localstorage_get(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+    async fn browser_localstorage_get(
+        &self,
+        Parameters(a): Parameters<StorageKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_get(&a.page, "localStorage", &a.key).await
     }
     /// Set a localStorage value.
     #[tool(description = "Set a localStorage item")]
-    async fn browser_localstorage_set(&self, Parameters(a): Parameters<StorageSetArgs>) -> Result<CallToolResult, McpError> {
-        self.storage_set(&a.page, "localStorage", &a.key, &a.value).await
+    async fn browser_localstorage_set(
+        &self,
+        Parameters(a): Parameters<StorageSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.storage_set(&a.page, "localStorage", &a.key, &a.value)
+            .await
     }
     /// Delete a localStorage key.
     #[tool(description = "Delete a localStorage item by key")]
-    async fn browser_localstorage_delete(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+    async fn browser_localstorage_delete(
+        &self,
+        Parameters(a): Parameters<StorageKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_delete(&a.page, "localStorage", &a.key).await
     }
     /// Clear localStorage.
     #[tool(description = "Clear all localStorage")]
-    async fn browser_localstorage_clear(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+    async fn browser_localstorage_clear(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_clear(&a.page, "localStorage").await
     }
     /// List all sessionStorage entries.
     #[tool(description = "List sessionStorage entries")]
-    async fn browser_sessionstorage_list(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+    async fn browser_sessionstorage_list(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_list(&a.page, "sessionStorage").await
     }
     /// Get a sessionStorage value.
     #[tool(description = "Get a sessionStorage item by key")]
-    async fn browser_sessionstorage_get(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+    async fn browser_sessionstorage_get(
+        &self,
+        Parameters(a): Parameters<StorageKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_get(&a.page, "sessionStorage", &a.key).await
     }
     /// Set a sessionStorage value.
     #[tool(description = "Set a sessionStorage item")]
-    async fn browser_sessionstorage_set(&self, Parameters(a): Parameters<StorageSetArgs>) -> Result<CallToolResult, McpError> {
-        self.storage_set(&a.page, "sessionStorage", &a.key, &a.value).await
+    async fn browser_sessionstorage_set(
+        &self,
+        Parameters(a): Parameters<StorageSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.storage_set(&a.page, "sessionStorage", &a.key, &a.value)
+            .await
     }
     /// Delete a sessionStorage key.
     #[tool(description = "Delete a sessionStorage item by key")]
-    async fn browser_sessionstorage_delete(&self, Parameters(a): Parameters<StorageKeyArgs>) -> Result<CallToolResult, McpError> {
+    async fn browser_sessionstorage_delete(
+        &self,
+        Parameters(a): Parameters<StorageKeyArgs>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_delete(&a.page, "sessionStorage", &a.key).await
     }
     /// Clear sessionStorage.
     #[tool(description = "Clear all sessionStorage")]
-    async fn browser_sessionstorage_clear(&self, Parameters(a): Parameters<PageArg>) -> Result<CallToolResult, McpError> {
+    async fn browser_sessionstorage_clear(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
         self.storage_clear(&a.page, "sessionStorage").await
     }
 
@@ -991,11 +1071,17 @@ impl BrowserServer {
         let cookies = page.cookies().await.map_err(fail)?;
         let local = page.local_storage().await.unwrap_or(serde_json::json!({}));
         let blob = serde_json::json!({ "cookies": cookies, "localStorage": local });
-        tokio::fs::write(&a.path, serde_json::to_vec_pretty(&blob).unwrap_or_default())
-            .await
-            .map_err(fail)?;
+        tokio::fs::write(
+            &a.path,
+            serde_json::to_vec_pretty(&blob).unwrap_or_default(),
+        )
+        .await
+        .map_err(fail)?;
         let n = cookies.as_array().map(|c| c.len()).unwrap_or(0);
-        Ok(ok(format!("saved {n} cookies + localStorage to {}", a.path)))
+        Ok(ok(format!(
+            "saved {n} cookies + localStorage to {}",
+            a.path
+        )))
     }
 
     /// Restore cookies + localStorage from a JSON file (re-auth a session).
@@ -1013,7 +1099,10 @@ impl BrowserServer {
         if let Some(local) = blob.get("localStorage") {
             let _ = page.set_local_storage(local).await;
         }
-        Ok(ok(format!("loaded session from {} (reload the page to apply)", a.path)))
+        Ok(ok(format!(
+            "loaded session from {} (reload the page to apply)",
+            a.path
+        )))
     }
 
     /// Hover the pointer over an element by ref.
@@ -1039,7 +1128,10 @@ impl BrowserServer {
         let page = self.page_of(&a.page).await?;
         page.select_option(backend, &a.value).await.map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("selected {:?} on {}\n\n{}", a.value, a.page, diff)))
+        Ok(ok(format!(
+            "selected {:?} on {}\n\n{}",
+            a.value, a.page, diff
+        )))
     }
 
     /// Install a virtual authenticator so WebAuthn/passkey prompts don't block.
@@ -1085,15 +1177,25 @@ impl BrowserServer {
         let page = self.page_of(&a.page).await?;
         let ms = a.timeout_ms.unwrap_or(10_000);
         let (found, what) = if let Some(t) = &a.text {
-            (page.wait_for_text(t, ms).await.map_err(fail)?, format!("text {t:?}"))
+            (
+                page.wait_for_text(t, ms).await.map_err(fail)?,
+                format!("text {t:?}"),
+            )
         } else if let Some(s) = &a.selector {
-            (page.wait_for_selector(s, ms).await.map_err(fail)?, format!("selector {s:?}"))
+            (
+                page.wait_for_selector(s, ms).await.map_err(fail)?,
+                format!("selector {s:?}"),
+            )
         } else {
             return Err(fail("provide `text` or `selector`"));
         };
         Ok(ok(format!(
             "{} {} on {}",
-            if found { "found" } else { "TIMEOUT waiting for" },
+            if found {
+                "found"
+            } else {
+                "TIMEOUT waiting for"
+            },
             what,
             a.page
         )))
@@ -1101,7 +1203,9 @@ impl BrowserServer {
 
     /// Run one-shot JavaScript. Isolated world by default (undetectable); pass
     /// main_world=true to read page-set window globals.
-    #[tool(description = "Evaluate JS (isolated world by default; main_world=true for page globals)")]
+    #[tool(
+        description = "Evaluate JS (isolated world by default; main_world=true for page globals)"
+    )]
     async fn browser_evaluate(
         &self,
         Parameters(a): Parameters<EvalArgs>,
@@ -1112,7 +1216,9 @@ impl BrowserServer {
         } else {
             page.evaluate(&a.expression).await.map_err(fail)?
         };
-        Ok(ok(serde_json::to_string(&v).unwrap_or_else(|_| "null".into())))
+        Ok(ok(
+            serde_json::to_string(&v).unwrap_or_else(|_| "null".into())
+        ))
     }
 
     /// Extract the page as Markdown (headings, links, lists, code).
@@ -1136,11 +1242,16 @@ impl BrowserServer {
         let mut done = 0;
         for f in &a.fields {
             let backend = self.backend_of(&a.page, &f.ref_).await?;
-            page.type_text(backend, &f.value, true).await.map_err(fail)?;
+            page.type_text(backend, &f.value, true)
+                .await
+                .map_err(fail)?;
             done += 1;
         }
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("filled {done} field(s) on {}\n\n{}", a.page, diff)))
+        Ok(ok(format!(
+            "filled {done} field(s) on {}\n\n{}",
+            a.page, diff
+        )))
     }
 
     /// Save the page as a PDF file; returns the path. (Headless mode only.)
@@ -1233,7 +1344,9 @@ impl BrowserServer {
 
     /// Get recent console messages for a page. NOTE: enables the Runtime CDP
     /// domain on first use (a stealth tell) and captures messages from then on.
-    #[tool(description = "Get console messages (enables Runtime on first use — a stealth tradeoff)")]
+    #[tool(
+        description = "Get console messages (enables Runtime on first use — a stealth tradeoff)"
+    )]
     async fn browser_console_messages(
         &self,
         Parameters(a): Parameters<PageArg>,
@@ -1259,7 +1372,8 @@ impl BrowserServer {
         };
         let lines = log.recent(200);
         Ok(ok(if lines.is_empty() {
-            "(no console messages captured yet — capture starts when this tool is first called)".to_string()
+            "(no console messages captured yet — capture starts when this tool is first called)"
+                .to_string()
         } else {
             lines.join("\n")
         }))
@@ -1272,7 +1386,9 @@ impl BrowserServer {
         Parameters(a): Parameters<IframeClickArgs>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
-        page.iframe_click(&a.frame_selector, &a.selector).await.map_err(fail)?;
+        page.iframe_click(&a.frame_selector, &a.selector)
+            .await
+            .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("iframe-clicked on {}\n\n{}", a.page, diff)))
     }
@@ -1284,7 +1400,9 @@ impl BrowserServer {
         Parameters(a): Parameters<IframeFillArgs>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
-        page.iframe_fill(&a.frame_selector, &a.selector, &a.value).await.map_err(fail)?;
+        page.iframe_fill(&a.frame_selector, &a.selector, &a.value)
+            .await
+            .map_err(fail)?;
         Ok(ok(format!("iframe-filled on {}", a.page)))
     }
 
@@ -1302,7 +1420,9 @@ impl BrowserServer {
             serde_json::to_string(&args).unwrap_or_else(|_| "[]".into())
         );
         let v = page.evaluate(&wrapped).await.map_err(fail)?;
-        Ok(ok(serde_json::to_string(&v).unwrap_or_else(|_| "null".into())))
+        Ok(ok(
+            serde_json::to_string(&v).unwrap_or_else(|_| "null".into())
+        ))
     }
 
     /// Switch focus to a page (returns its current snapshot).
@@ -1313,7 +1433,8 @@ impl BrowserServer {
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
         let snap = page.snapshot().await.map_err(fail)?;
-        self.store_snapshot(&a.page, snap.refs.clone(), snap.text.clone()).await;
+        self.store_snapshot(&a.page, snap.refs.clone(), snap.text.clone())
+            .await;
         Ok(ok(format!("page {}\n\n{}", a.page, snap.text)))
     }
 
@@ -1363,7 +1484,10 @@ impl BrowserServer {
     async fn browser_pages(&self) -> Result<CallToolResult, McpError> {
         let entries: Vec<(String, Page)> = {
             let st = self.state.lock().await;
-            st.pages.iter().map(|(k, v)| (k.clone(), v.page.clone())).collect()
+            st.pages
+                .iter()
+                .map(|(k, v)| (k.clone(), v.page.clone()))
+                .collect()
         };
         if entries.is_empty() {
             return Ok(ok("(no open pages)".to_string()));
@@ -1385,7 +1509,10 @@ impl BrowserServer {
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
         page.resize(a.width, a.height).await.map_err(fail)?;
-        Ok(ok(format!("resized {} to {}x{}", a.page, a.width, a.height)))
+        Ok(ok(format!(
+            "resized {} to {}x{}",
+            a.page, a.width, a.height
+        )))
     }
 
     /// Close a page and forget its refs.
@@ -1438,7 +1565,10 @@ impl BrowserServer {
             langs.as_str().map(|x| !x.is_empty()).unwrap_or(false),
             format!("navigator.languages = {langs}"),
         ));
-        checks.push((get("hasChrome").as_bool().unwrap_or(false), "window.chrome present".into()));
+        checks.push((
+            get("hasChrome").as_bool().unwrap_or(false),
+            "window.chrome present".into(),
+        ));
         let headless = get("headlessUA").as_bool().unwrap_or(false);
         checks.push((!headless, format!("headless in UA = {headless}")));
 
@@ -1484,9 +1614,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // HTTP mode if --port (or AB_HTTP) is given; otherwise stdio.
-    let port = cli
-        .port
-        .or_else(|| std::env::var("AB_HTTP").ok().and_then(|v| v.split(':').last()?.parse().ok()));
+    let port = cli.port.or_else(|| {
+        std::env::var("AB_HTTP")
+            .ok()
+            .and_then(|v| v.split(':').next_back()?.parse().ok())
+    });
     if let Some(port) = port {
         return serve_http(&format!("{}:{}", cli.host, port)).await;
     }
@@ -1562,8 +1694,6 @@ fn parse_cli() -> Cli {
     c
 }
 
-/// Serve over the MCP Streamable HTTP transport (endpoint: `/mcp`). Each client
-/// session gets its own BrowserServer (and thus its own browser).
 // --- Legacy SSE transport (`/sse` + `/message`) ------------------------------
 //
 // rmcp 2.2 ships only the streamable-HTTP server (`/mcp`); it has no legacy SSE
@@ -1577,7 +1707,8 @@ fn parse_cli() -> Cli {
 // JSON-RPC to that endpoint. We bridge each session to rmcp's service by wiring
 // a `(Sink, Stream)` pair (futures unbounded channels) into `serve()`.
 
-type SseSessions = Arc<Mutex<HashMap<String, futures::channel::mpsc::UnboundedSender<ClientJsonRpcMessage>>>>;
+type SseSessions =
+    Arc<Mutex<HashMap<String, futures::channel::mpsc::UnboundedSender<ClientJsonRpcMessage>>>>;
 
 #[derive(Clone)]
 struct SseState {
@@ -1600,8 +1731,9 @@ fn new_session_id() -> String {
 
 async fn sse_get(
     axum::extract::State(state): axum::extract::State<SseState>,
-) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
-{
+) -> axum::response::sse::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::StreamExt;
 
@@ -1609,7 +1741,8 @@ async fn sse_get(
     // server → client (TX): rmcp writes here, the SSE stream drains it.
     let (to_client_tx, to_client_rx) = futures::channel::mpsc::unbounded::<ServerJsonRpcMessage>();
     // client → server (RX): POST handler pushes here, rmcp reads it.
-    let (from_client_tx, from_client_rx) = futures::channel::mpsc::unbounded::<ClientJsonRpcMessage>();
+    let (from_client_tx, from_client_rx) =
+        futures::channel::mpsc::unbounded::<ClientJsonRpcMessage>();
 
     state
         .sessions

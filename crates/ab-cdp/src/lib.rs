@@ -152,7 +152,7 @@ impl CdpClient {
             let sink = guard.as_mut().ok_or(CdpError::Closed)?;
             let text = serde_json::to_string(&msg)?;
             trace!("-> {text}");
-            sink.send(Message::Text(text.into()))
+            sink.send(Message::Text(text))
                 .await
                 .map_err(|e| CdpError::Protocol(e.to_string()))?;
         }

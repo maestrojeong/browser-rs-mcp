@@ -172,7 +172,10 @@ impl Browser {
         let mut args: Vec<String> = vec![
             format!("--remote-debugging-port={}", opts.port),
             format!("--user-data-dir={}", data_dir.display()),
-            format!("--window-size={},{}", opts.window_size.0, opts.window_size.1),
+            format!(
+                "--window-size={},{}",
+                opts.window_size.0, opts.window_size.1
+            ),
             "--remote-allow-origins=*".to_string(),
         ];
         if opts.headless {
@@ -391,7 +394,7 @@ impl Page {
                     }
                 }
                 Ok(Err(_)) => return Ok(()), // lagged/closed: proceed best-effort
-                Err(_) => return Ok(()),      // timeout: proceed best-effort
+                Err(_) => return Ok(()),     // timeout: proceed best-effort
             }
         }
     }
@@ -561,12 +564,7 @@ impl Page {
           walk(document.body || document.documentElement);
           return out.join('\n\n');
         })()"#;
-        Ok(self
-            .evaluate(js)
-            .await?
-            .as_str()
-            .unwrap_or("")
-            .to_string())
+        Ok(self.evaluate(js).await?.as_str().unwrap_or("").to_string())
     }
 }
 
@@ -621,7 +619,10 @@ impl Page {
             .client
             .send_on(&self.session_id, "DOM.getDocument", json!({ "depth": 0 }))
             .await?;
-        let Some(root) = doc.get("root").and_then(|r| r.get("nodeId")).and_then(Value::as_i64)
+        let Some(root) = doc
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(Value::as_i64)
         else {
             return Ok(None);
         };
@@ -640,13 +641,25 @@ impl Page {
         let Some(nid) = nid else { return Ok(None) };
         let d = self
             .client
-            .send_on(&self.session_id, "DOM.describeNode", json!({ "nodeId": nid }))
+            .send_on(
+                &self.session_id,
+                "DOM.describeNode",
+                json!({ "nodeId": nid }),
+            )
             .await?;
-        Ok(d.get("node").and_then(|n| n.get("backendNodeId")).and_then(Value::as_i64))
+        Ok(d.get("node")
+            .and_then(|n| n.get("backendNodeId"))
+            .and_then(Value::as_i64))
     }
 
     /// Search the page's visible text for a query; returns matching snippets.
-    pub async fn find(&self, query: &str, regex: bool, ignore_case: bool, max: usize) -> Result<Value> {
+    pub async fn find(
+        &self,
+        query: &str,
+        regex: bool,
+        ignore_case: bool,
+        max: usize,
+    ) -> Result<Value> {
         let js = format!(
             r#"(() => {{
               const q = {q}, rx = {rx}, ic = {ic}, max = {max};
@@ -759,9 +772,12 @@ impl Page {
                 json!({ "backendNodeId": backend }),
             )
             .await;
-        Ok(res
-            .ok()
-            .and_then(|r| r.get("object").and_then(|o| o.get("objectId")).and_then(Value::as_str).map(String::from)))
+        Ok(res.ok().and_then(|r| {
+            r.get("object")
+                .and_then(|o| o.get("objectId"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        }))
     }
 
     /// Move the pointer to (x, y) like a human: a curved (cubic-Bézier) path
@@ -952,7 +968,11 @@ impl Page {
     pub async fn type_text(&self, backend: i64, text: &str, clear: bool) -> Result<()> {
         self.scroll_into_view(backend).await;
         self.client
-            .send_on(&self.session_id, "DOM.focus", json!({ "backendNodeId": backend }))
+            .send_on(
+                &self.session_id,
+                "DOM.focus",
+                json!({ "backendNodeId": backend }),
+            )
             .await?;
         if clear {
             if let Some(obj) = self.resolve_object(backend).await? {
@@ -1060,7 +1080,8 @@ impl Page {
                 match rx.recv().await {
                     Ok(ev) if ev.session_id.as_deref() == Some(&sid) => match ev.method.as_str() {
                         "Page.loadEventFired" => return Some(true),
-                        "Page.frameStartedLoading" | "Page.frameRequestedNavigation"
+                        "Page.frameStartedLoading"
+                        | "Page.frameRequestedNavigation"
                         | "Page.navigatedWithinDocument" => return Some(false),
                         _ => {}
                     },
@@ -1072,9 +1093,9 @@ impl Page {
         .await;
 
         match detected {
-            Ok(Some(true)) => {}                        // already loaded
+            Ok(Some(true)) => {}                                         // already loaded
             Ok(Some(false)) => self.wait_for_load().await.unwrap_or(()), // nav in flight
-            _ => tokio::time::sleep(Duration::from_millis(350)).await, // no nav: DOM grace
+            _ => tokio::time::sleep(Duration::from_millis(350)).await,   // no nav: DOM grace
         }
     }
 
@@ -1090,7 +1111,12 @@ impl Page {
     }
 
     /// Fill an input inside a same-origin iframe (main-world JS).
-    pub async fn iframe_fill(&self, frame_selector: &str, selector: &str, value: &str) -> Result<()> {
+    pub async fn iframe_fill(
+        &self,
+        frame_selector: &str,
+        selector: &str,
+        value: &str,
+    ) -> Result<()> {
         let js = format!(
             r#"(() => {{ const f=document.querySelector({fs}); const d=f&&(f.contentDocument||(f.contentWindow&&f.contentWindow.document)); const el=d&&d.querySelector({s}); if(!el) throw new Error('iframe element not found'); el.focus(); el.value={v}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return true; }})()"#,
             fs = serde_json::to_string(frame_selector).unwrap_or_else(|_| "\"\"".into()),
@@ -1118,7 +1144,11 @@ impl Page {
                 }
                 match ev.method.as_str() {
                     "Runtime.consoleAPICalled" => {
-                        let kind = ev.params.get("type").and_then(Value::as_str).unwrap_or("log");
+                        let kind = ev
+                            .params
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("log");
                         let args: Vec<String> = ev
                             .params
                             .get("args")
@@ -1128,13 +1158,20 @@ impl Page {
                                     .map(|x| {
                                         x.get("value")
                                             .map(|v| v.to_string())
-                                            .or_else(|| x.get("description").and_then(Value::as_str).map(String::from))
+                                            .or_else(|| {
+                                                x.get("description")
+                                                    .and_then(Value::as_str)
+                                                    .map(String::from)
+                                            })
                                             .unwrap_or_default()
                                     })
                                     .collect()
                             })
                             .unwrap_or_default();
-                        l.lines.lock().unwrap().push(format!("[{kind}] {}", args.join(" ")));
+                        l.lines
+                            .lock()
+                            .unwrap()
+                            .push(format!("[{kind}] {}", args.join(" ")));
                     }
                     "Runtime.exceptionThrown" => {
                         let txt = ev
@@ -1157,7 +1194,11 @@ impl Page {
     pub async fn focus(&self, backend: i64) -> Result<()> {
         self.scroll_into_view(backend).await;
         self.client
-            .send_on(&self.session_id, "DOM.focus", json!({ "backendNodeId": backend }))
+            .send_on(
+                &self.session_id,
+                "DOM.focus",
+                json!({ "backendNodeId": backend }),
+            )
             .await?;
         Ok(())
     }
@@ -1245,7 +1286,11 @@ impl Page {
         resident_key: bool,
     ) -> Result<String> {
         self.client
-            .send_on(&self.session_id, "WebAuthn.enable", json!({ "enableUI": false }))
+            .send_on(
+                &self.session_id,
+                "WebAuthn.enable",
+                json!({ "enableUI": false }),
+            )
             .await?;
         let res = self
             .client
@@ -1277,7 +1322,10 @@ impl Page {
             .client
             .send_on(&self.session_id, "Page.getNavigationHistory", json!({}))
             .await?;
-        let idx = hist.get("currentIndex").and_then(Value::as_i64).unwrap_or(0);
+        let idx = hist
+            .get("currentIndex")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         if idx <= 0 {
             return Ok(());
         }
@@ -1355,9 +1403,21 @@ impl Page {
                     "Network.requestWillBeSent" => {
                         if let (Some(id), Some(req)) = (rid, p.get("request")) {
                             let entry = NetEntry {
-                                url: req.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
-                                method: req.get("method").and_then(Value::as_str).unwrap_or("").to_string(),
-                                resource_type: p.get("type").and_then(Value::as_str).unwrap_or("").to_string(),
+                                url: req
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                method: req
+                                    .get("method")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                resource_type: p
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
                                 status: None,
                                 failed: false,
                             };
@@ -1369,7 +1429,10 @@ impl Page {
                     }
                     "Network.responseReceived" => {
                         if let Some(id) = rid {
-                            let status = p.get("response").and_then(|r| r.get("status")).and_then(Value::as_i64);
+                            let status = p
+                                .get("response")
+                                .and_then(|r| r.get("status"))
+                                .and_then(Value::as_i64);
                             let mut st = l.state.lock().unwrap();
                             if let Some(&idx) = st.index.get(id) {
                                 if let Some(e) = st.entries.get_mut(idx) {
@@ -1414,7 +1477,11 @@ impl Page {
     /// Clear all blocked-URL patterns.
     pub async fn clear_blocked_urls(&self) -> Result<()> {
         self.client
-            .send_on(&self.session_id, "Network.setBlockedURLs", json!({ "urls": [] }))
+            .send_on(
+                &self.session_id,
+                "Network.setBlockedURLs",
+                json!({ "urls": [] }),
+            )
             .await?;
         Ok(())
     }
@@ -1491,7 +1558,9 @@ impl Page {
         self.scroll_into_view(to).await;
         let to_pt = self.node_center(to).await?;
         let (Some((fx, fy)), Some((tx, ty))) = (from_pt, to_pt) else {
-            return Err(BrowserError::Protocol("drag source/target has no box".into()));
+            return Err(BrowserError::Protocol(
+                "drag source/target has no box".into(),
+            ));
         };
         self.human_move_to(fx, fy).await?;
         self.client
@@ -1560,7 +1629,12 @@ impl Page {
     }
 
     /// Delete cookies matching name (+ optional domain/path).
-    pub async fn cookie_delete(&self, name: &str, domain: Option<&str>, path: Option<&str>) -> Result<()> {
+    pub async fn cookie_delete(
+        &self,
+        name: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<()> {
         let mut p = json!({ "name": name });
         if let Some(d) = domain {
             p["domain"] = json!(d);
@@ -1615,7 +1689,8 @@ impl Page {
         Ok(())
     }
     pub async fn web_storage_clear(&self, kind: &str) -> Result<()> {
-        self.evaluate_main(&format!("window.{kind}.clear()")).await?;
+        self.evaluate_main(&format!("window.{kind}.clear()"))
+            .await?;
         Ok(())
     }
 
@@ -1802,7 +1877,11 @@ impl Page {
                 .collect()
         };
         self.client
-            .send_on(&self.session_id, "Fetch.enable", json!({ "patterns": patterns }))
+            .send_on(
+                &self.session_id,
+                "Fetch.enable",
+                json!({ "patterns": patterns }),
+            )
             .await?;
 
         if start_loop {
@@ -1813,8 +1892,7 @@ impl Page {
             tokio::spawn(async move {
                 use base64::Engine;
                 while let Ok(ev) = rx.recv().await {
-                    if ev.session_id.as_deref() != Some(&sid)
-                        || ev.method != "Fetch.requestPaused"
+                    if ev.session_id.as_deref() != Some(&sid) || ev.method != "Fetch.requestPaused"
                     {
                         continue;
                     }
@@ -1840,8 +1918,8 @@ impl Page {
                     };
                     match hit {
                         Some(m) => {
-                            let b64 = base64::engine::general_purpose::STANDARD
-                                .encode(m.body.as_bytes());
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(m.body.as_bytes());
                             let _ = client
                                 .send_on(
                                     &sid,
@@ -1912,7 +1990,9 @@ fn rand_u64(min: u64, max: u64) -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut x = n.wrapping_mul(2654435761).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut x = n
+        .wrapping_mul(2654435761)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
     x ^= x >> 13;
     x ^= x << 7;
     x ^= x >> 17;
@@ -1987,10 +2067,7 @@ fn detect_chrome() -> Option<PathBuf> {
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
     ];
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
 /// Chrome writes the chosen debugging port to `<user-data-dir>/DevToolsActivePort`.
