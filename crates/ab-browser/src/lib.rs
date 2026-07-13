@@ -131,10 +131,6 @@ pub struct Browser {
     user_agent: String,
     /// Whether to inject the JS stealth-patching layer into new pages.
     inject_stealth: bool,
-    /// Outer window size to enforce (launch mode only). Keeps
-    /// `window.outerWidth/Height` non-zero — an off-screen/unrealized window can
-    /// report 0, which detectors flag as headless.
-    window_size: (u32, u32),
 }
 
 impl Browser {
@@ -229,7 +225,6 @@ impl Browser {
             child: Some(child),
             user_agent,
             inject_stealth: opts.inject_stealth,
-            window_size: opts.window_size,
         })
     }
 
@@ -249,7 +244,6 @@ impl Browser {
             child: None,
             user_agent: String::new(),
             inject_stealth: false,
-            window_size: (1280, 800),
         })
     }
 
@@ -277,35 +271,6 @@ impl Browser {
             .and_then(Value::as_str)
             .ok_or_else(|| BrowserError::Protocol("no sessionId".into()))?
             .to_string();
-
-        // In launch mode, force real outer window geometry so
-        // `window.outerWidth/Height` are non-zero (an unrealized/off-screen
-        // window can report 0, which detectors flag). Never touch the user's
-        // window in connect mode.
-        if self.child.is_some() {
-            if let Ok(win) = self
-                .client
-                .send("Browser.getWindowForTarget", json!({ "targetId": target_id }))
-                .await
-            {
-                if let Some(window_id) = win.get("windowId").and_then(Value::as_i64) {
-                    let _ = self
-                        .client
-                        .send(
-                            "Browser.setWindowBounds",
-                            json!({
-                                "windowId": window_id,
-                                "bounds": {
-                                    "width": self.window_size.0,
-                                    "height": self.window_size.1,
-                                    "windowState": "normal",
-                                },
-                            }),
-                        )
-                        .await;
-                }
-            }
-        }
 
         let page = Page {
             client: self.client.clone(),
