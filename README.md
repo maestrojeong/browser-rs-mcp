@@ -12,7 +12,7 @@ actually use well, in a single ~5 MB binary.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 
-browser-rs --port 9321         # HTTP MCP at http://127.0.0.1:9321/mcp
+browser-rs --port 9321         # HTTP MCP: /mcp (streamable) + /sse (legacy)
 browser-rs                     # or stdio
 ```
 
@@ -27,7 +27,8 @@ Register with an MCP client:
   "command": "browser-rs"                    // stdio
 } } }
 // HTTP: run `browser-rs --port 9321` and point the client at
-//   http://127.0.0.1:9321/mcp
+//   http://127.0.0.1:9321/mcp   (streamable HTTP)  — or
+//   http://127.0.0.1:9321/sse   (legacy SSE, e.g. Claude SDK `type:"sse"`)
 ```
 
 ## vs mcp-patchright

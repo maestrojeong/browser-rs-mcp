@@ -22,3 +22,4 @@ tracing-subscriber.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 schemars.workspace = true
 axum.workspace = true
+futures = "0.3"

@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 use ab_browser::{Browser, ConsoleLog, LaunchOptions, NetworkLog, Page};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ClientJsonRpcMessage, ContentBlock, ServerCapabilities, ServerInfo,
+    ServerJsonRpcMessage,
+};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -1418,6 +1421,112 @@ fn parse_cli() -> Cli {
 
 /// Serve over the MCP Streamable HTTP transport (endpoint: `/mcp`). Each client
 /// session gets its own BrowserServer (and thus its own browser).
+// --- Legacy SSE transport (`/sse` + `/message`) ------------------------------
+//
+// rmcp 2.2 ships only the streamable-HTTP server (`/mcp`); it has no legacy SSE
+// server. But some MCP clients (e.g. the Claude Agent SDK's `type: "sse"`) still
+// speak the older HTTP+SSE transport. Serving it too makes browser-rs a true
+// drop-in for `mcp-patchright`, which exposes both `/sse` and `/mcp`.
+//
+// Protocol: client GETs `/sse` → server opens a `text/event-stream`, first emits
+// an `endpoint` event pointing at `/message?sessionId=<id>`, then relays every
+// server→client JSON-RPC message as a `message` event. Client POSTs its
+// JSON-RPC to that endpoint. We bridge each session to rmcp's service by wiring
+// a `(Sink, Stream)` pair (futures unbounded channels) into `serve()`.
+
+type SseSessions = Arc<Mutex<HashMap<String, futures::channel::mpsc::UnboundedSender<ClientJsonRpcMessage>>>>;
+
+#[derive(Clone)]
+struct SseState {
+    sessions: SseSessions,
+}
+
+fn new_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{nanos:016x}{n:08x}")
+}
+
+async fn sse_get(
+    axum::extract::State(state): axum::extract::State<SseState>,
+) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt;
+
+    let session_id = new_session_id();
+    // server → client (TX): rmcp writes here, the SSE stream drains it.
+    let (to_client_tx, to_client_rx) = futures::channel::mpsc::unbounded::<ServerJsonRpcMessage>();
+    // client → server (RX): POST handler pushes here, rmcp reads it.
+    let (from_client_tx, from_client_rx) = futures::channel::mpsc::unbounded::<ClientJsonRpcMessage>();
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), from_client_tx);
+
+    let sessions = state.sessions.clone();
+    let sid = session_id.clone();
+    tokio::spawn(async move {
+        match BrowserServer::new().serve((to_client_tx, from_client_rx)).await {
+            Ok(service) => {
+                let _ = service.waiting().await;
+            }
+            Err(e) => tracing::warn!("sse session {sid} serve error: {e}"),
+        }
+        sessions.lock().await.remove(&sid);
+        tracing::info!("sse session {sid} closed");
+    });
+
+    let endpoint = futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(
+            Event::default()
+                .event("endpoint")
+                .data(format!("/message?sessionId={session_id}")),
+        )
+    });
+    let messages = to_client_rx.map(|msg| {
+        let data = serde_json::to_string(&msg).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().event("message").data(data))
+    });
+
+    Sse::new(endpoint.chain(messages)).keep_alive(KeepAlive::default())
+}
+
+async fn sse_post(
+    axum::extract::State(state): axum::extract::State<SseState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    body: String,
+) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+    let Some(session_id) = params.get("sessionId") else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let msg: ClientJsonRpcMessage = match serde_json::from_str(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("sse /message bad payload: {e}");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let tx = state.sessions.lock().await.get(session_id).cloned();
+    match tx {
+        Some(tx) => {
+            if tx.unbounded_send(msg).is_err() {
+                return StatusCode::GONE;
+            }
+            StatusCode::ACCEPTED
+        }
+        None => StatusCode::NOT_FOUND,
+    }
+}
+
 async fn serve_http(addr: &str) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -1436,9 +1545,18 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
             StreamableHttpServerConfig::default(),
         );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let sse_state = SseState {
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let router = axum::Router::new()
+        .route("/sse", axum::routing::get(sse_get))
+        .route("/message", axum::routing::post(sse_post))
+        .nest_service("/mcp", service)
+        .with_state(sse_state);
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    info!("browser-rs MCP server on http://{bind}/mcp (streamable HTTP)");
+    info!("browser-rs MCP server on http://{bind}/mcp (streamable HTTP) + http://{bind}/sse (legacy SSE)");
     axum::serve(listener, router).await?;
     Ok(())
 }

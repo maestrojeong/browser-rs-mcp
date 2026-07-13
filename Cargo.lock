@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ab-browser"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ab-cdp",
  "anyhow",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "ab-cdp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "futures-util",
  "serde",
@@ -33,12 +33,13 @@ dependencies = [
 
 [[package]]
 name = "ab-mcp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ab-browser",
  "ab-cdp",
  "anyhow",
  "axum",
+ "futures",
  "rmcp",
  "schemars",
  "serde",
