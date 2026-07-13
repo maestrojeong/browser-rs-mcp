@@ -385,8 +385,16 @@ fn fail<E: std::fmt::Display>(e: E) -> McpError {
 
 impl BrowserServer {
     fn new() -> Self {
+        Self::with_state(Arc::new(Mutex::new(State::default())))
+    }
+
+    /// Build a handler that shares an existing `State` (one Chrome + tabs) across
+    /// sessions. In HTTP mode every MCP session (each turn's `/sse` or `/mcp`
+    /// connection) is handed a clone of ONE process-wide state, so the browser
+    /// stays resident between turns instead of being relaunched per connection.
+    fn with_state(state: Arc<Mutex<State>>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::default())),
+            state,
             tool_router: Self::tool_router(),
         }
     }
@@ -1439,6 +1447,9 @@ type SseSessions = Arc<Mutex<HashMap<String, futures::channel::mpsc::UnboundedSe
 #[derive(Clone)]
 struct SseState {
     sessions: SseSessions,
+    /// Process-wide browser state shared across all SSE sessions, so Chrome
+    /// stays resident between turns (each turn opens a fresh SSE connection).
+    browser: Arc<Mutex<State>>,
 }
 
 fn new_session_id() -> String {
@@ -1472,9 +1483,13 @@ async fn sse_get(
         .insert(session_id.clone(), from_client_tx);
 
     let sessions = state.sessions.clone();
+    let shared = state.browser.clone();
     let sid = session_id.clone();
     tokio::spawn(async move {
-        match BrowserServer::new().serve((to_client_tx, from_client_rx)).await {
+        match BrowserServer::with_state(shared)
+            .serve((to_client_tx, from_client_rx))
+            .await
+        {
             Ok(service) => {
                 let _ = service.waiting().await;
             }
@@ -1538,15 +1553,24 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
         format!("127.0.0.1:{addr}")
     };
 
+    // ONE process-wide browser state shared by every session on this port, so
+    // Chrome stays resident across turns (each turn = a fresh /sse or /mcp
+    // connection). The Arc is held by the streamable-http factory closure AND
+    // the SSE state for the whole process lifetime, so the browser is never
+    // dropped between sessions — only when the server process exits.
+    let shared_state: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
+
+    let mcp_state = shared_state.clone();
     let service: StreamableHttpService<BrowserServer, LocalSessionManager> =
         StreamableHttpService::new(
-            || Ok(BrowserServer::new()),
+            move || Ok(BrowserServer::with_state(mcp_state.clone())),
             Default::default(),
             StreamableHttpServerConfig::default(),
         );
 
     let sse_state = SseState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        browser: shared_state,
     };
 
     let router = axum::Router::new()
