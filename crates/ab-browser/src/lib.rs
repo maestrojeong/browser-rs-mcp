@@ -645,6 +645,86 @@ impl Page {
         self.evaluate(&js).await
     }
 
+    /// Actionability hit-test: is the target node (or a descendant of it)
+    /// actually the element at viewport point (x, y)? Playwright does this before
+    /// every click so an overlay/animation covering the target doesn't steal the
+    /// click. Returns Ok(true) if the point lands on the target, Ok(false) if it
+    /// is occluded, Err only on a protocol failure (caller may then assume true).
+    async fn point_hits_node(&self, backend: i64, x: f64, y: f64) -> Result<bool> {
+        let Some(obj) = self.resolve_object(backend).await? else {
+            return Ok(true);
+        };
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": obj,
+                    "arguments": [{ "value": x }, { "value": y }],
+                    "returnByValue": true,
+                    "functionDeclaration": r#"function(x, y){
+                        const hit = document.elementFromPoint(x, y);
+                        if (!hit) return false;
+                        return this === hit || this.contains(hit);
+                    }"#,
+                }),
+            )
+            .await?;
+        Ok(res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true))
+    }
+
+    /// Fallback click: dispatch a full trusted-shaped pointer+mouse event
+    /// sequence directly ON the node, bypassing coordinates entirely. Used when
+    /// the real coordinate click is occluded/misses (e.g. Google SPA
+    /// `div[role=link]` list items). Mirrors the sequence a real click fires.
+    async fn dispatch_click_on_node(&self, backend: i64) -> Result<bool> {
+        let Some(obj) = self.resolve_object(backend).await? else {
+            return Ok(false);
+        };
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": obj,
+                    "returnByValue": true,
+                    "functionDeclaration": r#"function(){
+                        const el = this;
+                        el.scrollIntoView({block:'center', inline:'center'});
+                        const r = el.getBoundingClientRect();
+                        const cx = r.left + r.width/2, cy = r.top + r.height/2;
+                        const base = {bubbles:true, cancelable:true, composed:true,
+                            clientX:cx, clientY:cy, button:0, pointerId:1,
+                            pointerType:'mouse', isPrimary:true, view:window};
+                        const down = {...base, buttons:1};
+                        const up = {...base, buttons:0};
+                        el.dispatchEvent(new PointerEvent('pointerover', down));
+                        el.dispatchEvent(new PointerEvent('pointerenter', down));
+                        el.dispatchEvent(new MouseEvent('mouseover', down));
+                        el.dispatchEvent(new PointerEvent('pointerdown', down));
+                        el.dispatchEvent(new MouseEvent('mousedown', down));
+                        try { el.focus && el.focus(); } catch(_) {}
+                        el.dispatchEvent(new PointerEvent('pointerup', up));
+                        el.dispatchEvent(new MouseEvent('mouseup', up));
+                        el.dispatchEvent(new MouseEvent('click', up));
+                        return true;
+                    }"#,
+                }),
+            )
+            .await?;
+        Ok(res
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
     /// Resolve a backend node to a Runtime objectId (for JS calls on it).
     async fn resolve_object(&self, backend: i64) -> Result<Option<String>> {
         let res = self
@@ -735,27 +815,51 @@ impl Page {
     /// Click a node by ref: glide the pointer to it, then press/release with a
     /// human-like dwell. Falls back to a DOM `.click()` when there is no box.
     pub async fn click(&self, backend: i64) -> Result<()> {
+        // Actionability, Playwright-style: scroll the target into view FIRST so
+        // its box-model coordinates are valid (an off-screen element yields a
+        // point the real mouse event can't reach). Then let layout settle.
+        let _ = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "backendNodeId": backend }),
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
+
         if let Some((x, y)) = self.node_center(backend).await? {
-            let _ = self.human_move_to(x, y).await;
-            tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
-            self.client
-                .send_on(
-                    &self.session_id,
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
-                )
-                .await?;
-            tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
-            self.client
-                .send_on(
-                    &self.session_id,
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
-                )
-                .await?;
+            // Only fire a real coordinate click if the point actually lands on
+            // the target — otherwise an overlay/animation would steal it.
+            let hits = self.point_hits_node(backend, x, y).await.unwrap_or(true);
+            if hits {
+                let _ = self.human_move_to(x, y).await;
+                tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+                self.client
+                    .send_on(
+                        &self.session_id,
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
+                    )
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
+                self.client
+                    .send_on(
+                        &self.session_id,
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        // Occluded, moved, or box-less (e.g. Google SPA div[role=link] list
+        // items): dispatch a full pointer+mouse sequence directly on the node.
+        if self.dispatch_click_on_node(backend).await? {
             return Ok(());
         }
-        // Fallback: JS click via objectId.
+        // Last resort: plain element.click().
         if let Some(obj) = self.resolve_object(backend).await? {
             self.client
                 .send_on(
