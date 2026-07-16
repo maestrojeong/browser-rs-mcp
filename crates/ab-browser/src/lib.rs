@@ -278,7 +278,7 @@ impl Browser {
 
     /// Return page targets currently known to Chrome. Used by the MCP layer to
     /// discover tabs opened by target=_blank/window.open rather than by a tool.
-    pub async fn page_targets(&self) -> Result<Vec<(String, String)>> {
+    pub async fn page_targets(&self) -> Result<Vec<(String, String, Option<String>)>> {
         let result = self.client.send("Target.getTargets", json!({})).await?;
         let targets = result
             .get("targetInfos")
@@ -293,7 +293,11 @@ impl Browser {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                Some((id, url))
+                let opener_id = info
+                    .get("openerId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Some((id, url, opener_id))
             })
             .collect();
         Ok(targets)

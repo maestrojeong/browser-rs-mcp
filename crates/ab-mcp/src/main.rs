@@ -92,6 +92,7 @@ struct State {
 struct BrowserServer {
     state: Arc<Mutex<State>>,
     tool_router: ToolRouter<Self>,
+    default_owner: Option<String>,
 }
 
 // ---- tool parameter schemas ----
@@ -462,9 +463,14 @@ impl BrowserServer {
     /// connection) is handed a clone of ONE process-wide state, so the browser
     /// stays resident between turns instead of being relaunched per connection.
     fn with_state(state: Arc<Mutex<State>>) -> Self {
+        Self::with_state_and_owner(state, None)
+    }
+
+    fn with_state_and_owner(state: Arc<Mutex<State>>, default_owner: Option<String>) -> Self {
         Self {
             state,
             tool_router: Self::tool_router(),
+            default_owner,
         }
     }
 
@@ -618,13 +624,23 @@ impl BrowserServer {
             .values()
             .map(|entry| entry.page.target_id().to_string())
             .collect();
-        let new_targets: Vec<(String, String)> = targets
+        let target_to_page: HashMap<String, String> = st
+            .pages
+            .iter()
+            .map(|(page_id, entry)| (entry.page.target_id().to_string(), page_id.clone()))
+            .collect();
+        let new_targets: Vec<(String, String, Option<String>)> = targets
             .into_iter()
-            .filter(|(target_id, url)| !known.contains(target_id) && url != "about:blank")
+            .filter(|(target_id, url, _)| !known.contains(target_id) && url != "about:blank")
             .collect();
 
         let mut added = Vec::new();
-        for (target_id, _) in new_targets {
+        for (target_id, _, opener_id) in new_targets {
+            let inherited_owner = opener_id
+                .as_ref()
+                .and_then(|target_id| target_to_page.get(target_id))
+                .and_then(|page_id| st.page_owners.get(page_id))
+                .cloned();
             let page = st
                 .browser
                 .as_ref()
@@ -647,7 +663,7 @@ impl BrowserServer {
                     consolelog: None,
                 },
             );
-            if let Some(owner) = request_owner() {
+            if let Some(owner) = inherited_owner {
                 st.owners.insert(owner.clone(), id.clone());
                 st.page_owners.insert(id.clone(), owner);
             }
@@ -1513,10 +1529,11 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<PageArg>,
     ) -> Result<CallToolResult, McpError> {
+        let page_id = self.canonical_page_id(&a.page).await?;
         // Lazily enable + store the console log for this page.
         let existing = {
             let st = self.state.lock().await;
-            st.pages.get(&a.page).and_then(|e| e.consolelog.clone())
+            st.pages.get(&page_id).and_then(|e| e.consolelog.clone())
         };
         let log = match existing {
             Some(l) => l,
@@ -1524,7 +1541,7 @@ impl BrowserServer {
                 let page = self.page_of(&a.page).await?;
                 let l = page.enable_console_log().await.map_err(fail)?;
                 let mut st = self.state.lock().await;
-                if let Some(e) = st.pages.get_mut(&a.page) {
+                if let Some(e) = st.pages.get_mut(&page_id) {
                     e.consolelog = Some(l.clone());
                 }
                 // Give a brief moment for buffered messages after enabling.
@@ -1867,7 +1884,8 @@ impl rmcp::ServerHandler for BrowserServer {
                     })
             })
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .or_else(|| self.default_owner.clone());
         REQUEST_OWNER
             .scope(owner, async {
                 self.tool_router
@@ -2031,6 +2049,8 @@ fn new_session_id() -> String {
 
 async fn sse_get(
     axum::extract::State(state): axum::extract::State<SseState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::sse::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
@@ -2038,6 +2058,13 @@ async fn sse_get(
     use futures::StreamExt;
 
     let session_id = new_session_id();
+    let owner = headers
+        .get("x-browser-owner")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| params.get("owner").cloned())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     // server → client (TX): rmcp writes here, the SSE stream drains it.
     let (to_client_tx, to_client_rx) = futures::channel::mpsc::unbounded::<ServerJsonRpcMessage>();
     // client → server (RX): POST handler pushes here, rmcp reads it.
@@ -2054,7 +2081,7 @@ async fn sse_get(
     let shared = state.browser.clone();
     let sid = session_id.clone();
     tokio::spawn(async move {
-        match BrowserServer::with_state(shared)
+        match BrowserServer::with_state_and_owner(shared, owner)
             .serve((to_client_tx, from_client_rx))
             .await
         {
