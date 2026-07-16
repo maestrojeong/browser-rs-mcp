@@ -44,7 +44,7 @@ delivered as a lean Rust MCP server driving stock Chrome.
 
 ```
 MCP client (Claude Code / agent)
-        │  stdio or streamable-HTTP (MCP)
+        │  stdio or HTTP (MCP + owner identity)
         ▼
    ab-mcp   ── rmcp server, browser_* tools
         │
@@ -79,13 +79,31 @@ MCP client (Claude Code / agent)
 - `snapshot.rs`: prune ignored/noise nodes, print `role "name"` indented, assign
   `[ref]` to interactive roles, keep a ref→backendDOMNodeId map for act tools.
 
-### ab-mcp  (WIP)
+### ab-mcp
 - rmcp `ServerHandler` over stdio and streamable-HTTP.
 - Tools mirror the proven minimal set: `browser_navigate`, `browser_snapshot`,
   `browser_act`, `browser_evaluate`, `browser_screenshot`, `browser_read`,
   `browser_tabs`, `browser_wait`, `browser_download`, `browser_pdf`.
 - Core agent loop the tools encode: **snapshot → act → verify** (act reads back
   a settle diff so the agent doesn't blind-retry).
+
+### HTTP ownership isolation
+
+One HTTP server represents one Chrome process and one persistent profile.
+Multiple clients share that process by connecting with distinct owner values in
+the `owner` query parameter or `X-Browser-Owner` header.
+
+`State` tracks both `pages: pageId -> Page` and
+`page_owners: pageId -> owner`. All page-taking tools pass through the common
+page resolver, which rejects a page unless its owner matches the request owner.
+Page listing uses the same filter. This makes isolation an enforcement rule,
+not merely a filtered UI.
+
+Owner lifecycle is explicit. `DELETE /owners?owner=...` closes every real tab
+owned by that identity and removes its page and alias mappings. The profile and
+other owners remain live. `browser_close` has the same owner-scoped behavior
+when called through an owner connection; only an ownerless administrative
+connection may close the complete browser.
 
 ## Roadmap
 

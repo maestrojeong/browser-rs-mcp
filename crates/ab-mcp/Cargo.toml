@@ -23,3 +23,5 @@ rmcp = { workspace = true, features = ["server", "transport-io", "transport-stre
 schemars.workspace = true
 axum.workspace = true
 futures = "0.3"
+http = "1"
+url = "2"

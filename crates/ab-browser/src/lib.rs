@@ -262,6 +262,45 @@ impl Browser {
             .ok_or_else(|| BrowserError::Protocol("no targetId".into()))?
             .to_string();
 
+        let page = self.attach_page(&target_id).await?;
+        // No page patching by default: an untouched real Chrome is the goal.
+        if self.inject_stealth {
+            page.init_stealth().await?;
+            if !self.user_agent.is_empty() {
+                page.set_user_agent(&self.user_agent).await?;
+            }
+        }
+        if !url.is_empty() && url != "about:blank" {
+            page.navigate(url).await?;
+        }
+        Ok(page)
+    }
+
+    /// Return page targets currently known to Chrome. Used by the MCP layer to
+    /// discover tabs opened by target=_blank/window.open rather than by a tool.
+    pub async fn page_targets(&self) -> Result<Vec<(String, String)>> {
+        let result = self.client.send("Target.getTargets", json!({})).await?;
+        let targets = result
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|info| info.get("type").and_then(Value::as_str) == Some("page"))
+            .filter_map(|info| {
+                let id = info.get("targetId")?.as_str()?.to_string();
+                let url = info
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Some((id, url))
+            })
+            .collect();
+        Ok(targets)
+    }
+
+    /// Attach to an existing page target, such as a popup discovered after a click.
+    pub async fn attach_page(&self, target_id: &str) -> Result<Page> {
         let attached = self
             .client
             .send(
@@ -275,25 +314,14 @@ impl Browser {
             .ok_or_else(|| BrowserError::Protocol("no sessionId".into()))?
             .to_string();
 
-        let page = Page {
+        Ok(Page {
             client: self.client.clone(),
             session_id,
-            target_id,
+            target_id: target_id.to_string(),
             pointer: Arc::new(Mutex::new(None)),
             dialog: Arc::new(Mutex::new((true, None))),
             routes: Arc::new(Mutex::new(RouteState::default())),
-        };
-        // No page patching by default: an untouched real Chrome is the goal.
-        if self.inject_stealth {
-            page.init_stealth().await?;
-            if !self.user_agent.is_empty() {
-                page.set_user_agent(&self.user_agent).await?;
-            }
-        }
-        if !url.is_empty() && url != "about:blank" {
-            page.navigate(url).await?;
-        }
-        Ok(page)
+        })
     }
 
     /// Terminate the browser process (only if we launched it; connect() no-op).
@@ -342,6 +370,14 @@ pub struct Page {
 impl Page {
     pub fn target_id(&self) -> &str {
         &self.target_id
+    }
+
+    /// Close this tab at the browser target level.
+    pub async fn close(&self) -> Result<()> {
+        self.client
+            .send("Target.closeTarget", json!({ "targetId": self.target_id }))
+            .await?;
+        Ok(())
     }
 
     async fn init_stealth(&self) -> Result<()> {

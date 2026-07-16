@@ -80,6 +80,17 @@ For HTTP, run `browser-rs --port 9321` and point the client at:
 - `http://127.0.0.1:9321/mcp` — streamable HTTP (e.g. Codex, `type: "http"`)
 - `http://127.0.0.1:9321/sse` — legacy SSE (e.g. Claude SDK, `type: "sse"`)
 
+For a shared profile, append a stable owner to each client connection:
+
+```text
+http://127.0.0.1:9321/mcp?owner=user%3Agroup%3Atopic
+```
+
+The equivalent `X-Browser-Owner` header is also accepted. Owner-scoped clients
+can list and control only their own tabs. When deleting a topic or worker, call
+`DELETE /owners?owner=...` to close only its tabs. Ownerless connections have
+administrative access to all tabs, so do not expose the HTTP port publicly.
+
 ## Updating
 
 Re-run the curl one-liner; it always fetches the latest release. To replace a

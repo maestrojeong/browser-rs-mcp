@@ -30,9 +30,36 @@ Register with an MCP client:
   "command": "browser-rs"                    // stdio
 } } }
 // HTTP: run `browser-rs --port 9321` and point the client at
-//   http://127.0.0.1:9321/mcp   (streamable HTTP)  — or
-//   http://127.0.0.1:9321/sse   (legacy SSE, e.g. Claude SDK `type:"sse"`)
+//   http://127.0.0.1:9321/mcp?owner=user:group:topic
+// The same owner may instead be sent as X-Browser-Owner.
 ```
+
+## Shared profiles and tab ownership
+
+HTTP clients can share one browser process and persistent profile while keeping
+their tabs isolated. Give every topic, worker, or cron job a stable `owner`:
+
+```text
+http://127.0.0.1:9321/mcp?owner=42:100:research
+X-Browser-Owner: 42:100:research
+```
+
+New tabs are assigned to the request owner. `browser_pages`, `browser_tabs`, and
+every page operation resolve only pages owned by that connection. Knowing
+another owner's concrete page id is not enough to access it. On an owner-scoped
+connection, `browser_close` closes only that owner's tabs; it does not stop the
+shared browser.
+
+Hosts should clean up an owner when its topic or job is deleted:
+
+```bash
+curl -X DELETE 'http://127.0.0.1:9321/owners?owner=42%3A100%3Aresearch'
+```
+
+This closes the owner's real Chrome tabs and removes its in-memory mappings
+without deleting the profile or affecting other owners. Connections without an
+owner retain process-wide administrative access, so keep the HTTP listener on
+localhost or behind a trusted proxy.
 
 ## vs mcp-patchright
 
@@ -113,8 +140,8 @@ browser-rs --port 9321 [options]    # HTTP MCP transport at /mcp
 
 Every flag has an env equivalent (`AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`,
 `AB_CONNECT`, `AB_STEALTH`, `AB_CHROME`). Because it takes `--port` +
-`--user-data-dir` like `mcp-patchright`, a host that allocates a port + profile
-per session can spawn it and connect by URL (drop-in wherever patchright fits).
+`--user-data-dir` like `mcp-patchright`, a host can allocate one port per
+profile and connect multiple owner-scoped sessions to it.
 
 ## Benchmarks (browser + detector co-evolve)
 

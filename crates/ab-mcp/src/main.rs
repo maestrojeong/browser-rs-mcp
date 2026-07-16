@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ab_browser::{Browser, ConsoleLog, LaunchOptions, NetworkLog, Page};
-use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
+use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
 use rmcp::model::{
-    CallToolResult, ClientJsonRpcMessage, ContentBlock, ServerCapabilities, ServerInfo,
-    ServerJsonRpcMessage,
+    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
 };
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServiceExt};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{tool, tool_router, ErrorData as McpError, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -28,6 +29,14 @@ Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to
 - refs go stale when the page changes — re-snapshot before reusing them.
 - browser_evaluate runs one-shot JS; browser_take_screenshot saves a PNG.
 Stealth: this browser never enables the detectable CDP domains (no Runtime.enable)."#;
+
+tokio::task_local! {
+    static REQUEST_OWNER: Option<String>;
+}
+
+fn request_owner() -> Option<String> {
+    REQUEST_OWNER.try_with(Clone::clone).ok().flatten()
+}
 
 struct PageEntry {
     page: Page,
@@ -71,6 +80,11 @@ fn snapshot_diff(old: &str, new: &str) -> String {
 struct State {
     browser: Option<Browser>,
     pages: HashMap<String, PageEntry>,
+    /// Stable caller-selected aliases for pages. This lets an agent claim pN
+    /// once and use its owner name in every later `page` argument.
+    owners: HashMap<String, String>,
+    /// Durable ownership for every page; one owner may have multiple tabs.
+    page_owners: HashMap<String, String>,
     next: u64,
 }
 
@@ -114,8 +128,22 @@ struct FindArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PageArg {
-    /// Page id returned by browser_navigate (e.g. "p1").
+    /// Page id (e.g. "p1") or owner alias from browser_claim_page.
     page: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ClaimPageArgs {
+    /// Stable caller identity, such as a topic or agent name.
+    owner: String,
+    /// Concrete page id to claim (e.g. "p1").
+    page: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct OwnerArg {
+    /// Owner alias previously registered with browser_claim_page.
+    owner: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -440,21 +468,49 @@ impl BrowserServer {
         }
     }
 
-    /// Clone the Page for a given id (does not hold the lock across ops).
+    fn resolve_page_id(st: &State, id_or_owner: &str) -> Option<String> {
+        if let Some(owner) = request_owner() {
+            if id_or_owner == owner {
+                return st.owners.get(&owner).cloned();
+            }
+            if st.page_owners.get(id_or_owner) == Some(&owner) {
+                return Some(id_or_owner.to_string());
+            }
+            return None;
+        }
+        if st.pages.contains_key(id_or_owner) {
+            Some(id_or_owner.to_string())
+        } else {
+            st.owners.get(id_or_owner).cloned()
+        }
+    }
+
+    /// Resolve either a concrete page id or a claimed owner alias.
+    async fn canonical_page_id(&self, id_or_owner: &str) -> Result<String, McpError> {
+        let st = self.state.lock().await;
+        Self::resolve_page_id(&st, id_or_owner)
+            .ok_or_else(|| fail(format!("unknown page or owner '{id_or_owner}'")))
+    }
+
+    /// Clone the Page for a given id/owner (does not hold the lock across ops).
     async fn page_of(&self, id: &str) -> Result<Page, McpError> {
         let st = self.state.lock().await;
+        let page_id = Self::resolve_page_id(&st, id)
+            .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
         st.pages
-            .get(id)
+            .get(&page_id)
             .map(|e| e.page.clone())
-            .ok_or_else(|| fail(format!("unknown page '{id}'")))
+            .ok_or_else(|| fail(format!("unknown page '{page_id}'")))
     }
 
     async fn backend_of(&self, id: &str, ref_: &str) -> Result<i64, McpError> {
         let st = self.state.lock().await;
+        let page_id = Self::resolve_page_id(&st, id)
+            .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
         let entry = st
             .pages
-            .get(id)
-            .ok_or_else(|| fail(format!("unknown page '{id}'")))?;
+            .get(&page_id)
+            .ok_or_else(|| fail(format!("unknown page '{page_id}'")))?;
         entry
             .refs
             .get(ref_)
@@ -487,7 +543,10 @@ impl BrowserServer {
     /// Persist a fresh snapshot (refs + text) for a page.
     async fn store_snapshot(&self, id: &str, refs: HashMap<String, i64>, text: String) {
         let mut st = self.state.lock().await;
-        if let Some(e) = st.pages.get_mut(id) {
+        let Some(page_id) = Self::resolve_page_id(&st, id) else {
+            return;
+        };
+        if let Some(e) = st.pages.get_mut(&page_id) {
             e.refs = refs;
             e.last_text = text;
         }
@@ -495,15 +554,106 @@ impl BrowserServer {
 
     async fn last_text(&self, id: &str) -> String {
         let st = self.state.lock().await;
+        let Some(page_id) = Self::resolve_page_id(&st, id) else {
+            return String::new();
+        };
         st.pages
-            .get(id)
+            .get(&page_id)
             .map(|e| e.last_text.clone())
             .unwrap_or_default()
     }
 
     async fn netlog_of(&self, id: &str) -> Option<NetworkLog> {
         let st = self.state.lock().await;
-        st.pages.get(id).and_then(|e| e.netlog.clone())
+        let page_id = Self::resolve_page_id(&st, id)?;
+        st.pages.get(&page_id).and_then(|e| e.netlog.clone())
+    }
+
+    async fn pages_text(&self) -> String {
+        let _ = self.sync_external_pages().await;
+        let scoped_owner = request_owner();
+        let entries: Vec<(String, Page, Vec<String>)> = {
+            let st = self.state.lock().await;
+            st.pages
+                .iter()
+                .filter(|(page_id, _)| {
+                    scoped_owner.as_ref().is_none_or(|owner| {
+                        st.page_owners
+                            .get(*page_id)
+                            .is_some_and(|owned| owned == owner)
+                    })
+                })
+                .map(|(k, v)| {
+                    let owners = st.page_owners.get(k).cloned().into_iter().collect();
+                    (k.clone(), v.page.clone(), owners)
+                })
+                .collect()
+        };
+        if entries.is_empty() {
+            return "(no open pages)".to_string();
+        }
+        let mut out = String::new();
+        for (id, page, owners) in entries {
+            let title = page.title().await.unwrap_or_default();
+            let url = page.url().await.unwrap_or_default();
+            let owner = if owners.is_empty() {
+                "-".to_string()
+            } else {
+                owners.join(",")
+            };
+            out.push_str(&format!("{id}  owner={owner}  {title:?}  {url}\n"));
+        }
+        out
+    }
+
+    /// Import tabs created by page JavaScript or target=_blank into the MCP page map.
+    async fn sync_external_pages(&self) -> Result<Vec<String>, McpError> {
+        let mut st = self.state.lock().await;
+        let Some(browser) = st.browser.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let targets = browser.page_targets().await.map_err(fail)?;
+        let known: std::collections::HashSet<String> = st
+            .pages
+            .values()
+            .map(|entry| entry.page.target_id().to_string())
+            .collect();
+        let new_targets: Vec<(String, String)> = targets
+            .into_iter()
+            .filter(|(target_id, url)| !known.contains(target_id) && url != "about:blank")
+            .collect();
+
+        let mut added = Vec::new();
+        for (target_id, _) in new_targets {
+            let page = st
+                .browser
+                .as_ref()
+                .unwrap()
+                .attach_page(&target_id)
+                .await
+                .map_err(fail)?;
+            let netlog = page.enable_network_log().await.ok();
+            let _ = page.enable_dialog_auto_accept().await;
+            let snap = page.snapshot().await.map_err(fail)?;
+            st.next += 1;
+            let id = format!("p{}", st.next);
+            st.pages.insert(
+                id.clone(),
+                PageEntry {
+                    page,
+                    refs: snap.refs,
+                    last_text: snap.text,
+                    netlog,
+                    consolelog: None,
+                },
+            );
+            if let Some(owner) = request_owner() {
+                st.owners.insert(owner.clone(), id.clone());
+                st.page_owners.insert(id.clone(), owner);
+            }
+            added.push(id);
+        }
+        Ok(added)
     }
 
     // Web-storage helpers shared by the localStorage/sessionStorage tools.
@@ -587,6 +737,10 @@ impl BrowserServer {
                 consolelog: None,
             },
         );
+        if let Some(owner) = request_owner() {
+            st.owners.insert(owner.clone(), id.clone());
+            st.page_owners.insert(id.clone(), owner);
+        }
         Ok((id, snap.text))
     }
 
@@ -598,7 +752,12 @@ impl BrowserServer {
         let snap = page.snapshot().await.map_err(fail)?;
         let diff = snapshot_diff(&before, &snap.text);
         self.store_snapshot(id, snap.refs, snap.text).await;
-        Ok(diff)
+        let new_pages = self.sync_external_pages().await?;
+        if new_pages.is_empty() {
+            Ok(diff)
+        } else {
+            Ok(format!("{diff}\nnew pages: {}", new_pages.join(", ")))
+        }
     }
 }
 
@@ -1216,9 +1375,12 @@ impl BrowserServer {
         } else {
             page.evaluate(&a.expression).await.map_err(fail)?
         };
-        Ok(ok(
-            serde_json::to_string(&v).unwrap_or_else(|_| "null".into())
-        ))
+        let mut output = serde_json::to_string(&v).unwrap_or_else(|_| "null".into());
+        let new_pages = self.sync_external_pages().await?;
+        if !new_pages.is_empty() {
+            output.push_str(&format!("\nnew pages: {}", new_pages.join(", ")));
+        }
+        Ok(ok(output))
     }
 
     /// Extract the page as Markdown (headings, links, lists, code).
@@ -1441,9 +1603,39 @@ impl BrowserServer {
     /// Close the browser and drop all pages.
     #[tool(description = "Close the browser (all pages)")]
     async fn browser_close(&self) -> Result<CallToolResult, McpError> {
+        if let Some(owner) = request_owner() {
+            let pages = {
+                let st = self.state.lock().await;
+                st.page_owners
+                    .iter()
+                    .filter(|(_, page_owner)| *page_owner == &owner)
+                    .filter_map(|(page_id, _)| {
+                        st.pages
+                            .get(page_id)
+                            .map(|entry| (page_id.clone(), entry.page.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut closed = Vec::new();
+            for (page_id, page) in pages {
+                if page.close().await.is_ok() {
+                    closed.push(page_id);
+                }
+            }
+            let mut st = self.state.lock().await;
+            for page_id in &closed {
+                st.pages.remove(page_id);
+                st.page_owners.remove(page_id);
+            }
+            st.owners.remove(&owner);
+            return Ok(ok(format!("closed {} owner page(s)", closed.len())));
+        }
+
         let browser = {
             let mut st = self.state.lock().await;
             st.pages.clear();
+            st.owners.clear();
+            st.page_owners.clear();
             st.browser.take()
         };
         if let Some(b) = browser {
@@ -1470,8 +1662,17 @@ impl BrowserServer {
     /// List open pages.
     #[tool(description = "List open page ids")]
     async fn browser_tabs(&self) -> Result<CallToolResult, McpError> {
+        self.sync_external_pages().await?;
         let st = self.state.lock().await;
-        let ids: Vec<String> = st.pages.keys().cloned().collect();
+        let ids: Vec<String> = if let Some(owner) = request_owner() {
+            st.page_owners
+                .iter()
+                .filter(|(_, page_owner)| *page_owner == &owner)
+                .map(|(page_id, _)| page_id.clone())
+                .collect()
+        } else {
+            st.pages.keys().cloned().collect()
+        };
         Ok(ok(if ids.is_empty() {
             "(no open pages)".to_string()
         } else {
@@ -1482,23 +1683,76 @@ impl BrowserServer {
     /// List open pages with their current URL and title.
     #[tool(description = "List open pages with id, title, and URL")]
     async fn browser_pages(&self) -> Result<CallToolResult, McpError> {
-        let entries: Vec<(String, Page)> = {
-            let st = self.state.lock().await;
-            st.pages
-                .iter()
-                .map(|(k, v)| (k.clone(), v.page.clone()))
-                .collect()
-        };
-        if entries.is_empty() {
-            return Ok(ok("(no open pages)".to_string()));
+        Ok(ok(self.pages_text().await))
+    }
+
+    /// Show this server's profile path and all tabs in that profile.
+    #[tool(description = "Show the current browser profile path and its open tabs")]
+    async fn browser_profile(&self) -> Result<CallToolResult, McpError> {
+        let profile = std::env::var("AB_PROFILE").unwrap_or_else(|_| "(ephemeral)".into());
+        let page_text = self.pages_text().await;
+        Ok(ok(format!("profile {profile}\n{page_text}")))
+    }
+
+    /// Claim a concrete page under a stable owner alias.
+    #[tool(
+        description = "Claim a page for an owner; later pass the owner as `page` to any browser tool"
+    )]
+    async fn browser_claim_page(
+        &self,
+        Parameters(a): Parameters<ClaimPageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let owner = a.owner.trim();
+        if owner.is_empty() {
+            return Err(fail("owner must not be empty"));
         }
-        let mut out = String::new();
-        for (id, page) in entries {
-            let title = page.title().await.unwrap_or_default();
-            let url = page.url().await.unwrap_or_default();
-            out.push_str(&format!("{id}  {title:?}  {url}\n"));
+        let mut st = self.state.lock().await;
+        if let Some(scoped_owner) = request_owner() {
+            if owner != scoped_owner {
+                return Err(fail(format!(
+                    "this MCP connection may only claim owner '{scoped_owner}'"
+                )));
+            }
         }
-        Ok(ok(out))
+        if !st.pages.contains_key(&a.page) {
+            return Err(fail(format!("unknown page '{}'", a.page)));
+        }
+        if let Some(other) = st
+            .page_owners
+            .get(&a.page)
+            .filter(|other| other.as_str() != owner)
+        {
+            return Err(fail(format!(
+                "page '{}' is already claimed by owner '{}'",
+                a.page, other
+            )));
+        }
+        st.page_owners.insert(a.page.clone(), owner.to_string());
+        if let Some(previous) = st.owners.insert(owner.to_string(), a.page.clone()) {
+            if previous != a.page {
+                return Ok(ok(format!(
+                    "owner {owner} moved from {previous} to {}",
+                    a.page
+                )));
+            }
+        }
+        Ok(ok(format!("owner {owner} claimed {}", a.page)))
+    }
+
+    /// Release an owner's page claim without closing the tab.
+    #[tool(description = "Release an owner's page claim without closing the page")]
+    async fn browser_release_page(
+        &self,
+        Parameters(a): Parameters<OwnerArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().await;
+        match st.owners.remove(&a.owner) {
+            Some(page) => {
+                st.page_owners.retain(|_, owner| owner != &a.owner);
+                Ok(ok(format!("released owner {} from {page}", a.owner)))
+            }
+            None => Err(fail(format!("unknown owner '{}'", a.owner))),
+        }
     }
 
     /// Resize a page's viewport.
@@ -1521,11 +1775,16 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<PageArg>,
     ) -> Result<CallToolResult, McpError> {
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let page = self.page_of(&page_id).await?;
+        page.close().await.map_err(fail)?;
         let mut st = self.state.lock().await;
-        if st.pages.remove(&a.page).is_some() {
-            Ok(ok(format!("closed {}", a.page)))
+        if st.pages.remove(&page_id).is_some() {
+            st.owners.retain(|_, claimed| claimed != &page_id);
+            st.page_owners.remove(&page_id);
+            Ok(ok(format!("closed {page_id}")))
         } else {
-            Err(fail(format!("unknown page '{}'", a.page)))
+            Err(fail(format!("unknown page '{page_id}'")))
         }
     }
 
@@ -1586,8 +1845,49 @@ impl BrowserServer {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
 impl rmcp::ServerHandler for BrowserServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let owner = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| {
+                parts
+                    .headers
+                    .get("x-browser-owner")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        url::form_urlencoded::parse(parts.uri.query()?.as_bytes())
+                            .find(|(key, _)| key == "owner")
+                            .map(|(_, value)| value.into_owned())
+                    })
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        REQUEST_OWNER
+            .scope(owner, async {
+                self.tool_router
+                    .call(ToolCallContext::new(self, request, context))
+                    .await
+            })
+            .await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            ..Default::default()
+        })
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.server_info.name = "browser-rs".to_string();
@@ -1810,6 +2110,56 @@ async fn sse_post(
     }
 }
 
+async fn close_owner_pages(
+    axum::extract::State(state): axum::extract::State<SseState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    let Some(owner) = params
+        .get("owner")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "ok": false, "error": "owner is required" })),
+        );
+    };
+
+    let pages = {
+        let st = state.browser.lock().await;
+        st.page_owners
+            .iter()
+            .filter(|(_, page_owner)| page_owner.as_str() == owner)
+            .filter_map(|(page_id, _)| {
+                st.pages
+                    .get(page_id)
+                    .map(|entry| (page_id.clone(), entry.page.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut closed = Vec::new();
+    for (page_id, page) in pages {
+        if page.close().await.is_ok() {
+            closed.push(page_id);
+        }
+    }
+
+    let mut st = state.browser.lock().await;
+    for page_id in &closed {
+        st.pages.remove(page_id);
+        st.page_owners.remove(page_id);
+    }
+    st.owners.remove(owner);
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "ok": true, "owner": owner, "closed": closed.len() })),
+    )
+}
+
 async fn serve_http(addr: &str) -> anyhow::Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
@@ -1844,6 +2194,7 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
     let router = axum::Router::new()
         .route("/sse", axum::routing::get(sse_get))
         .route("/message", axum::routing::post(sse_post))
+        .route("/owners", axum::routing::delete(close_owner_pages))
         .nest_service("/mcp", service)
         .with_state(sse_state);
 
