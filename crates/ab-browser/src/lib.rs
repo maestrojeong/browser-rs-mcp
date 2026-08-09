@@ -17,6 +17,7 @@ use ab_cdp::CdpClient;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 pub use snapshot::Snapshot;
@@ -87,6 +88,8 @@ pub enum BrowserError {
     Cdp(#[from] ab_cdp::CdpError),
     #[error("unexpected protocol response: {0}")]
     Protocol(String),
+    #[error("typing cancelled")]
+    TypingCancelled,
 }
 
 pub type Result<T> = std::result::Result<T, BrowserError>;
@@ -1353,10 +1356,23 @@ impl Page {
         Err(BrowserError::Protocol("element not clickable".into()))
     }
 
-    /// Focus a node and type text with per-character key events at human-like
-    /// random intervals. When `clear` is set, existing content is selected and
-    /// replaced first.
+    /// Focus a node and enter text. Long text uses one `Input.insertText`
+    /// command; shorter text retains human-like per-character key events.
     pub async fn type_text(&self, backend: i64, text: &str, clear: bool) -> Result<()> {
+        self.type_text_cancellable(backend, text, clear, &CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Page::type_text`], but stops between key events when `cancel`
+    /// is triggered. Text already entered remains in the field.
+    pub async fn type_text_cancellable(
+        &self,
+        backend: i64,
+        text: &str,
+        clear: bool,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        ensure_typing_active(cancel)?;
         self.scroll_into_view(backend).await;
         self.client
             .send_on(
@@ -1386,12 +1402,31 @@ impl Page {
                         &self.session_id,
                         "Input.dispatchKeyEvent",
                         json!({ "type": kind, "key": "Delete", "code": "Delete", "windowsVirtualKeyCode": 46 }),
-                    )
-                    .await?;
+                )
+                .await?;
             }
         }
+
+        ensure_typing_active(cancel)?;
+        if uses_insert_text(text) {
+            self.client
+                .send_on(
+                    &self.session_id,
+                    "Input.insertText",
+                    json!({ "text": text }),
+                )
+                .await?;
+            return Ok(());
+        }
+
         let mut shift_held = false;
         for ch in text.chars() {
+            if cancel.is_cancelled() {
+                if shift_held {
+                    self.release_shift().await?;
+                }
+                return Err(BrowserError::TypingCancelled);
+            }
             let s = ch.to_string();
             let need_shift = needs_shift(ch);
             // Real keyboards produce shifted chars (uppercase, @, !, …) only
@@ -1406,15 +1441,12 @@ impl Page {
                     )
                     .await?;
                 shift_held = true;
-                tokio::time::sleep(Duration::from_millis(rand_u64(15, 45))).await;
+                if typing_delay(cancel, rand_u64(15, 45)).await.is_err() {
+                    self.release_shift().await?;
+                    return Err(BrowserError::TypingCancelled);
+                }
             } else if !need_shift && shift_held {
-                self.client
-                    .send_on(
-                        &self.session_id,
-                        "Input.dispatchKeyEvent",
-                        json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
-                    )
-                    .await?;
+                self.release_shift().await?;
                 shift_held = false;
             }
             let modifiers = if need_shift { 8 } else { 0 };
@@ -1426,7 +1458,7 @@ impl Page {
                 )
                 .await?;
             // Key hold time (press duration), then release.
-            tokio::time::sleep(Duration::from_millis(rand_u64(20, 90))).await;
+            let cancelled = typing_delay(cancel, rand_u64(20, 90)).await.is_err();
             self.client
                 .send_on(
                     &self.session_id,
@@ -1434,6 +1466,12 @@ impl Page {
                     json!({ "type": "keyUp", "key": s, "modifiers": modifiers }),
                 )
                 .await?;
+            if cancelled {
+                if shift_held {
+                    self.release_shift().await?;
+                }
+                return Err(BrowserError::TypingCancelled);
+            }
             // Inter-key gap with real human burstiness (bimodal): most keys are
             // moderate, ~12% are fast bursts, ~18% are longer "thinking" pauses.
             // High variance is itself a human signal — metronomic typing is a tell.
@@ -1445,17 +1483,27 @@ impl Page {
             } else {
                 rand_u64(55, 175) // normal
             };
-            tokio::time::sleep(Duration::from_millis(gap)).await;
+            if typing_delay(cancel, gap).await.is_err() {
+                if shift_held {
+                    self.release_shift().await?;
+                }
+                return Err(BrowserError::TypingCancelled);
+            }
         }
         if shift_held {
-            self.client
-                .send_on(
-                    &self.session_id,
-                    "Input.dispatchKeyEvent",
-                    json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
-                )
-                .await?;
+            self.release_shift().await?;
         }
+        Ok(())
+    }
+
+    async fn release_shift(&self) -> Result<()> {
+        self.client
+            .send_on(
+                &self.session_id,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
+            )
+            .await?;
         Ok(())
     }
 
@@ -2782,6 +2830,27 @@ fn needs_shift(ch: char) -> bool {
     ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
 }
 
+const INSERT_TEXT_THRESHOLD: usize = 30;
+
+fn uses_insert_text(text: &str) -> bool {
+    text.chars().count() >= INSERT_TEXT_THRESHOLD
+}
+
+fn ensure_typing_active(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        Err(BrowserError::TypingCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+async fn typing_delay(cancel: &CancellationToken, millis: u64) -> Result<()> {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(millis)) => Ok(()),
+        _ = cancel.cancelled() => Err(BrowserError::TypingCancelled),
+    }
+}
+
 /// A signed offset that is clearly *off* the center of a box axis: 12–40 % of
 /// the half-dimension, so clicks land inside the element but never on its exact
 /// center (which behavioral detectors flag).
@@ -2875,8 +2944,15 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 mod tests {
     use super::{
         activation_verified, build_descend_js, build_frame_element_js, require_frame_chain,
-        resolve_frame_id, split_frame_chain, FrameAction, ReadMode,
+        resolve_frame_id, split_frame_chain, uses_insert_text, FrameAction, ReadMode,
     };
+
+    #[test]
+    fn long_text_uses_insert_text_by_unicode_character_count() {
+        assert!(!uses_insert_text(&"한".repeat(29)));
+        assert!(uses_insert_text(&"한".repeat(30)));
+        assert!(uses_insert_text(&"a".repeat(30)));
+    }
 
     #[test]
     fn activation_requires_visible_and_focused_document() {

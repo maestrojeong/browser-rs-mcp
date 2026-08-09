@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ab-cdp", "crates/ab-browser", "crates/ab-mcp"]
 
 [workspace.package]
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"

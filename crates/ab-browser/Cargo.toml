@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 ab-cdp.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

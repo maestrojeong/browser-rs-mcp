@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-AB_VERSION=v0.1.19 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+AB_VERSION=v0.1.20 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,13 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.1.19)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.1.20)</strong></summary>
+
+**v0.1.20 — non-blocking typing + cancel.** `browser_type` now returns
+immediately ("typing started") and runs keyboard dispatch in the background.
+Long text (≥ 30 chars) uses a single CDP `Input.insertText` instead of
+char‑by‑char key events for speed. Call `browser_cancel_typing({page})` to
+stop a running typing task mid-flight; already-typed characters remain.
 
 **v0.1.19 — out-of-process iframe support.** Cross-origin iframe actions now
 route CDP commands through the iframe target's own flatten-mode session when
@@ -244,11 +250,11 @@ whole section — it only activates when a host explicitly configures it.
 
 ## Tools
 
-MCP exposes 65 `browser_*` tools:
+MCP exposes 66 `browser_*` tools:
 
 **Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_wheel` · `browser_type` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_read` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_read` · `browser_close_page` · `browser_close`
 
 Use `browser_activate_page({ "page": "p5" })` before automating a background
 tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,
@@ -256,6 +262,10 @@ retries visibility/focus verification, and uses a process-specific macOS
 foreground fallback when browser-rs launched Chrome itself. Use
 `browser_wheel({ "page": "p5", "delta_y": 700, "x": 650, "y": 500 })` for a
 real CDP `mouseWheel` event instead of DOM `window.scrollBy()`.
+`browser_type` keeps human-like key events for text under 30 characters and
+uses one atomic CDP `Input.insertText` command for longer input.
+`browser_cancel_typing` stops active per-character typing; text already entered
+remains, while atomic long-text insertion normally finishes before cancellation.
 
 **Network and requests:** `browser_network_requests` · `browser_route_block` · `browser_route_mock` · `browser_route_clear` · `browser_network_state_set` · `browser_api_request`
 

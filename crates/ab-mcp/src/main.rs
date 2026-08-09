@@ -6,7 +6,7 @@
 //! Core loop the tools encode: **snapshot -> act -> verify**.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use ab_browser::{Browser, ConsoleLog, LaunchOptions, NetworkLog, Page};
 use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
@@ -19,6 +19,7 @@ use rmcp::{tool, tool_router, ErrorData as McpError, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 mod http_security;
@@ -115,6 +116,7 @@ struct PageEntry {
     page: Page,
     refs: HashMap<String, i64>,
     last_text: String,
+    active_typing: Option<Weak<CancellationToken>>,
     netlog: Option<NetworkLog>,
     consolelog: Option<ConsoleLog>,
     webauthn_authenticator_id: Option<String>,
@@ -720,6 +722,26 @@ impl BrowserServer {
             .ok_or_else(|| fail(format!("unknown page '{page_id}'")))
     }
 
+    async fn begin_typing(
+        &self,
+        id: &str,
+    ) -> Result<(String, Page, Arc<CancellationToken>), McpError> {
+        let mut st = self.state.lock().await;
+        let page_id = Self::resolve_page_id(&st, id)
+            .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
+        let entry = st
+            .pages
+            .get_mut(&page_id)
+            .ok_or_else(|| fail(format!("unknown page '{page_id}'")))?;
+
+        if let Some(active) = entry.active_typing.as_ref().and_then(Weak::upgrade) {
+            active.cancel();
+        }
+        let cancel = Arc::new(CancellationToken::new());
+        entry.active_typing = Some(Arc::downgrade(&cancel));
+        Ok((page_id, entry.page.clone(), cancel))
+    }
+
     async fn backend_of(&self, id: &str, ref_: &str) -> Result<i64, McpError> {
         let st = self.state.lock().await;
         let page_id = Self::resolve_page_id(&st, id)
@@ -875,6 +897,7 @@ impl BrowserServer {
                     page,
                     refs: snap.refs,
                     last_text: snap.text,
+                    active_typing: None,
                     netlog,
                     consolelog: None,
                     webauthn_authenticator_id,
@@ -973,6 +996,7 @@ impl BrowserServer {
                 page,
                 refs: snap.refs.clone(),
                 last_text: snap.text.clone(),
+                active_typing: None,
                 netlog,
                 consolelog: None,
                 webauthn_authenticator_id,
@@ -1114,12 +1138,56 @@ impl BrowserServer {
         Parameters(a): Parameters<TypeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
-        let page = self.page_of(&a.page).await?;
-        page.type_text(backend, &a.text, a.clear)
-            .await
-            .map_err(fail)?;
-        let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("typed into {}\n\n{}", a.page, diff)))
+        let (page_id, page, cancel) = self.begin_typing(&a.page).await?;
+        let state = Arc::clone(&self.state);
+        let page_label = a.page.clone();
+        tokio::spawn(async move {
+            let typing_result = page
+                .type_text_cancellable(backend, &a.text, a.clear, &cancel)
+                .await;
+            // Clean up the active_typing token regardless of outcome.
+            {
+                let mut st = state.lock().await;
+                if let Some(entry) = st.pages.get_mut(&page_id) {
+                    let should_clear = entry
+                        .active_typing
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .is_none_or(|active| Arc::ptr_eq(&active, &cancel));
+                    if should_clear {
+                        entry.active_typing = None;
+                    }
+                }
+            }
+            if let Err(e) = typing_result {
+                tracing::warn!("background typing on {page_id} failed: {e}");
+            }
+        });
+        Ok(ok(format!("typing started on {page_label}")))
+    }
+
+    /// Cancel the active per-character typing request for a page.
+    #[tool(
+        description = "Cancel active browser_type typing on a page; already-entered text remains"
+    )]
+    async fn browser_cancel_typing(
+        &self,
+        Parameters(a): Parameters<PageArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let active = {
+            let st = self.state.lock().await;
+            st.pages
+                .get(&page_id)
+                .and_then(|entry| entry.active_typing.as_ref())
+                .and_then(Weak::upgrade)
+        };
+        if let Some(cancel) = active {
+            cancel.cancel();
+            Ok(ok(format!("typing cancellation requested on {page_id}")))
+        } else {
+            Ok(ok(format!("no active typing on {page_id}")))
+        }
     }
 
     /// Press a named key on a page, then report what changed.
@@ -2537,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_and_wheel_tools_are_publicly_registered() {
+    fn foreground_wheel_and_cancel_typing_tools_are_publicly_registered() {
         let tools = BrowserServer::new().tool_router.list_all();
         let names = tools
             .iter()
@@ -2545,6 +2613,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"browser_activate_page"));
         assert!(names.contains(&"browser_wheel"));
+        assert!(names.contains(&"browser_cancel_typing"));
     }
 
     #[test]
