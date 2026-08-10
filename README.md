@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-AB_VERSION=v0.1.21 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.21 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
