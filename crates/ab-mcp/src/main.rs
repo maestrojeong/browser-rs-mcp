@@ -30,6 +30,7 @@ const INSTRUCTIONS: &str = r#"browser-rs — a real Chrome driven over CDP, no b
 Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to verify.
 - snapshot renders the page as an accessibility tree; interactive nodes carry [ref=eN] handles.
 - act on them by ref with browser_click / browser_type / browser_press_key.
+- browser_type waits for completion by default; use wait=false only when a later browser_cancel_typing call is needed.
 - browser_activate_page explicitly foregrounds a tab and verifies visibility.
 - browser_wheel sends native CDP mouse-wheel input for lazy-loaded feeds.
 - refs go stale when the page changes — re-snapshot before reusing them.
@@ -316,6 +317,14 @@ struct TypeArgs {
     /// Replace existing content instead of appending.
     #[serde(default)]
     clear: bool,
+    /// Wait for typing to finish and return the resulting page diff. Set false
+    /// only when the typing must remain cancellable by a later tool call.
+    #[serde(default = "default_true")]
+    wait: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -742,6 +751,20 @@ impl BrowserServer {
         Ok((page_id, entry.page.clone(), cancel))
     }
 
+    async fn finish_typing(&self, page_id: &str, cancel: &Arc<CancellationToken>) {
+        let mut st = self.state.lock().await;
+        if let Some(entry) = st.pages.get_mut(page_id) {
+            let should_clear = entry
+                .active_typing
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_none_or(|active| Arc::ptr_eq(&active, cancel));
+            if should_clear {
+                entry.active_typing = None;
+            }
+        }
+    }
+
     async fn backend_of(&self, id: &str, ref_: &str) -> Result<i64, McpError> {
         let st = self.state.lock().await;
         let page_id = Self::resolve_page_id(&st, id)
@@ -1132,38 +1155,37 @@ impl BrowserServer {
     }
 
     /// Type text into an element by ref (optionally clearing it first).
-    #[tool(description = "Type text into an element by ref; returns settle-diff")]
+    #[tool(
+        description = "Type text into an element by ref; waits for completion and returns settle-diff by default. Set wait=false to start cancellable background typing"
+    )]
     async fn browser_type(
         &self,
         Parameters(a): Parameters<TypeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let (page_id, page, cancel) = self.begin_typing(&a.page).await?;
-        let state = Arc::clone(&self.state);
-        let page_label = a.page.clone();
-        tokio::spawn(async move {
-            let typing_result = page
+        if a.wait {
+            let result = page
                 .type_text_cancellable(backend, &a.text, a.clear, &cancel)
                 .await;
-            // Clean up the active_typing token regardless of outcome.
-            {
-                let mut st = state.lock().await;
-                if let Some(entry) = st.pages.get_mut(&page_id) {
-                    let should_clear = entry
-                        .active_typing
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .is_none_or(|active| Arc::ptr_eq(&active, &cancel));
-                    if should_clear {
-                        entry.active_typing = None;
-                    }
-                }
-            }
-            if let Err(e) = typing_result {
-                tracing::warn!("background typing on {page_id} failed: {e}");
+            self.finish_typing(&page_id, &cancel).await;
+            result.map_err(fail)?;
+            let diff = self.settle_diff(&page_id, &page).await?;
+            return Ok(ok(format!("typed into {page_id}\n\n{diff}")));
+        }
+
+        let server = self.clone();
+        let task_page_id = page_id.clone();
+        tokio::spawn(async move {
+            let result = page
+                .type_text_cancellable(backend, &a.text, a.clear, &cancel)
+                .await;
+            server.finish_typing(&task_page_id, &cancel).await;
+            if let Err(e) = result {
+                tracing::warn!("background typing on {task_page_id} failed: {e}");
             }
         });
-        Ok(ok(format!("typing started on {page_label}")))
+        Ok(ok(format!("typing started on {page_id}")))
     }
 
     /// Cancel the active per-character typing request for a page.
@@ -2441,8 +2463,8 @@ mod tests {
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
         force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
         release_owner_claim, truncate_text, validate_wheel_input,
-        webauthn_options_match_automatic_defaults, BrowserServer, State, DEFAULT_MAX_OUTPUT_LIMIT,
-        REQUEST_OWNER,
+        webauthn_options_match_automatic_defaults, BrowserServer, State, TypeArgs,
+        DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
 
@@ -2614,6 +2636,26 @@ mod tests {
         assert!(names.contains(&"browser_activate_page"));
         assert!(names.contains(&"browser_wheel"));
         assert!(names.contains(&"browser_cancel_typing"));
+    }
+
+    #[test]
+    fn browser_type_waits_by_default_and_background_typing_is_explicit() {
+        let blocking: TypeArgs = serde_json::from_value(serde_json::json!({
+            "page": "p1",
+            "selector": "#message",
+            "text": "hello"
+        }))
+        .unwrap();
+        assert!(blocking.wait);
+
+        let background: TypeArgs = serde_json::from_value(serde_json::json!({
+            "page": "p1",
+            "selector": "#message",
+            "text": "hello",
+            "wait": false
+        }))
+        .unwrap();
+        assert!(!background.wait);
     }
 
     #[test]

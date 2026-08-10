@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-AB_VERSION=v0.1.20 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+AB_VERSION=v0.1.21 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,10 +90,14 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.1.20)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.1.21)</strong></summary>
 
-**v0.1.20 — non-blocking typing + cancel.** `browser_type` now returns
-immediately ("typing started") and runs keyboard dispatch in the background.
+**v0.1.21 — opt-in background typing.** `browser_type` waits for completion
+and returns its settle diff by default, preserving the existing action contract.
+Pass `wait: false` only when a later `browser_cancel_typing` call is needed.
+
+**v0.1.20 — cancellable typing.** `browser_type` can run keyboard dispatch in
+the background so a later `browser_cancel_typing` call can stop it mid-flight.
 Long text (≥ 30 chars) uses a single CDP `Input.insertText` instead of
 char‑by‑char key events for speed. Call `browser_cancel_typing({page})` to
 stop a running typing task mid-flight; already-typed characters remain.
@@ -264,8 +268,9 @@ foreground fallback when browser-rs launched Chrome itself. Use
 real CDP `mouseWheel` event instead of DOM `window.scrollBy()`.
 `browser_type` keeps human-like key events for text under 30 characters and
 uses one atomic CDP `Input.insertText` command for longer input.
-`browser_cancel_typing` stops active per-character typing; text already entered
-remains, while atomic long-text insertion normally finishes before cancellation.
+`browser_cancel_typing` stops active per-character typing started with
+`wait: false`; text already entered remains, while atomic long-text insertion
+normally finishes before cancellation.
 
 **Network and requests:** `browser_network_requests` · `browser_route_block` · `browser_route_mock` · `browser_route_clear` · `browser_network_state_set` · `browser_api_request`
 
