@@ -10,7 +10,7 @@
 browser-rs is a lightweight, stealth-oriented browser MCP server. It lets
 multiple AI agents share one logged-in Chrome — each agent controls only its
 own tabs — for parallel scraping, web automation, and QA without every agent
-spinning up its own browser. 64 Playwright-style tools, one Rust binary, no
+spinning up its own browser. 67 Playwright-style tools, one Rust binary, no
 Node.js runtime.
 
 ```mermaid
@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.21 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.22 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,15 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.1.21)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.1.22)</strong></summary>
+
+**v0.1.22 — exact pointer capabilities.** Snapshot refs are unique capabilities
+bound to the page target and main-document loader, so navigation and later
+snapshots make old refs fail instead of silently retargeting them. The new
+`browser_pointer` tool adds right-click, double-click, horizontal/vertical
+scroll, and drag through either trusted CDP input or an explicit untrusted
+`dom_event` route. Trusted input retains humanized motion; DOM scrolling only
+succeeds when the selected scroll container actually moves.
 
 **v0.1.21 — opt-in background typing.** `browser_type` waits for completion
 and returns its settle diff by default, preserving the existing action contract.
@@ -254,11 +262,11 @@ whole section — it only activates when a host explicitly configures it.
 
 ## Tools
 
-MCP exposes 66 `browser_*` tools:
+MCP exposes 67 `browser_*` tools:
 
 **Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_read` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_read` · `browser_close_page` · `browser_close`
 
 Use `browser_activate_page({ "page": "p5" })` before automating a background
 tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,
@@ -266,6 +274,10 @@ retries visibility/focus verification, and uses a process-specific macOS
 foreground fallback when browser-rs launched Chrome itself. Use
 `browser_wheel({ "page": "p5", "delta_y": 700, "x": 650, "y": 500 })` for a
 real CDP `mouseWheel` event instead of DOM `window.scrollBy()`.
+Use `browser_pointer` for right-click/double-click and for an explicit
+`input_route: "dom_event"` background compatibility path. Constructed DOM
+events have `isTrusted == false`; they are never an automatic fallback from
+trusted CDP input.
 `browser_type` keeps human-like key events for text under 30 characters and
 uses one atomic CDP `Input.insertText` command for longer input.
 `browser_cancel_typing` stops active per-character typing started with
@@ -374,6 +386,41 @@ SHA-256 files, and attaches them to the GitHub Release. `install.sh` fetches the
 latest release by default; set `AB_VERSION=vX.Y.Z` to pin one.
 
 </details>
+
+## FAQ
+
+**What is browser-rs?** browser-rs is an MCP (Model Context Protocol) browser
+server — it exposes a real, stealth-oriented Chrome to AI agents as a set of
+tools (navigate, click, type, snapshot, etc.), so any MCP-compatible client
+can drive a browser without writing Playwright/Puppeteer glue code itself.
+
+**Can multiple AI agents share one browser?** Yes — that's the main reason
+browser-rs exists. One Chrome process and one persistent, logged-in profile
+are shared across agents; each agent gets its own owner-scoped tab group and
+can only see/control its own tabs. See [Multi-agent tabs](#multi-agent-tabs).
+
+**Is browser-rs a Playwright or Puppeteer alternative?** It solves a similar
+problem — programmatic browser control — but ships as a single ~5.5 MB Rust
+binary with no Node.js runtime or npm dependency tree, talks to Chrome over
+raw CDP, and is designed from the start for many agents sharing one browser
+rather than one script owning one browser instance.
+
+**Does browser-rs bypass bot detection?** No tool can guarantee that. The
+default headful mode with a persistent profile and no injected page patches
+avoids common automation signals, and [`bench/`](./bench) has reproducible
+detector runners to track regressions — but this is not a bypass guarantee.
+See [DESIGN.md](DESIGN.md).
+
+**What is managed mode / multi-tenant hosting?** An opt-in mode for a host
+platform running one browser-rs process for many untrusted tenants, adding
+per-owner HMAC capability auth, a tool allowlist, and an optional secret
+broker so long-term credentials never enter browser-rs. See
+[Managed mode](#managed-mode-secure-multi-tenant-hosting).
+
+## Related projects
+
+- **[Negotium](https://github.com/maestrojeong/negotium)** — a self-hosted AI
+  agent runtime whose built-in browser tools run on browser-rs.
 
 ## License
 

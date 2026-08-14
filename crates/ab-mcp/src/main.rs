@@ -8,7 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, Weak};
 
-use ab_browser::{Browser, ConsoleLog, LaunchOptions, NetworkLog, Page};
+use ab_browser::{
+    Browser, ConsoleLog, ElementRef, InputRoute, LaunchOptions, NetworkLog, Page, PointerAction,
+    PointerLocation, PointerRequest,
+};
 use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ContentBlock, ListToolsResult,
@@ -28,7 +31,7 @@ mod secret_broker;
 const INSTRUCTIONS: &str = r#"browser-rs — a real Chrome driven over CDP, no bundled agent.
 
 Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to verify.
-- snapshot renders the page as an accessibility tree; interactive nodes carry [ref=eN] handles.
+- snapshot renders the page as an accessibility tree; interactive nodes carry snapshot-scoped [ref] handles.
 - act on them by ref with browser_click / browser_type / browser_press_key.
 - browser_type waits for completion by default; use wait=false only when a later browser_cancel_typing call is needed.
 - browser_activate_page explicitly foregrounds a tab and verifies visibility.
@@ -115,7 +118,7 @@ fn webauthn_options_match_automatic_defaults(
 
 struct PageEntry {
     page: Page,
-    refs: HashMap<String, i64>,
+    refs: HashMap<String, ElementRef>,
     last_text: String,
     active_typing: Option<Weak<CancellationToken>>,
     netlog: Option<NetworkLog>,
@@ -127,22 +130,32 @@ struct PageEntry {
 /// Cheap post-action signal — trims noise so the agent sees only the delta.
 fn snapshot_diff(old: &str, new: &str) -> String {
     use std::collections::HashSet;
-    let old_lines: HashSet<&str> = old.lines().map(str::trim).collect();
-    let new_lines: HashSet<&str> = new.lines().map(str::trim).collect();
+    let normalize = |line: &str| {
+        let mut value = line.trim().to_string();
+        while let Some(start) = value.find(" [ref=") {
+            let Some(end) = value[start..].find(']') else {
+                break;
+            };
+            value.replace_range(start..=start + end, "");
+        }
+        value
+    };
+    let old_lines: HashSet<String> = old.lines().map(&normalize).collect();
+    let new_lines: HashSet<String> = new.lines().map(&normalize).collect();
     let mut out = String::new();
     for line in new.lines() {
-        let t = line.trim();
-        if !t.is_empty() && !old_lines.contains(t) {
+        let t = normalize(line);
+        if !t.is_empty() && !old_lines.contains(&t) {
             out.push_str("+ ");
-            out.push_str(line);
+            out.push_str(&t);
             out.push('\n');
         }
     }
     for line in old.lines() {
-        let t = line.trim();
-        if !t.is_empty() && !new_lines.contains(t) {
+        let t = normalize(line);
+        if !t.is_empty() && !new_lines.contains(&t) {
             out.push_str("- ");
-            out.push_str(line);
+            out.push_str(&t);
             out.push('\n');
         }
     }
@@ -277,6 +290,45 @@ struct WheelArgs {
     x: f64,
     /// Viewport y coordinate where the wheel event is dispatched.
     y: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PointerArgs {
+    /// Page id (e.g. "p1") or owner alias.
+    page: String,
+    /// click, hover, right_click, double_click, scroll, or drag.
+    action: String,
+    /// trusted (default) or dom_event. dom_event is untrusted and requires ref.
+    #[serde(default)]
+    input_route: Option<String>,
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    destination_ref: Option<String>,
+    #[serde(default)]
+    destination_selector: Option<String>,
+    #[serde(default)]
+    to_x: Option<f64>,
+    #[serde(default)]
+    to_y: Option<f64>,
+    #[serde(default)]
+    delta_x: Option<f64>,
+    #[serde(default)]
+    delta_y: Option<f64>,
+}
+
+struct PointerLocationInput<'a> {
+    ref_: &'a Option<String>,
+    selector: &'a Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
+    label: &'static str,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -765,7 +817,7 @@ impl BrowserServer {
         }
     }
 
-    async fn backend_of(&self, id: &str, ref_: &str) -> Result<i64, McpError> {
+    async fn element_ref_of(&self, id: &str, ref_: &str) -> Result<ElementRef, McpError> {
         let st = self.state.lock().await;
         let page_id = Self::resolve_page_id(&st, id)
             .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
@@ -776,7 +828,7 @@ impl BrowserServer {
         entry
             .refs
             .get(ref_)
-            .copied()
+            .cloned()
             .ok_or_else(|| fail(format!("unknown ref '{ref_}' (re-snapshot?)")))
     }
 
@@ -789,7 +841,10 @@ impl BrowserServer {
         selector: &Option<String>,
     ) -> Result<i64, McpError> {
         if let Some(r) = ref_ {
-            return self.backend_of(page_id, r).await;
+            let element = self.element_ref_of(page_id, r).await?;
+            let page = self.page_of(page_id).await?;
+            page.validate_element_ref(&element).await.map_err(fail)?;
+            return Ok(element.backend_node_id);
         }
         if let Some(sel) = selector {
             let page = self.page_of(page_id).await?;
@@ -802,8 +857,67 @@ impl BrowserServer {
         Err(fail("provide `ref` or `selector`"))
     }
 
+    async fn pointer_location(
+        &self,
+        page_id: &str,
+        page: &Page,
+        input: PointerLocationInput<'_>,
+    ) -> Result<Option<PointerLocation>, McpError> {
+        let coordinate = match (input.x, input.y) {
+            (None, None) => None,
+            (Some(x), Some(y)) if x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 => {
+                Some(PointerLocation::Coordinates { x, y })
+            }
+            (Some(_), Some(_)) => {
+                return Err(fail(format!(
+                    "{} coordinates must be finite and non-negative",
+                    input.label
+                )))
+            }
+            _ => {
+                return Err(fail(format!(
+                    "provide both {} x/y, or neither",
+                    input.label
+                )))
+            }
+        };
+        let element = match (input.ref_, input.selector) {
+            (Some(_), Some(_)) => {
+                return Err(fail(format!(
+                    "provide either {} ref or selector, not both",
+                    input.label
+                )))
+            }
+            (Some(reference), None) => Some(
+                self.element_ref_of(page_id, reference)
+                    .await
+                    .map(PointerLocation::Element)?,
+            ),
+            (None, Some(selector)) => {
+                let backend = page
+                    .backend_for_selector(selector)
+                    .await
+                    .map_err(fail)?
+                    .ok_or_else(|| fail(format!("no element matches selector {selector:?}")))?;
+                Some(PointerLocation::Element(
+                    page.element_ref_for_backend(backend).await.map_err(fail)?,
+                ))
+            }
+            (None, None) => None,
+        };
+        match (element, coordinate) {
+            (Some(_), Some(_)) => Err(fail(format!(
+                "provide either {} element or coordinates, not both",
+                input.label
+            ))),
+            (Some(element), None) => Ok(Some(element)),
+            (None, Some(coordinate)) => Ok(Some(coordinate)),
+            (None, None) => Ok(None),
+        }
+    }
+
     /// Persist a fresh snapshot (refs + text) for a page.
-    async fn store_snapshot(&self, id: &str, refs: HashMap<String, i64>, text: String) {
+    async fn store_snapshot(&self, id: &str, refs: HashMap<String, ElementRef>, text: String) {
         let mut st = self.state.lock().await;
         let Some(page_id) = Self::resolve_page_id(&st, id) else {
             return;
@@ -1117,14 +1231,24 @@ impl BrowserServer {
     }
 
     /// Click an element by its snapshot ref, then report what changed.
-    #[tool(description = "Click an element by ref (synthesized mouse click); returns settle-diff")]
+    #[tool(description = "Click an element by ref (trusted CDP mouse click); returns settle-diff")]
     async fn browser_click(
         &self,
         Parameters(a): Parameters<RefArgs>,
     ) -> Result<CallToolResult, McpError> {
         let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let page = self.page_of(&a.page).await?;
-        page.click(backend).await.map_err(fail)?;
+        let origin = page.element_ref_for_backend(backend).await.map_err(fail)?;
+        page.dispatch_pointer(&PointerRequest {
+            action: PointerAction::Click,
+            route: InputRoute::Trusted,
+            origin: PointerLocation::Element(origin),
+            destination: None,
+            delta_x: 0.0,
+            delta_y: 0.0,
+        })
+        .await
+        .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("clicked on {}\n\n{}", a.page, diff)))
     }
@@ -1141,7 +1265,16 @@ impl BrowserServer {
 
         let page_id = self.canonical_page_id(&a.page).await?;
         let page = self.page_of(&page_id).await?;
-        page.wheel(a.delta_y, a.x, a.y).await.map_err(fail)?;
+        page.dispatch_pointer(&PointerRequest {
+            action: PointerAction::Scroll,
+            route: InputRoute::Trusted,
+            origin: PointerLocation::Coordinates { x: a.x, y: a.y },
+            destination: None,
+            delta_x: 0.0,
+            delta_y: a.delta_y,
+        })
+        .await
+        .map_err(fail)?;
         let diff = self.settle_diff(&page_id, &page).await?;
         Ok(ok(serde_json::to_string_pretty(&serde_json::json!({
             "page": page_id,
@@ -1152,6 +1285,87 @@ impl BrowserServer {
             "diff": diff,
         }))
         .unwrap_or_else(|_| "{}".into())))
+    }
+
+    /// Extended pointer actions with explicit trusted or synthetic DOM delivery.
+    #[tool(
+        description = "Click, hover, right-click, double-click, scroll, or drag by ref/selector/coordinates. trusted is default; dom_event is explicitly untrusted and requires a snapshot ref"
+    )]
+    async fn browser_pointer(
+        &self,
+        Parameters(a): Parameters<PointerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page_id = self.canonical_page_id(&a.page).await?;
+        let page = self.page_of(&page_id).await?;
+        let action = PointerAction::parse(&a.action).map_err(fail)?;
+        let route =
+            InputRoute::parse(a.input_route.as_deref().unwrap_or("trusted")).map_err(fail)?;
+        if route == InputRoute::DomEvent && a.ref_.is_none() {
+            return Err(fail("input_route=dom_event requires `ref` for the origin"));
+        }
+        let origin = self
+            .pointer_location(
+                &page_id,
+                &page,
+                PointerLocationInput {
+                    ref_: &a.ref_,
+                    selector: &a.selector,
+                    x: a.x,
+                    y: a.y,
+                    label: "origin",
+                },
+            )
+            .await?
+            .ok_or_else(|| fail("provide origin ref, selector, or x/y"))?;
+        let destination = self
+            .pointer_location(
+                &page_id,
+                &page,
+                PointerLocationInput {
+                    ref_: &a.destination_ref,
+                    selector: &a.destination_selector,
+                    x: a.to_x,
+                    y: a.to_y,
+                    label: "destination",
+                },
+            )
+            .await?;
+        let request = PointerRequest {
+            action,
+            route,
+            origin,
+            destination,
+            delta_x: a.delta_x.unwrap_or(0.0),
+            delta_y: a.delta_y.unwrap_or(0.0),
+        };
+        let outcome = match page.dispatch_pointer(&request).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let message = error.to_string();
+                let code = if message.contains("stale ref") {
+                    "browser_ref_stale"
+                } else if message.contains("same live document")
+                    || message.contains("drag endpoint")
+                {
+                    "browser_wrong_target_refused"
+                } else {
+                    "browser_action_unavailable"
+                };
+                return Ok(CallToolResult::structured_error(serde_json::json!({
+                    "status": "refused",
+                    "refusal": { "code": code, "message": message },
+                    "retryable": false,
+                })));
+            }
+        };
+        let diff = self.settle_diff(&page_id, &page).await?;
+        let mut value = serde_json::to_value(outcome).map_err(fail)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("status".into(), serde_json::json!("ok"));
+            object.insert("page".into(), serde_json::json!(page_id));
+            object.insert("diff".into(), serde_json::json!(diff));
+        }
+        Ok(CallToolResult::structured(value))
     }
 
     /// Type text into an element by ref (optionally clearing it first).
@@ -1431,7 +1645,18 @@ impl BrowserServer {
             .resolve(&a.page, &a.target_ref, &a.target_selector)
             .await?;
         let page = self.page_of(&a.page).await?;
-        page.drag(from, to).await.map_err(fail)?;
+        let origin = page.element_ref_for_backend(from).await.map_err(fail)?;
+        let destination = page.element_ref_for_backend(to).await.map_err(fail)?;
+        page.dispatch_pointer(&PointerRequest {
+            action: PointerAction::Drag,
+            route: InputRoute::Trusted,
+            origin: PointerLocation::Element(origin),
+            destination: Some(PointerLocation::Element(destination)),
+            delta_x: 0.0,
+            delta_y: 0.0,
+        })
+        .await
+        .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("dragged on {}\n\n{}", a.page, diff)))
     }
@@ -1655,7 +1880,17 @@ impl BrowserServer {
     ) -> Result<CallToolResult, McpError> {
         let backend = self.resolve(&a.page, &a.ref_, &a.selector).await?;
         let page = self.page_of(&a.page).await?;
-        page.hover(backend).await.map_err(fail)?;
+        let origin = page.element_ref_for_backend(backend).await.map_err(fail)?;
+        page.dispatch_pointer(&PointerRequest {
+            action: PointerAction::Hover,
+            route: InputRoute::Trusted,
+            origin: PointerLocation::Element(origin),
+            destination: None,
+            delta_x: 0.0,
+            delta_y: 0.0,
+        })
+        .await
+        .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("hovered on {}\n\n{}", a.page, diff)))
     }
@@ -1808,7 +2043,9 @@ impl BrowserServer {
         let page = self.page_of(&a.page).await?;
         let mut done = 0;
         for f in &a.fields {
-            let backend = self.backend_of(&a.page, &f.ref_).await?;
+            let element = self.element_ref_of(&a.page, &f.ref_).await?;
+            page.validate_element_ref(&element).await.map_err(fail)?;
+            let backend = element.backend_node_id;
             page.type_text(backend, &f.value, true)
                 .await
                 .map_err(fail)?;
@@ -2462,7 +2699,7 @@ mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
         force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
-        release_owner_claim, truncate_text, validate_wheel_input,
+        release_owner_claim, snapshot_diff, truncate_text, validate_wheel_input,
         webauthn_options_match_automatic_defaults, BrowserServer, State, TypeArgs,
         DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
     };
@@ -2473,6 +2710,13 @@ mod tests {
         assert!(constant_time_secret_eq("한국어-token", "한국어-token"));
         assert!(!constant_time_secret_eq("한국어-token", "other-token"));
         assert!(!constant_time_secret_eq("short", "longer"));
+    }
+
+    #[test]
+    fn snapshot_diff_ignores_snapshot_scoped_ref_churn() {
+        let old = "button \"Save\" [ref=e1_1]\nStaticText \"Ready\"\n";
+        let new = "button \"Save\" [ref=e2_1]\nStaticText \"Ready\"\n";
+        assert_eq!(snapshot_diff(old, new), "(no visible change)");
     }
 
     #[test]
@@ -2627,13 +2871,14 @@ mod tests {
     }
 
     #[test]
-    fn foreground_wheel_and_cancel_typing_tools_are_publicly_registered() {
+    fn foreground_pointer_wheel_and_cancel_typing_tools_are_publicly_registered() {
         let tools = BrowserServer::new().tool_router.list_all();
         let names = tools
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
         assert!(names.contains(&"browser_activate_page"));
+        assert!(names.contains(&"browser_pointer"));
         assert!(names.contains(&"browser_wheel"));
         assert!(names.contains(&"browser_cancel_typing"));
     }
