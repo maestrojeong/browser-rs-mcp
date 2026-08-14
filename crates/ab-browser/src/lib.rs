@@ -4,6 +4,7 @@
 //! attached tab (flatten-mode session). Everything is designed so an LLM agent
 //! can run the loop: `snapshot -> act -> verify`.
 
+pub mod pointer;
 pub mod snapshot;
 pub mod stealth;
 
@@ -20,7 +21,8 @@ use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-pub use snapshot::Snapshot;
+pub use pointer::{InputRoute, PointerAction, PointerLocation, PointerOutcome, PointerRequest};
+pub use snapshot::{DocumentIdentity, ElementRef, Snapshot};
 
 /// One logged network request/response.
 #[derive(Debug, Clone)]
@@ -339,6 +341,7 @@ impl Browser {
             #[cfg(target_os = "macos")]
             browser_pid: self.child.as_ref().and_then(Child::id),
             pointer: Arc::new(Mutex::new(None)),
+            pointer_mutation: Arc::new(tokio::sync::Mutex::new(())),
             dialog: Arc::new(Mutex::new((true, None))),
             routes: Arc::new(Mutex::new(RouteState::default())),
         })
@@ -605,6 +608,8 @@ pub struct Page {
     /// motion is *continuous* — the next move starts where the last one ended,
     /// instead of teleporting to a fresh random origin every click.
     pointer: Arc<Mutex<Option<(f64, f64)>>>,
+    /// Serialize pointer validation and dispatch by the real page target.
+    pointer_mutation: Arc<tokio::sync::Mutex<()>>,
     /// JS-dialog handling policy: (accept, prompt_text). Read by the auto-handler.
     dialog: Arc<Mutex<(bool, Option<String>)>>,
     /// Network mock rules + intercept-loop state.
@@ -865,7 +870,72 @@ impl Page {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        Ok(snapshot::render(&nodes))
+        let document = self.current_main_document_identity().await?;
+        Ok(snapshot::render_with_document(&nodes, Some(document)))
+    }
+
+    async fn current_main_document_identity(&self) -> Result<DocumentIdentity> {
+        let tree = self
+            .client
+            .send_on(&self.session_id, "Page.getFrameTree", json!({}))
+            .await?;
+        let frame = tree
+            .get("frameTree")
+            .and_then(|tree| tree.get("frame"))
+            .ok_or_else(|| BrowserError::Protocol("no main frame identity".into()))?;
+        let frame_id = frame
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Protocol("main frame has no id".into()))?;
+        let loader_id = frame
+            .get("loaderId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Protocol("main frame has no loaderId".into()))?;
+        Ok(DocumentIdentity {
+            target_id: self.target_id.clone(),
+            frame_id: frame_id.to_string(),
+            loader_id: loader_id.to_string(),
+        })
+    }
+
+    /// Re-prove that a snapshot ref still belongs to this exact live document.
+    pub async fn validate_element_ref(&self, element: &ElementRef) -> Result<()> {
+        let expected = element.document.as_ref().ok_or_else(|| {
+            BrowserError::Protocol("unproven ref: re-snapshot the live page".into())
+        })?;
+        let live = self.current_main_document_identity().await?;
+        if &live != expected {
+            return Err(BrowserError::Protocol(
+                "stale ref: the page target or document changed; re-snapshot".into(),
+            ));
+        }
+        let resolved = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.resolveNode",
+                json!({ "backendNodeId": element.backend_node_id }),
+            )
+            .await
+            .map_err(|_| BrowserError::Protocol("stale ref: node no longer resolves".into()))?;
+        if resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(BrowserError::Protocol(
+                "stale ref: node has no live object".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bind a selector-resolved backend node to the current document identity.
+    pub async fn element_ref_for_backend(&self, backend_node_id: i64) -> Result<ElementRef> {
+        Ok(ElementRef {
+            backend_node_id,
+            document: Some(self.current_main_document_identity().await?),
+        })
     }
 
     /// Full-page PNG screenshot, returned as raw bytes.
@@ -1086,53 +1156,6 @@ impl Page {
             .unwrap_or(true))
     }
 
-    /// Fallback click: dispatch a full trusted-shaped pointer+mouse event
-    /// sequence directly ON the node, bypassing coordinates entirely. Used when
-    /// the real coordinate click is occluded/misses (e.g. Google SPA
-    /// `div[role=link]` list items). Mirrors the sequence a real click fires.
-    async fn dispatch_click_on_node(&self, backend: i64) -> Result<bool> {
-        let Some(obj) = self.resolve_object(backend).await? else {
-            return Ok(false);
-        };
-        let res = self
-            .client
-            .send_on(
-                &self.session_id,
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": obj,
-                    "returnByValue": true,
-                    "functionDeclaration": r#"function(){
-                        const el = this;
-                        el.scrollIntoView({block:'center', inline:'center'});
-                        const r = el.getBoundingClientRect();
-                        const cx = r.left + r.width/2, cy = r.top + r.height/2;
-                        const base = {bubbles:true, cancelable:true, composed:true,
-                            clientX:cx, clientY:cy, button:0, pointerId:1,
-                            pointerType:'mouse', isPrimary:true, view:window};
-                        const down = {...base, buttons:1};
-                        const up = {...base, buttons:0};
-                        el.dispatchEvent(new PointerEvent('pointerover', down));
-                        el.dispatchEvent(new PointerEvent('pointerenter', down));
-                        el.dispatchEvent(new MouseEvent('mouseover', down));
-                        el.dispatchEvent(new PointerEvent('pointerdown', down));
-                        el.dispatchEvent(new MouseEvent('mousedown', down));
-                        try { el.focus && el.focus(); } catch(_) {}
-                        el.dispatchEvent(new PointerEvent('pointerup', up));
-                        el.dispatchEvent(new MouseEvent('mouseup', up));
-                        el.dispatchEvent(new MouseEvent('click', up));
-                        return true;
-                    }"#,
-                }),
-            )
-            .await?;
-        Ok(res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false))
-    }
-
     /// Resolve a backend node to a Runtime objectId (for JS calls on it).
     async fn resolve_object(&self, backend: i64) -> Result<Option<String>> {
         let res = self
@@ -1223,31 +1246,6 @@ impl Page {
         Ok(())
     }
 
-    /// Dispatch a real CDP mouse-wheel event at viewport coordinates.
-    ///
-    /// This intentionally does not use DOM scrolling APIs: sites receive the
-    /// same `mouseWheel` input path as physical trackpad/mouse scrolling.
-    pub async fn wheel(&self, delta_y: f64, x: f64, y: f64) -> Result<()> {
-        self.human_move_to(x, y).await?;
-        self.client
-            .send_on(
-                &self.session_id,
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": x,
-                    "y": y,
-                    "deltaX": 0.0,
-                    "deltaY": delta_y,
-                }),
-            )
-            .await?;
-        tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
-        Ok(())
-    }
-
-    /// Click a node by ref: glide the pointer to it, then press/release with a
-    /// human-like dwell. Falls back to a DOM `.click()` when there is no box.
     /// Playwright-style pre-action: bring the node into the viewport so its
     /// box-model coordinates are valid, then let layout settle briefly. Used by
     /// every coordinate-based action (click/hover/drag) and by focus/type so
@@ -1262,98 +1260,6 @@ impl Page {
             )
             .await;
         tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
-    }
-
-    /// Fallback hover: dispatch pointer/mouse-over events directly on the node,
-    /// for when the real pointer move can't reach an occluded target.
-    async fn dispatch_hover_on_node(&self, backend: i64) -> Result<bool> {
-        let Some(obj) = self.resolve_object(backend).await? else {
-            return Ok(false);
-        };
-        let res = self
-            .client
-            .send_on(
-                &self.session_id,
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": obj,
-                    "returnByValue": true,
-                    "functionDeclaration": r#"function(){
-                        const el = this;
-                        el.scrollIntoView({block:'center', inline:'center'});
-                        const r = el.getBoundingClientRect();
-                        const cx = r.left + r.width/2, cy = r.top + r.height/2;
-                        const o = {bubbles:true, cancelable:true, composed:true,
-                            clientX:cx, clientY:cy, pointerId:1, pointerType:'mouse',
-                            isPrimary:true, view:window};
-                        el.dispatchEvent(new PointerEvent('pointerover', o));
-                        el.dispatchEvent(new PointerEvent('pointerenter', o));
-                        el.dispatchEvent(new MouseEvent('mouseover', o));
-                        el.dispatchEvent(new MouseEvent('mousemove', o));
-                        return true;
-                    }"#,
-                }),
-            )
-            .await?;
-        Ok(res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false))
-    }
-
-    pub async fn click(&self, backend: i64) -> Result<()> {
-        // Actionability, Playwright-style: scroll the target into view FIRST so
-        // its box-model coordinates are valid (an off-screen element yields a
-        // point the real mouse event can't reach).
-        self.scroll_into_view(backend).await;
-
-        if let Some((x, y)) = self.node_center(backend).await? {
-            // Only fire a real coordinate click if the point actually lands on
-            // the target — otherwise an overlay/animation would steal it.
-            let hits = self.point_hits_node(backend, x, y).await.unwrap_or(true);
-            if hits {
-                let _ = self.human_move_to(x, y).await;
-                tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
-                self.client
-                    .send_on(
-                        &self.session_id,
-                        "Input.dispatchMouseEvent",
-                        json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 }),
-                    )
-                    .await?;
-                tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
-                self.client
-                    .send_on(
-                        &self.session_id,
-                        "Input.dispatchMouseEvent",
-                        json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
-                    )
-                    .await?;
-                return Ok(());
-            }
-        }
-
-        // Occluded, moved, or box-less (e.g. Google SPA div[role=link] list
-        // items): dispatch a full pointer+mouse sequence directly on the node.
-        if self.dispatch_click_on_node(backend).await? {
-            return Ok(());
-        }
-        // Last resort: plain element.click().
-        if let Some(obj) = self.resolve_object(backend).await? {
-            self.client
-                .send_on(
-                    &self.session_id,
-                    "Runtime.callFunctionOn",
-                    json!({
-                        "objectId": obj,
-                        "functionDeclaration": "function(){ this.click(); }",
-                    }),
-                )
-                .await?;
-            return Ok(());
-        }
-        Err(BrowserError::Protocol("element not clickable".into()))
     }
 
     /// Focus a node and enter text. Long text uses one `Input.insertText`
@@ -2045,22 +1951,6 @@ impl Page {
 
 /// More navigation / interaction primitives (parity with mature drivers).
 impl Page {
-    /// Hover the pointer over an element by ref — glides there continuously.
-    pub async fn hover(&self, backend: i64) -> Result<()> {
-        self.scroll_into_view(backend).await;
-        if let Some((x, y)) = self.node_center(backend).await? {
-            // Real pointer glide only if the point lands on the target;
-            // otherwise dispatch hover events on the node (occluded target).
-            if self.point_hits_node(backend, x, y).await.unwrap_or(true) {
-                return self.human_move_to(x, y).await;
-            }
-        }
-        if self.dispatch_hover_on_node(backend).await? {
-            return Ok(());
-        }
-        Err(BrowserError::Protocol("element has no box to hover".into()))
-    }
-
     /// Set the value of a <select> by ref and fire input/change events.
     pub async fn select_option(&self, backend: i64, value: &str) -> Result<()> {
         self.scroll_into_view(backend).await;
@@ -2357,49 +2247,6 @@ impl Page {
                 json!({ "files": paths, "backendNodeId": backend }),
             )
             .await?;
-        Ok(())
-    }
-
-    /// Drag from one element to another (press, glide, release).
-    pub async fn drag(&self, from: i64, to: i64) -> Result<()> {
-        // Bring both endpoints into view so their coordinates are valid.
-        self.scroll_into_view(from).await;
-        let from_pt = self.node_center(from).await?;
-        self.scroll_into_view(to).await;
-        let to_pt = self.node_center(to).await?;
-        let (Some((fx, fy)), Some((tx, ty))) = (from_pt, to_pt) else {
-            return Err(BrowserError::Protocol(
-                "drag source/target has no box".into(),
-            ));
-        };
-        self.human_move_to(fx, fy).await?;
-        self.client
-            .send_on(
-                &self.session_id,
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mousePressed", "x": fx, "y": fy, "button": "left", "buttons": 1, "clickCount": 1 }),
-            )
-            .await?;
-        // Glide toward the target while holding the button.
-        for i in 1..=8 {
-            let t = i as f64 / 8.0;
-            self.client
-                .send_on(
-                    &self.session_id,
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseMoved", "x": fx + (tx - fx) * t, "y": fy + (ty - fy) * t, "button": "left", "buttons": 1 }),
-                )
-                .await?;
-            tokio::time::sleep(Duration::from_millis(rand_u64(8, 22))).await;
-        }
-        self.client
-            .send_on(
-                &self.session_id,
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseReleased", "x": tx, "y": ty, "button": "left", "buttons": 0, "clickCount": 1 }),
-            )
-            .await?;
-        *self.pointer.lock().unwrap() = Some((tx, ty));
         Ok(())
     }
 

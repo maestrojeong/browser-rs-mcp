@@ -7,14 +7,38 @@
 //! Design goal: minimal tokens, maximum signal. Ignored/empty nodes are pruned.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 
 /// A rendered snapshot plus the ref -> backendDOMNodeId map used by act tools.
 pub struct Snapshot {
     pub text: String,
-    /// ref id (e.g. "e3") -> backendDOMNodeId
-    pub refs: HashMap<String, i64>,
+    /// Snapshot-scoped ref id -> live-node capability.
+    pub refs: HashMap<String, ElementRef>,
+}
+
+/// Main-frame document identity captured when an accessibility ref is minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentIdentity {
+    pub target_id: String,
+    pub frame_id: String,
+    pub loader_id: String,
+}
+
+/// A snapshot-scoped element capability. The backend id is never sufficient by
+/// itself: callers must re-prove `document` before mutating the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementRef {
+    pub backend_node_id: i64,
+    pub document: Option<DocumentIdentity>,
+}
+
+static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct RenderContext<'a> {
+    snapshot_id: u64,
+    document: Option<&'a DocumentIdentity>,
 }
 
 /// Roles that are interactive enough to warrant a [ref].
@@ -71,6 +95,13 @@ fn str_prop(node: &Value, key: &str) -> String {
 
 /// Build a snapshot from the `nodes` array returned by Accessibility.getFullAXTree.
 pub fn render(nodes: &[Value]) -> Snapshot {
+    render_with_document(nodes, None)
+}
+
+pub(crate) fn render_with_document(
+    nodes: &[Value],
+    document: Option<DocumentIdentity>,
+) -> Snapshot {
     // Index nodes by their AX nodeId and remember child order.
     let mut by_id: HashMap<&str, &Value> = HashMap::new();
     let mut root_id: Option<&str> = None;
@@ -93,9 +124,13 @@ pub fn render(nodes: &[Value]) -> Snapshot {
     let mut out = String::new();
     let mut refs = HashMap::new();
     let mut counter = 0u32;
+    let context = RenderContext {
+        snapshot_id: NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
+        document: document.as_ref(),
+    };
 
     if let Some(rid) = root_id {
-        walk(rid, &by_id, 0, &mut out, &mut refs, &mut counter);
+        walk(rid, &by_id, 0, &mut out, &mut refs, &mut counter, &context);
     }
 
     Snapshot { text: out, refs }
@@ -107,8 +142,9 @@ fn walk(
     by_id: &HashMap<&str, &Value>,
     depth: usize,
     out: &mut String,
-    refs: &mut HashMap<String, i64>,
+    refs: &mut HashMap<String, ElementRef>,
     counter: &mut u32,
+    context: &RenderContext<'_>,
 ) {
     let Some(node) = by_id.get(id) else { return };
 
@@ -140,9 +176,15 @@ fn walk(
         }
         if is_interactive(role) {
             *counter += 1;
-            let r = format!("e{}", *counter);
+            let r = format!("e{}_{}", context.snapshot_id, *counter);
             if let Some(backend) = node.get("backendDOMNodeId").and_then(Value::as_i64) {
-                refs.insert(r.clone(), backend);
+                refs.insert(
+                    r.clone(),
+                    ElementRef {
+                        backend_node_id: backend,
+                        document: context.document.cloned(),
+                    },
+                );
             }
             line.push_str(&format!(" [ref={r}]"));
         }
@@ -156,7 +198,7 @@ fn walk(
     if let Some(children) = node.get("childIds").and_then(Value::as_array) {
         for c in children {
             if let Some(cid) = c.as_str() {
-                walk(cid, by_id, child_depth, out, refs, counter);
+                walk(cid, by_id, child_depth, out, refs, counter, context);
             }
         }
     }
@@ -174,7 +216,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, render_with_document, DocumentIdentity};
     use serde_json::json;
 
     #[test]
@@ -245,5 +287,27 @@ mod tests {
         ];
         let snap = render(&nodes);
         assert!(!snap.text.contains("generic"));
+    }
+
+    #[test]
+    fn refs_are_unique_across_snapshots_and_carry_document_identity() {
+        let nodes = vec![json!({
+            "nodeId": "1",
+            "role": {"value": "button"},
+            "name": {"value": "Save"},
+            "backendDOMNodeId": 42
+        })];
+        let identity = DocumentIdentity {
+            target_id: "target".into(),
+            frame_id: "frame".into(),
+            loader_id: "loader".into(),
+        };
+        let first = render_with_document(&nodes, Some(identity.clone()));
+        let second = render_with_document(&nodes, Some(identity.clone()));
+        let first_ref = first.refs.iter().next().unwrap();
+        let second_ref = second.refs.iter().next().unwrap();
+        assert_ne!(first_ref.0, second_ref.0);
+        assert_eq!(first_ref.1.backend_node_id, 42);
+        assert_eq!(first_ref.1.document.as_ref(), Some(&identity));
     }
 }

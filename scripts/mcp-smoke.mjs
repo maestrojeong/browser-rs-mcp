@@ -45,7 +45,7 @@ notify("notifications/initialized", {});
 const tools = await send("tools/list", {});
 const toolNames = tools.result.tools.map((t) => t.name);
 console.log("tools:", toolNames.join(", "));
-for (const required of ["browser_activate_page", "browser_wheel"]) {
+for (const required of ["browser_activate_page", "browser_pointer", "browser_wheel"]) {
   if (!toolNames.includes(required)) {
     child.kill();
     throw new Error(`missing tool: ${required}`);
@@ -88,10 +88,42 @@ if (!(scrollValue > 0)) {
 }
 console.log("scrollY after mouseWheel:", scrollValue);
 
-// act: click the first ref, then re-snapshot to verify navigation.
+async function freshRef() {
+  const snapshot = await send("tools/call", {
+    name: "browser_snapshot",
+    arguments: { page: "p1" },
+  });
+  const snapshotText = snapshot.result?.content?.[0]?.text || "";
+  return snapshotText.match(/\[ref=([^\]]+)\]/)?.[1];
+}
+
+// Each mutation settles and refreshes refs, so fetch a fresh capability before
+// every later action.
+let firstRef = await freshRef();
+if (!firstRef) {
+  child.kill();
+  throw new Error("navigation snapshot had no interactive ref");
+}
+for (const inputRoute of ["trusted", "dom_event"]) {
+  const hover = await send("tools/call", {
+    name: "browser_pointer",
+    arguments: {
+      page: "p1",
+      action: "hover",
+      input_route: inputRoute,
+      ref: firstRef,
+    },
+  });
+  if (hover.result?.isError || hover.error) {
+    child.kill();
+    throw new Error(`${inputRoute} pointer hover failed: ${JSON.stringify(hover)}`);
+  }
+  console.log(`browser_pointer hover (${inputRoute}):`, hover.result?.content?.[0]?.text);
+  firstRef = await freshRef();
+}
 const click = await send("tools/call", {
   name: "browser_click",
-  arguments: { page: "p1", ref: "e1" },
+  arguments: { page: "p1", ref: firstRef },
 });
 const clickResult = click.result?.content?.[0]?.text || JSON.stringify(click.error);
 console.log("--- browser_click (with settle-diff) ---");

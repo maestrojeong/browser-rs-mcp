@@ -36,7 +36,8 @@ delivered as a lean Rust MCP server driving stock Chrome.
    *headless fallback*, not the default.
 3. **The agent's world model is the accessibility tree,** not raw HTML. It is
    smaller (fewer tokens), more stable across re-renders, and maps cleanly to
-   "act by ref". Interactive nodes carry `[ref=eN]` → backendDOMNodeId.
+   "act by ref". Interactive nodes carry snapshot-scoped refs that bind a
+   backendDOMNodeId to the page target and main-frame loader identity.
 4. **Rust hot path.** tokio + tokio-tungstenite, no GC pauses, single small
    static binary — ideal for an MCP server spawned per session.
 
