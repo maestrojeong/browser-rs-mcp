@@ -169,7 +169,37 @@ users — are unaffected and keep their existing behavior.
 
 ## Connect an MCP client
 
-Example stdio configuration:
+`browser-rs` speaks standard MCP over stdio — any compliant client connects
+with one line of config. Pick yours:
+
+<details>
+<summary><strong>Claude Code</strong></summary>
+
+```bash
+claude mcp add browser-rs -- browser-rs
+```
+
+Registers it for the current project. Add `-s user` to register it globally
+for all projects instead. Verify with `claude mcp list`.
+
+</details>
+
+<details>
+<summary><strong>Codex CLI</strong></summary>
+
+Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.browser-rs]
+command = "browser-rs"
+```
+
+</details>
+
+<details>
+<summary><strong>Claude Desktop</strong></summary>
+
+Add to `claude_desktop_config.json`:
 
 ```jsonc
 {
@@ -180,6 +210,25 @@ Example stdio configuration:
   }
 }
 ```
+
+</details>
+
+<details>
+<summary><strong>Cursor</strong></summary>
+
+Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
+
+```jsonc
+{
+  "mcpServers": {
+    "browser-rs": {
+      "command": "browser-rs"
+    }
+  }
+}
+```
+
+</details>
 
 Use HTTP when several agents should share one browser process and profile:
 
