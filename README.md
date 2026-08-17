@@ -230,6 +230,41 @@ Add to `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (per-project):
 
 </details>
 
+<details>
+<summary><strong>Gemini CLI</strong></summary>
+
+Add to `~/.gemini/settings.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "browser-rs": {
+      "command": "browser-rs"
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Any other MCP client</strong></summary>
+
+Any MCP-compliant client that launches a stdio server works. The command is
+just `browser-rs`, no arguments:
+
+```jsonc
+{
+  "mcpServers": {
+    "browser-rs": {
+      "command": "browser-rs"
+    }
+  }
+}
+```
+
+</details>
+
 Use HTTP when several agents should share one browser process and profile:
 
 ```bash
