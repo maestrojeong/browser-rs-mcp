@@ -638,6 +638,25 @@ struct IframeFillArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct IframeTypeArgs {
+    page: String,
+    /// CSS selector for the <iframe> element, or a " >> "-separated chain
+    /// for nested iframes. Same-origin and cross-origin frames are supported.
+    frame_selector: String,
+    /// CSS selector for the input inside the innermost iframe.
+    selector: String,
+    /// Text to type through trusted CDP keyboard input.
+    text: String,
+    /// Replace existing content instead of appending.
+    #[serde(default)]
+    clear: bool,
+    /// Wait for typing to finish and return the resulting page diff. Set false
+    /// only when the typing must remain cancellable by browser_cancel_typing.
+    #[serde(default = "default_true")]
+    wait: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct IframeReadArgs {
     page: String,
     /// CSS selector for the <iframe> element, or a " >> "-separated chain
@@ -2215,6 +2234,51 @@ impl BrowserServer {
         Ok(ok(format!("iframe-filled on {}", a.page)))
     }
 
+    /// Type into an input inside an iframe using trusted CDP keyboard input.
+    #[tool(
+        description = "Type text into an element inside a same-origin or cross-origin iframe using trusted CDP keyboard input; chain nested iframes in frame_selector with ' >> '; waits by default and supports browser_cancel_typing when wait=false"
+    )]
+    async fn browser_iframe_type(
+        &self,
+        Parameters(a): Parameters<IframeTypeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let (page_id, page, cancel) = self.begin_typing(&a.page).await?;
+        if a.wait {
+            let result = page
+                .iframe_type_text_cancellable(
+                    &a.frame_selector,
+                    &a.selector,
+                    &a.text,
+                    a.clear,
+                    &cancel,
+                )
+                .await;
+            self.finish_typing(&page_id, &cancel).await;
+            result.map_err(fail)?;
+            let diff = self.settle_diff(&page_id, &page).await?;
+            return Ok(ok(format!("iframe-typed into {page_id}\n\n{diff}")));
+        }
+
+        let server = self.clone();
+        let task_page_id = page_id.clone();
+        tokio::spawn(async move {
+            let result = page
+                .iframe_type_text_cancellable(
+                    &a.frame_selector,
+                    &a.selector,
+                    &a.text,
+                    a.clear,
+                    &cancel,
+                )
+                .await;
+            server.finish_typing(&task_page_id, &cancel).await;
+            if let Err(e) = result {
+                tracing::warn!("background iframe typing on {task_page_id} failed: {e}");
+            }
+        });
+        Ok(ok(format!("iframe typing started on {page_id}")))
+    }
+
     /// Read HTML or text from inside an iframe (same-origin or cross-origin,
     /// including nested chains via " >> "). Use this to inspect content
     /// hidden behind a cross-origin iframe that `browser_get_visible_html`
@@ -2700,7 +2764,7 @@ mod tests {
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
         force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
         release_owner_claim, snapshot_diff, truncate_text, validate_wheel_input,
-        webauthn_options_match_automatic_defaults, BrowserServer, State, TypeArgs,
+        webauthn_options_match_automatic_defaults, BrowserServer, IframeTypeArgs, State, TypeArgs,
         DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
@@ -2871,7 +2935,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_pointer_wheel_and_cancel_typing_tools_are_publicly_registered() {
+    fn foreground_pointer_wheel_and_typing_tools_are_publicly_registered() {
         let tools = BrowserServer::new().tool_router.list_all();
         let names = tools
             .iter()
@@ -2881,6 +2945,7 @@ mod tests {
         assert!(names.contains(&"browser_pointer"));
         assert!(names.contains(&"browser_wheel"));
         assert!(names.contains(&"browser_cancel_typing"));
+        assert!(names.contains(&"browser_iframe_type"));
     }
 
     #[test]
@@ -2901,6 +2966,15 @@ mod tests {
         }))
         .unwrap();
         assert!(!background.wait);
+
+        let iframe: IframeTypeArgs = serde_json::from_value(serde_json::json!({
+            "page": "p1",
+            "frame_selector": "iframe#outer >> iframe#inner",
+            "selector": "#phone",
+            "text": "01012345678"
+        }))
+        .unwrap();
+        assert!(iframe.wait);
     }
 
     #[test]

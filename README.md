@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.22 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.23 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,15 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.1.22)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.1.23)</strong></summary>
+
+**v0.1.23 — trusted iframe typing.** The new `browser_iframe_type` tool
+focuses inputs inside same-origin, cross-origin, and out-of-process iframes,
+then dispatches browser-generated CDP keyboard input on the innermost frame's
+own session. This supports React-controlled and masked inputs that reject
+`element.value` assignment plus synthetic DOM events. It shares
+`browser_type`'s humanized short-text typing, atomic long-text insertion,
+`clear`, blocking-by-default behavior, and `browser_cancel_typing` support.
 
 **v0.1.22 — exact pointer capabilities.** Snapshot refs are unique capabilities
 bound to the page target and main-document loader, so navigation and later
@@ -346,11 +354,11 @@ whole section — it only activates when a host explicitly configures it.
 
 ## Tools
 
-MCP exposes 67 `browser_*` tools:
+MCP exposes 68 `browser_*` tools:
 
 **Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_read` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_type` · `browser_iframe_read` · `browser_close_page` · `browser_close`
 
 Use `browser_activate_page({ "page": "p5" })` before automating a background
 tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,
@@ -364,6 +372,9 @@ events have `isTrusted == false`; they are never an automatic fallback from
 trusted CDP input.
 `browser_type` keeps human-like key events for text under 30 characters and
 uses one atomic CDP `Input.insertText` command for longer input.
+`browser_iframe_type` applies the same input behavior after focusing the target
+inside a nested iframe chain and routes OOPIF input through that frame's CDP
+session; use it instead of `browser_iframe_fill` for controlled or masked inputs.
 `browser_cancel_typing` stops active per-character typing started with
 `wait: false`; text already entered remains, while atomic long-text insertion
 normally finishes before cancellation.

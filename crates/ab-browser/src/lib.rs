@@ -388,6 +388,7 @@ pub enum ReadMode {
 enum FrameAction<'a> {
     Click,
     Fill(&'a str),
+    Focus { clear: bool },
     Read(ReadMode),
 }
 
@@ -447,6 +448,14 @@ fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction<'_>) ->
             "el.focus(); el.value={v}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return {{ ok: true }};",
             v = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
         ),
+        FrameAction::Focus { clear } => {
+            let select_js = if *clear {
+                " if (typeof el.select === 'function') el.select(); else if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, (el.value || '').length);"
+            } else {
+                ""
+            };
+            format!("el.focus();{select_js} return {{ ok: true }};")
+        }
         FrameAction::Read(ReadMode::Html) => "return { ok: true, value: el.outerHTML };".to_string(),
         FrameAction::Read(ReadMode::Text) => {
             "return { ok: true, value: (el.innerText !== undefined ? el.innerText : (el.textContent || '')) };"
@@ -1301,26 +1310,39 @@ impl Page {
                     )
                     .await?;
             }
+        }
+
+        self.dispatch_text_cancellable(&self.session_id, text, clear, cancel)
+            .await
+    }
+
+    /// Dispatch text to the element currently focused in `session_id`.
+    /// Keeping the session explicit lets iframe typing target an OOPIF's own
+    /// renderer session instead of always falling back to the top-level page.
+    async fn dispatch_text_cancellable(
+        &self,
+        session_id: &str,
+        text: &str,
+        clear: bool,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if clear {
             // Delete the selection so typed keys replace it.
             for kind in ["keyDown", "keyUp"] {
                 self.client
                     .send_on(
-                        &self.session_id,
+                        session_id,
                         "Input.dispatchKeyEvent",
                         json!({ "type": kind, "key": "Delete", "code": "Delete", "windowsVirtualKeyCode": 46 }),
-                )
-                .await?;
+                    )
+                    .await?;
             }
         }
 
         ensure_typing_active(cancel)?;
         if uses_insert_text(text) {
             self.client
-                .send_on(
-                    &self.session_id,
-                    "Input.insertText",
-                    json!({ "text": text }),
-                )
+                .send_on(session_id, "Input.insertText", json!({ "text": text }))
                 .await?;
             return Ok(());
         }
@@ -1329,7 +1351,7 @@ impl Page {
         for ch in text.chars() {
             if cancel.is_cancelled() {
                 if shift_held {
-                    self.release_shift().await?;
+                    self.release_shift_on(session_id).await?;
                 }
                 return Err(BrowserError::TypingCancelled);
             }
@@ -1341,24 +1363,24 @@ impl Page {
             if need_shift && !shift_held {
                 self.client
                     .send_on(
-                        &self.session_id,
+                        session_id,
                         "Input.dispatchKeyEvent",
                         json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "modifiers": 8 }),
                     )
                     .await?;
                 shift_held = true;
                 if typing_delay(cancel, rand_u64(15, 45)).await.is_err() {
-                    self.release_shift().await?;
+                    self.release_shift_on(session_id).await?;
                     return Err(BrowserError::TypingCancelled);
                 }
             } else if !need_shift && shift_held {
-                self.release_shift().await?;
+                self.release_shift_on(session_id).await?;
                 shift_held = false;
             }
             let modifiers = if need_shift { 8 } else { 0 };
             self.client
                 .send_on(
-                    &self.session_id,
+                    session_id,
                     "Input.dispatchKeyEvent",
                     json!({ "type": "keyDown", "text": s, "key": s, "unmodifiedText": s, "modifiers": modifiers }),
                 )
@@ -1367,14 +1389,14 @@ impl Page {
             let cancelled = typing_delay(cancel, rand_u64(20, 90)).await.is_err();
             self.client
                 .send_on(
-                    &self.session_id,
+                    session_id,
                     "Input.dispatchKeyEvent",
                     json!({ "type": "keyUp", "key": s, "modifiers": modifiers }),
                 )
                 .await?;
             if cancelled {
                 if shift_held {
-                    self.release_shift().await?;
+                    self.release_shift_on(session_id).await?;
                 }
                 return Err(BrowserError::TypingCancelled);
             }
@@ -1391,21 +1413,21 @@ impl Page {
             };
             if typing_delay(cancel, gap).await.is_err() {
                 if shift_held {
-                    self.release_shift().await?;
+                    self.release_shift_on(session_id).await?;
                 }
                 return Err(BrowserError::TypingCancelled);
             }
         }
         if shift_held {
-            self.release_shift().await?;
+            self.release_shift_on(session_id).await?;
         }
         Ok(())
     }
 
-    async fn release_shift(&self) -> Result<()> {
+    async fn release_shift_on(&self, session_id: &str) -> Result<()> {
         self.client
             .send_on(
-                &self.session_id,
+                session_id,
                 "Input.dispatchKeyEvent",
                 json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
             )
@@ -1473,6 +1495,26 @@ impl Page {
         Ok(())
     }
 
+    /// Focus an input inside a same-origin, cross-origin, or OOPIF iframe and
+    /// type through CDP's Input domain. Unlike `iframe_fill`, this does not
+    /// assign `element.value` or synthesize DOM events, so controlled inputs
+    /// receive the browser-generated keyboard/input event sequence.
+    pub async fn iframe_type_text_cancellable(
+        &self,
+        frame_selector: &str,
+        selector: &str,
+        text: &str,
+        clear: bool,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let chain = require_frame_chain(frame_selector)?;
+        let (_, session_id) = self
+            .descend_and_act_with_session(&chain, selector, &FrameAction::Focus { clear })
+            .await?;
+        self.dispatch_text_cancellable(&session_id, text, clear, cancel)
+            .await
+    }
+
     /// Read an element's `outerHTML` (`ReadMode::Html`) or rendered text
     /// (`ReadMode::Text`) from inside an iframe. `frame_selector` may be a
     /// single CSS selector or a `>>`-separated chain for nested iframes, and
@@ -1516,6 +1558,20 @@ impl Page {
         selector: &str,
         action: &FrameAction<'_>,
     ) -> Result<Value> {
+        self.descend_and_act_with_session(chain, selector, action)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Variant of `descend_and_act` that also returns the CDP session owning
+    /// the innermost frame. Keyboard input must be dispatched on that session
+    /// when Site Isolation places the target frame in an OOPIF renderer.
+    async fn descend_and_act_with_session(
+        &self,
+        chain: &[&str],
+        selector: &str,
+        action: &FrameAction<'_>,
+    ) -> Result<(Value, String)> {
         let mut context: Option<FrameExecutionContext> = None;
         let mut remaining: Vec<&str> = chain.to_vec();
         // Bound the loop: at most one CDP hop per chain element, plus one.
@@ -1526,7 +1582,11 @@ impl Page {
                 Some(ctx) => self.eval_with_context(&js, ctx).await?,
             };
             if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                return Ok(result);
+                let session_id = context
+                    .as_ref()
+                    .map(|ctx| ctx.session_id.clone())
+                    .unwrap_or_else(|| self.session_id.clone());
+                return Ok((result, session_id));
             }
             let index = result.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let src = result
@@ -2847,6 +2907,27 @@ mod tests {
         assert!(js.contains(r#"el.value="hello \"world\"";"#));
         assert!(js.contains("dispatchEvent(new Event('input'"));
         assert!(js.contains("dispatchEvent(new Event('change'"));
+    }
+
+    #[test]
+    fn descend_js_focus_selects_only_when_clear_is_requested() {
+        let append = build_descend_js(
+            &["iframe#f"],
+            "input#phone",
+            &FrameAction::Focus { clear: false },
+        );
+        assert!(append.contains("el.focus();"));
+        assert!(!append.contains("el.select()"));
+
+        let replace = build_descend_js(
+            &["iframe#f"],
+            "input#phone",
+            &FrameAction::Focus { clear: true },
+        );
+        assert!(replace.contains("el.focus();"));
+        assert!(replace.contains("el.select()"));
+        assert!(!replace.contains("el.value="));
+        assert!(!replace.contains("dispatchEvent"));
     }
 
     #[test]
