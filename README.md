@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.23 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.0 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,19 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.1.23)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.2.0)</strong></summary>
+
+**v0.2.0 — trusted-only interaction defaults.** Synthetic pointer delivery and
+`browser_iframe_fill` have been removed. `browser_iframe_click` now resolves
+same-origin, cross-origin, and OOPIF target boxes before dispatching trusted CDP
+mouse input; `browser_select_option` uses trusted native-select type-ahead
+keyboard events instead of assigning `select.value`. Strict mode is now the
+default: console capture is hidden and `browser_evaluate(main_world=true)` is
+rejected unless the server starts with `--allow-detectable-tools`. Virtual
+WebAuthn authenticators are no longer installed automatically; call
+`browser_webauthn` explicitly before a passkey challenge when needed.
+JavaScript dialog handling likewise starts only after an explicit
+`browser_handle_dialog` call.
 
 **v0.1.23 — trusted iframe typing.** The new `browser_iframe_type` tool
 focuses inputs inside same-origin, cross-origin, and out-of-process iframes,
@@ -352,13 +364,25 @@ if you want the redaction broker (see [CLI and environment](#cli-and-environment
 for full per-variable semantics). Standalone/self-hosted users can ignore this
 whole section — it only activates when a host explicitly configures it.
 
+## Strict anti-detection mode
+
+Strict mode is the default. It hides `browser_console_messages`, which enables
+the observable Runtime domain, and rejects `browser_evaluate` with
+`main_world: true`. Every public interaction tool uses trusted CDP input;
+synthetic DOM pointer/fill routes are not part of the v0.2 API.
+
+Start with `--allow-detectable-tools` (or set
+`AB_ALLOW_DETECTABLE_TOOLS=1`) only for an explicit debugging or compatibility
+session. `AB_ALLOWED_TOOLS` is still applied as an additional fail-closed
+allowlist and cannot override strict mode.
+
 ## Tools
 
-MCP exposes 68 `browser_*` tools:
+MCP implements 67 `browser_*` tools; strict mode advertises 66 by default:
 
 **Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_fill` · `browser_iframe_type` · `browser_iframe_read` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_type` · `browser_iframe_read` · `browser_close_page` · `browser_close`
 
 Use `browser_activate_page({ "page": "p5" })` before automating a background
 tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,
@@ -366,24 +390,27 @@ retries visibility/focus verification, and uses a process-specific macOS
 foreground fallback when browser-rs launched Chrome itself. Use
 `browser_wheel({ "page": "p5", "delta_y": 700, "x": 650, "y": 500 })` for a
 real CDP `mouseWheel` event instead of DOM `window.scrollBy()`.
-Use `browser_pointer` for right-click/double-click and for an explicit
-`input_route: "dom_event"` background compatibility path. Constructed DOM
-events have `isTrusted == false`; they are never an automatic fallback from
-trusted CDP input.
-`browser_type` keeps human-like key events for text under 30 characters and
-uses one atomic CDP `Input.insertText` command for longer input.
+Use `browser_pointer` for trusted right-click, double-click, scroll, and drag;
+v0.2 has no synthetic `input_route`.
+`browser_type` uses humanized per-character keys for short text and trusted
+atomic insertion for paste/IME-like text of 30 characters or more.
 `browser_iframe_type` applies the same input behavior after focusing the target
 inside a nested iframe chain and routes OOPIF input through that frame's CDP
-session; use it instead of `browser_iframe_fill` for controlled or masked inputs.
-`browser_cancel_typing` stops active per-character typing started with
-`wait: false`; text already entered remains, while atomic long-text insertion
-normally finishes before cancellation.
+session. `browser_iframe_click` similarly uses trusted pointer input, while
+`browser_select_option` performs native select type-ahead with trusted keys.
+`browser_cancel_typing` stops active typing started with `wait: false`; text
+already entered remains.
 
 **Network and requests:** `browser_network_requests` · `browser_route_block` · `browser_route_mock` · `browser_route_clear` · `browser_network_state_set` · `browser_api_request`
 
 **Cookies and storage:** `browser_cookie_list` · `browser_cookie_get` · `browser_cookie_set` · `browser_cookie_delete` · `browser_cookie_clear` · `browser_localstorage_list` · `browser_localstorage_get` · `browser_localstorage_set` · `browser_localstorage_delete` · `browser_localstorage_clear` · `browser_sessionstorage_list` · `browser_sessionstorage_get` · `browser_sessionstorage_set` · `browser_sessionstorage_delete` · `browser_sessionstorage_clear` · `browser_storage_save` · `browser_storage_load`
 
 **Diagnostics and page utilities:** `browser_console_messages` · `browser_fingerprint_check` · `browser_handle_dialog` · `browser_highlight` · `browser_hide_highlight` · `browser_webauthn` · `browser_claim_page` · `browser_release_page`
+
+`browser_webauthn` is opt-in and affects only the selected page. Ordinary
+navigation leaves Chrome's native WebAuthn/passkey behavior untouched.
+`browser_handle_dialog` is also opt-in; without it, alert/confirm/prompt
+dialogs retain native Chrome behavior.
 
 ## CLI and environment
 
@@ -397,12 +424,14 @@ browser-rs --port 9321 [options]    # HTTP MCP transport
   --headed                 Run headful (default)
   --connect <port|url>     Attach to an existing Chrome
   --stealth                Enable the JS fallback layer
+  --allow-detectable-tools Opt in to observable debugging paths
 ```
 
 `--port` enables HTTP mode; without it, the server uses stdio. The equivalent
 environment variables are `AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`,
-`AB_STEALTH`, and `AB_CHROME`. `AB_HTTP_CAPABILITY` protects HTTP/SSE requests
-with `X-Browser-Capability` and is required for non-loopback binds.
+`AB_STEALTH`, `AB_CHROME`, and `AB_ALLOW_DETECTABLE_TOOLS`.
+`AB_HTTP_CAPABILITY` protects HTTP/SSE requests with `X-Browser-Capability`
+and is required for non-loopback binds.
 
 Managed hosts (see [Managed mode](#managed-mode-secure-multi-tenant-hosting)
 above) can set:
@@ -413,6 +442,7 @@ above) can set:
 | `AB_HTTP_CAPABILITY=<random-root>` | Root secret the host derives per-owner tokens from |
 | `AB_SPAWN_NONCE=<random-nonce>` | Reported on `/health` so the host can confirm which process instance is live |
 | `AB_ALLOWED_TOOLS=<a,b,c>` | Fail-closed allowlist of callable/visible `browser_*` tool names |
+| `AB_ALLOW_DETECTABLE_TOOLS=1` | Opt in to main-world JS and Runtime-enabled console capture |
 | `AB_SECRET_BROKER_SOCKET`, `AB_SECRET_BROKER_TOKEN` | Unix-socket broker that injects secrets into tool input and redacts them from tool output |
 | `AB_MAX_OUTPUT_LIMIT=<bytes>` | Absolute ceiling any caller's `maxLength`/`maxBytes` is clamped to (default 5,000,000 — already far above the 100k/200k tool defaults, so it only matters if a host needs a different bound) |
 

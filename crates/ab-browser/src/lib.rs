@@ -11,6 +11,7 @@ pub mod stealth;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-pub use pointer::{InputRoute, PointerAction, PointerLocation, PointerOutcome, PointerRequest};
+pub use pointer::{PointerAction, PointerLocation, PointerOutcome, PointerRequest};
 pub use snapshot::{DocumentIdentity, ElementRef, Snapshot};
 
 /// One logged network request/response.
@@ -343,6 +344,7 @@ impl Browser {
             pointer: Arc::new(Mutex::new(None)),
             pointer_mutation: Arc::new(tokio::sync::Mutex::new(())),
             dialog: Arc::new(Mutex::new((true, None))),
+            dialog_handler_started: Arc::new(AtomicBool::new(false)),
             routes: Arc::new(Mutex::new(RouteState::default())),
         })
     }
@@ -385,9 +387,8 @@ pub enum ReadMode {
 
 /// Action to perform on the element resolved at the bottom of an iframe chain
 /// (see `Page::descend_and_act`).
-enum FrameAction<'a> {
-    Click,
-    Fill(&'a str),
+enum FrameAction {
+    Point,
     Focus { clear: bool },
     Read(ReadMode),
 }
@@ -395,7 +396,7 @@ enum FrameAction<'a> {
 /// Split a `frame_selector` argument into a chain of CSS selectors. Chains
 /// are written Playwright-style as `"sel1 >> sel2 >> sel3"`, each hop naming
 /// the `<iframe>` to descend into next; the last selector passed separately
-/// to `iframe_click`/`iframe_fill` targets the element inside the innermost
+/// to `iframe_click`/`iframe_type` targets the element inside the innermost
 /// frame. A plain selector with no `>>` is a chain of length one (single
 /// iframe hop), matching the pre-existing single-level API.
 ///
@@ -416,8 +417,8 @@ fn split_frame_chain(frame_selector: &str) -> Vec<&str> {
 /// whitespace/`>>`-only input up front. Without this, an accidentally empty
 /// `frame_selector` (e.g. a caller-side templating bug) would silently
 /// resolve to a zero-length chain and `descend_and_act` would act directly
-/// on the *top-level* document — which for `iframe_click`/`iframe_fill`
-/// means clicking/filling something on the main page while the caller
+/// on the *top-level* document — which for iframe actions means acting on
+/// something on the main page while the caller
 /// believes they're targeting content inside an iframe.
 fn require_frame_chain(frame_selector: &str) -> Result<Vec<&str>> {
     let chain = split_frame_chain(frame_selector);
@@ -439,15 +440,11 @@ fn require_frame_chain(frame_selector: &str) -> Result<Vec<&str>> {
 /// `{ok:false, index, src, name}` describing the boundary iframe element
 /// (whose attributes remain readable even though its document does not), so
 /// the caller can resume via CDP.
-fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction<'_>) -> String {
+fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction) -> String {
     let chain_json = serde_json::to_string(chain).unwrap_or_else(|_| "[]".into());
     let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let act_js = match action {
-        FrameAction::Click => "el.click(); return { ok: true };".to_string(),
-        FrameAction::Fill(value) => format!(
-            "el.focus(); el.value={v}; el.dispatchEvent(new Event('input',{{bubbles:true}})); el.dispatchEvent(new Event('change',{{bubbles:true}})); return {{ ok: true }};",
-            v = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
-        ),
+        FrameAction::Point => "el.scrollIntoView({block:'center',inline:'center'}); const r=el.getBoundingClientRect(); if(r.width<=0||r.height<=0) throw new Error('element has no visible box'); return {ok:true,x:offsetX+r.left+r.width/2,y:offsetY+r.top+r.height/2,halfWidth:r.width/2,halfHeight:r.height/2};".to_string(),
         FrameAction::Focus { clear } => {
             let select_js = if *clear {
                 " if (typeof el.select === 'function') el.select(); else if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, (el.value || '').length);"
@@ -462,24 +459,34 @@ fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction<'_>) ->
                 .to_string()
         }
     };
+    let locate = matches!(action, FrameAction::Point);
     format!(
         r#"(() => {{
   const chain = {chain_json};
+  const locate = {locate};
   let doc = document;
+  let offsetX = 0, offsetY = 0;
   for (let i = 0; i < chain.length; i++) {{
     const f = doc.querySelector(chain[i]);
     if (!f) throw new Error('iframe not found at step ' + i + ': ' + chain[i]);
+    if (locate) {{
+      f.scrollIntoView({{block:'center',inline:'center'}});
+      const r = f.getBoundingClientRect();
+      offsetX += r.left + (f.clientLeft || 0);
+      offsetY += r.top + (f.clientTop || 0);
+    }}
     let inner = null;
     try {{ inner = f.contentDocument; }} catch (e) {{ inner = null; }}
     if (!inner) {{
-      return {{ ok: false, index: i, src: f.src || f.getAttribute('src') || '', name: f.name || f.getAttribute('name') || '' }};
+      return {{ ok: false, index: i, src: f.src || f.getAttribute('src') || '', name: f.name || f.getAttribute('name') || '', offsetX, offsetY }};
     }}
     doc = inner;
   }}
   const el = doc.querySelector({sel_json});
   if (!el) throw new Error('element not found: ' + {sel_json});
   {act_js}
-}})()"#
+}})()"#,
+        locate = locate,
     )
 }
 
@@ -621,6 +628,8 @@ pub struct Page {
     pointer_mutation: Arc<tokio::sync::Mutex<()>>,
     /// JS-dialog handling policy: (accept, prompt_text). Read by the auto-handler.
     dialog: Arc<Mutex<(bool, Option<String>)>>,
+    /// Whether explicit dialog handling has installed its Page-domain listener.
+    dialog_handler_started: Arc<AtomicBool>,
     /// Network mock rules + intercept-loop state.
     routes: Arc<Mutex<RouteState>>,
 }
@@ -1183,6 +1192,31 @@ impl Page {
         }))
     }
 
+    async fn resolve_object_in_context(
+        &self,
+        backend: i64,
+        execution_context_id: i64,
+    ) -> Result<Option<String>> {
+        let res = self
+            .client
+            .send_on(
+                &self.session_id,
+                "DOM.resolveNode",
+                json!({
+                    "backendNodeId": backend,
+                    "executionContextId": execution_context_id,
+                }),
+            )
+            .await;
+        Ok(res.ok().and_then(|response| {
+            response
+                .get("object")
+                .and_then(|object| object.get("objectId"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        }))
+    }
+
     /// Move the pointer to (x, y) like a human: a curved (cubic-Bézier) path
     /// with many small steps (~1 per few px, matching a real ~60-120 Hz
     /// pointer), an ease-in-out velocity profile, per-step jitter, and a final
@@ -1271,8 +1305,9 @@ impl Page {
         tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
     }
 
-    /// Focus a node and enter text. Long text uses one `Input.insertText`
-    /// command; shorter text retains human-like per-character key events.
+    /// Focus a node and enter text. Long text uses one trusted
+    /// `Input.insertText` command, matching a paste/IME-style workflow;
+    /// shorter text retains humanized per-character key events.
     pub async fn type_text(&self, backend: i64, text: &str, clear: bool) -> Result<()> {
         self.type_text_cancellable(backend, text, clear, &CancellationToken::new())
             .await
@@ -1466,39 +1501,63 @@ impl Page {
         }
     }
 
-    /// Click an element inside an iframe. `frame_selector` may chain multiple
+    /// Click an element inside an iframe with trusted browser-generated pointer
+    /// input. `frame_selector` may chain multiple
     /// CSS selectors with `>>` to descend through nested iframes (e.g.
     /// `"iframe.wrapper >> iframe.popup"`). Same-origin frames are resolved
-    /// with a single main-world JS round trip; if a cross-origin boundary is
+    /// with isolated-world DOM access; if a cross-origin boundary is
     /// hit, resolution automatically falls back to CDP (`Page.getFrameTree` +
     /// `Page.createIsolatedWorld`), which is not subject to the Same-Origin
-    /// Policy. See `descend_and_act` for the mechanism.
+    /// Policy. The resolved element box is translated into top-level viewport
+    /// coordinates before CDP mouse press/release events are dispatched.
     pub async fn iframe_click(&self, frame_selector: &str, selector: &str) -> Result<()> {
         let chain = require_frame_chain(frame_selector)?;
-        self.descend_and_act(&chain, selector, &FrameAction::Click)
+        // The first pass brings every frame and the target into view. A deep
+        // target scroll can move an ancestor browsing context, so resolve once
+        // more after scrolling and dispatch only from the stable coordinates.
+        self.descend_and_act_with_session(&chain, selector, &FrameAction::Point)
             .await?;
-        Ok(())
-    }
-
-    /// Fill an input inside an iframe. See `iframe_click` for the
-    /// same-origin/cross-origin resolution behavior and the `>>` chaining
-    /// syntax for nested iframes.
-    pub async fn iframe_fill(
-        &self,
-        frame_selector: &str,
-        selector: &str,
-        value: &str,
-    ) -> Result<()> {
-        let chain = require_frame_chain(frame_selector)?;
-        self.descend_and_act(&chain, selector, &FrameAction::Fill(value))
+        let (point, session_id) = self
+            .descend_and_act_with_session(&chain, selector, &FrameAction::Point)
             .await?;
-        Ok(())
+        let x = point
+            .get("x")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BrowserError::Protocol("iframe target has no viewport x".into()))?;
+        let y = point
+            .get("y")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| BrowserError::Protocol("iframe target has no viewport y".into()))?;
+        let half_width = point
+            .get("halfWidth")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let half_height = point
+            .get("halfHeight")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let dx = off_center(half_width);
+        let dy = off_center(half_height);
+        let root_point = (x + dx, y + dy);
+        if session_id == self.session_id {
+            self.trusted_click_at(root_point.0, root_point.1).await
+        } else {
+            let local_x = point
+                .get("localX")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| BrowserError::Protocol("iframe target has no local x".into()))?;
+            let local_y = point
+                .get("localY")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| BrowserError::Protocol("iframe target has no local y".into()))?;
+            self.trusted_frame_click_at(&session_id, root_point, (local_x + dx, local_y + dy))
+                .await
+        }
     }
 
     /// Focus an input inside a same-origin, cross-origin, or OOPIF iframe and
-    /// type through CDP's Input domain. Unlike `iframe_fill`, this does not
-    /// assign `element.value` or synthesize DOM events, so controlled inputs
-    /// receive the browser-generated keyboard/input event sequence.
+    /// type through CDP's Input domain. Controlled inputs receive the
+    /// browser-generated keyboard/input event sequence.
     pub async fn iframe_type_text_cancellable(
         &self,
         frame_selector: &str,
@@ -1556,7 +1615,7 @@ impl Page {
         &self,
         chain: &[&str],
         selector: &str,
-        action: &FrameAction<'_>,
+        action: &FrameAction,
     ) -> Result<Value> {
         self.descend_and_act_with_session(chain, selector, action)
             .await
@@ -1570,23 +1629,43 @@ impl Page {
         &self,
         chain: &[&str],
         selector: &str,
-        action: &FrameAction<'_>,
+        action: &FrameAction,
     ) -> Result<(Value, String)> {
         let mut context: Option<FrameExecutionContext> = None;
         let mut remaining: Vec<&str> = chain.to_vec();
+        let mut root_offset_x = 0.0;
+        let mut root_offset_y = 0.0;
         // Bound the loop: at most one CDP hop per chain element, plus one.
         for _ in 0..=chain.len() {
             let js = build_descend_js(&remaining, selector, action);
-            let result = match context.as_ref() {
-                None => self.evaluate_main(&js).await?,
+            let mut result = match context.as_ref() {
+                None => self.evaluate(&js).await?,
                 Some(ctx) => self.eval_with_context(&js, ctx).await?,
             };
             if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                if matches!(action, FrameAction::Point) {
+                    let local_x = result.get("x").and_then(Value::as_f64).ok_or_else(|| {
+                        BrowserError::Protocol("iframe point result has no x".into())
+                    })?;
+                    let local_y = result.get("y").and_then(Value::as_f64).ok_or_else(|| {
+                        BrowserError::Protocol("iframe point result has no y".into())
+                    })?;
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("localX".into(), json!(local_x));
+                        object.insert("localY".into(), json!(local_y));
+                        object.insert("x".into(), json!(root_offset_x + local_x));
+                        object.insert("y".into(), json!(root_offset_y + local_y));
+                    }
+                }
                 let session_id = context
                     .as_ref()
                     .map(|ctx| ctx.session_id.clone())
                     .unwrap_or_else(|| self.session_id.clone());
                 return Ok((result, session_id));
+            }
+            if matches!(action, FrameAction::Point) {
+                root_offset_x += result.get("offsetX").and_then(Value::as_f64).unwrap_or(0.0);
+                root_offset_y += result.get("offsetY").and_then(Value::as_f64).unwrap_or(0.0);
             }
             let index = result.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let src = result
@@ -1981,6 +2060,10 @@ impl Page {
 
     /// Press a single named key (e.g. "Enter", "Tab", "Escape").
     pub async fn press(&self, key: &str) -> Result<()> {
+        self.press_key_on(&self.session_id, key).await
+    }
+
+    async fn press_key_on(&self, session_id: &str, key: &str) -> Result<()> {
         let (code, vk) = match key {
             "Enter" => ("Enter", 13),
             "Tab" => ("Tab", 9),
@@ -1988,22 +2071,65 @@ impl Page {
             "Backspace" => ("Backspace", 8),
             "ArrowDown" => ("ArrowDown", 40),
             "ArrowUp" => ("ArrowUp", 38),
+            "Home" => ("Home", 36),
+            "End" => ("End", 35),
             _ => (key, 0),
         };
-        for kind in ["keyDown", "keyUp"] {
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyDown",
+                    "key": code,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                }),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(25, 95))).await;
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": code,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                }),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
+        Ok(())
+    }
+
+    async fn type_select_search_on(&self, session_id: &str, label: &str) -> Result<()> {
+        for ch in label.to_lowercase().chars() {
+            let key = ch.to_string();
             self.client
                 .send_on(
-                    &self.session_id,
+                    session_id,
                     "Input.dispatchKeyEvent",
                     json!({
-                        "type": kind,
-                        "key": code,
-                        "code": code,
-                        "windowsVirtualKeyCode": vk,
-                        "nativeVirtualKeyCode": vk,
+                        "type": "keyDown",
+                        "text": key,
+                        "key": key,
+                        "unmodifiedText": key,
                     }),
                 )
                 .await?;
+            tokio::time::sleep(Duration::from_millis(rand_u64(25, 85))).await;
+            self.client
+                .send_on(
+                    session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({ "type": "keyUp", "key": key }),
+                )
+                .await?;
+            tokio::time::sleep(Duration::from_millis(rand_u64(35, 120))).await;
         }
         Ok(())
     }
@@ -2011,26 +2137,98 @@ impl Page {
 
 /// More navigation / interaction primitives (parity with mature drivers).
 impl Page {
-    /// Set the value of a <select> by ref and fire input/change events.
+    /// Select one enabled option using trusted browser-generated keyboard input.
     pub async fn select_option(&self, backend: i64, value: &str) -> Result<()> {
         self.scroll_into_view(backend).await;
+        let frame_id = self.main_frame_id().await?;
+        let context_id = self
+            .create_world_in_session(&self.session_id, &frame_id)
+            .await?;
         let obj = self
-            .resolve_object(backend)
+            .resolve_object_in_context(backend, context_id)
             .await?
             .ok_or_else(|| BrowserError::Protocol("cannot resolve element".into()))?;
-        self.client
+        let result = async {
+            let inspected = self
+                .client
+                .send_on(
+                    &self.session_id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": obj,
+                        "arguments": [{ "value": value }],
+                        "functionDeclaration": "function(v){if(this.tagName!=='SELECT')return{error:'target is not a select'};if(this.disabled)return{error:'select is disabled'};if(this.multiple)return{error:'multiple select is not supported by trusted single-option input'};const enabled=Array.from(this.options).filter(o=>!o.disabled&&!(o.parentElement&&o.parentElement.tagName==='OPTGROUP'&&o.parentElement.disabled));const target=enabled.find(o=>o.value===v);if(!target)return{error:'enabled option value not found'};return{currentValue:this.value,targetLabel:target.label||target.textContent||''};}",
+                        "returnByValue": true,
+                    }),
+                )
+                .await?;
+            if let Some(exception) = inspected.get("exceptionDetails") {
+                return Err(BrowserError::Protocol(format!(
+                    "select inspection failed: {exception}"
+                )));
+            }
+            let metadata = inspected
+                .pointer("/result/value")
+                .ok_or_else(|| BrowserError::Protocol("select inspection returned no value".into()))?;
+            if let Some(error) = metadata.get("error").and_then(Value::as_str) {
+                return Err(BrowserError::Protocol(error.into()));
+            }
+            if metadata.get("currentValue").and_then(Value::as_str) == Some(value) {
+                return Ok(());
+            }
+            let target_label = metadata
+                .get("targetLabel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .ok_or_else(|| BrowserError::Protocol("select target label is missing".into()))?;
+            if target_label.chars().count() > 200 {
+                return Err(BrowserError::Protocol(
+                    "select target label is too long for trusted type-ahead".into(),
+                ));
+            }
+
+            self.client
+                .send_on(
+                    &self.session_id,
+                    "DOM.focus",
+                    json!({ "backendNodeId": backend }),
+                )
+                .await?;
+            self.type_select_search_on(&self.session_id, target_label)
+                .await?;
+
+            let verified = self
+                .client
+                .send_on(
+                    &self.session_id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": obj,
+                        "functionDeclaration": "function(){return this.value;}",
+                        "returnByValue": true,
+                    }),
+                )
+                .await?;
+            let actual = verified.pointer("/result/value").and_then(Value::as_str);
+            if actual != Some(value) {
+                return Err(BrowserError::Protocol(format!(
+                    "trusted select input chose {:?}, expected {value:?}",
+                    actual.unwrap_or("")
+                )));
+            }
+            Ok(())
+        }
+        .await;
+        let _ = self
+            .client
             .send_on(
                 &self.session_id,
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": obj,
-                    "arguments": [{ "value": value }],
-                    "functionDeclaration":
-                        "function(v){ this.value = v; this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); }",
-                }),
+                "Runtime.releaseObject",
+                json!({ "objectId": obj }),
             )
-            .await?;
-        Ok(())
+            .await;
+        result
     }
 
     /// Install a CDP virtual authenticator so WebAuthn / passkey prompts are
@@ -2487,12 +2685,19 @@ impl Page {
         Ok(())
     }
 
-    /// Auto-accept JavaScript dialogs (alert/confirm/prompt) so automation never
-    /// blocks on them. Enables the Page domain and handles openings as they come.
-    pub async fn enable_dialog_auto_accept(&self) -> Result<()> {
-        self.client
+    /// Start the explicit JavaScript-dialog handler. Idempotent per page.
+    pub async fn enable_dialog_handler(&self) -> Result<bool> {
+        if self.dialog_handler_started.swap(true, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        if let Err(error) = self
+            .client
             .send_on(&self.session_id, "Page.enable", json!({}))
-            .await?;
+            .await
+        {
+            self.dialog_handler_started.store(false, Ordering::Release);
+            return Err(error.into());
+        }
         let mut rx = self.client.events();
         let sid = self.session_id.clone();
         let client = self.client.clone();
@@ -2517,14 +2722,17 @@ impl Page {
                 }
             }
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Set how the next JS dialogs (alert/confirm/prompt/beforeunload) are
-    /// handled: accept vs dismiss, plus optional prompt text. Applies to the
-    /// running auto-handler; default is accept.
+    /// handled: accept vs dismiss, plus optional prompt text.
     pub fn set_dialog_policy(&self, accept: bool, prompt_text: Option<String>) {
         *self.dialog.lock().unwrap() = (accept, prompt_text);
+    }
+
+    pub fn dialog_handler_enabled(&self) -> bool {
+        self.dialog_handler_started.load(Ordering::Acquire)
     }
 
     /// Draw a highlight box over an element (debug/inspection aid).
@@ -2855,7 +3063,7 @@ mod tests {
     };
 
     #[test]
-    fn long_text_uses_insert_text_by_unicode_character_count() {
+    fn long_text_uses_atomic_trusted_insertion_by_unicode_character_count() {
         assert!(!uses_insert_text(&"한".repeat(29)));
         assert!(uses_insert_text(&"한".repeat(30)));
         assert!(uses_insert_text(&"a".repeat(30)));
@@ -2890,23 +3098,25 @@ mod tests {
     }
 
     #[test]
-    fn descend_js_embeds_chain_and_selector_as_json_and_performs_click() {
-        let js = build_descend_js(&["iframe#f"], "button#go", &FrameAction::Click);
+    fn descend_js_locates_iframe_target_without_synthetic_clicks() {
+        let js = build_descend_js(&["iframe#f"], "button#go", &FrameAction::Point);
         assert!(js.contains(r#"["iframe#f"]"#));
         assert!(js.contains(r#"querySelector("button#go")"#));
-        assert!(js.contains("el.click();"));
+        assert!(js.contains("getBoundingClientRect"));
+        assert!(js.contains("offsetX"));
+        assert!(!js.contains("el.click();"));
+        assert!(!js.contains("dispatchEvent"));
         assert!(js.contains("ok: false"));
-        assert!(js.contains("ok: true"));
+        assert!(js.contains("ok:true"));
     }
 
     #[test]
-    fn descend_js_fill_sets_value_and_dispatches_events() {
-        let js = build_descend_js(&[], "input#q", &FrameAction::Fill("hello \"world\""));
-        // No frame hops: chain is empty, so it should act directly.
+    fn point_lookup_on_current_document_returns_a_box_only() {
+        let js = build_descend_js(&[], "button#go", &FrameAction::Point);
         assert!(js.contains(r#"const chain = [];"#));
-        assert!(js.contains(r#"el.value="hello \"world\"";"#));
-        assert!(js.contains("dispatchEvent(new Event('input'"));
-        assert!(js.contains("dispatchEvent(new Event('change'"));
+        assert!(js.contains("halfWidth"));
+        assert!(js.contains("halfHeight"));
+        assert!(!js.contains("dispatchEvent"));
     }
 
     #[test]

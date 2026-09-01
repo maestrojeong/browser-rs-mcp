@@ -1,13 +1,12 @@
 //! Unified browser-internal pointer actions.
 //!
-//! Trusted input retains browser-rs's humanized CDP path. DOM events are an
-//! explicit, untrusted background compatibility route and never an automatic
-//! fallback.
+//! All input uses browser-generated CDP events. Synthetic DOM-event delivery is
+//! intentionally absent because it exposes isTrusted == false to page scripts.
 
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::{rand_u64, BrowserError, ElementRef, Page, Result};
 
@@ -38,25 +37,6 @@ impl PointerAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputRoute {
-    Trusted,
-    DomEvent,
-}
-
-impl InputRoute {
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "trusted" => Ok(Self::Trusted),
-            "dom_event" => Ok(Self::DomEvent),
-            _ => Err(BrowserError::Protocol(format!(
-                "unknown input route {value:?}"
-            ))),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum PointerLocation {
     Element(ElementRef),
@@ -66,7 +46,6 @@ pub enum PointerLocation {
 #[derive(Debug, Clone)]
 pub struct PointerRequest {
     pub action: PointerAction,
-    pub route: InputRoute,
     pub origin: PointerLocation,
     pub destination: Option<PointerLocation>,
     pub delta_x: f64,
@@ -76,7 +55,6 @@ pub struct PointerRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct PointerOutcome {
     pub action: PointerAction,
-    pub route: InputRoute,
     pub trusted: bool,
     pub dispatched: bool,
     /// `changed`, `unchanged`, or `unknown`.
@@ -89,10 +67,7 @@ impl Page {
         validate_request(request)?;
         let _mutation = self.pointer_mutation.lock().await;
         self.validate_pointer_refs(request).await?;
-        match request.route {
-            InputRoute::Trusted => self.dispatch_trusted_pointer(request).await,
-            InputRoute::DomEvent => self.dispatch_dom_pointer(request).await,
-        }
+        self.dispatch_trusted_pointer(request).await
     }
 
     async fn validate_pointer_refs(&self, request: &PointerRequest) -> Result<()> {
@@ -153,12 +128,7 @@ impl Page {
 
         match request.action {
             PointerAction::Click => {
-                tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
-                self.mouse_button("mousePressed", x, y, "left", 1, 1)
-                    .await?;
-                tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
-                self.mouse_button("mouseReleased", x, y, "left", 0, 1)
-                    .await?;
+                self.left_click_at(x, y).await?;
             }
             PointerAction::Hover => {}
             PointerAction::RightClick => {
@@ -221,7 +191,6 @@ impl Page {
 
         Ok(PointerOutcome {
             action: request.action,
-            route: request.route,
             trusted: true,
             dispatched: true,
             observed: "unknown",
@@ -266,9 +235,23 @@ impl Page {
         buttons: u8,
         click_count: u8,
     ) -> Result<()> {
+        self.mouse_button_on(&self.session_id, kind, x, y, button, (buttons, click_count))
+            .await
+    }
+
+    async fn mouse_button_on(
+        &self,
+        session_id: &str,
+        kind: &str,
+        x: f64,
+        y: f64,
+        button: &str,
+        state: (u8, u8),
+    ) -> Result<()> {
+        let (buttons, click_count) = state;
         self.client
             .send_on(
-                &self.session_id,
+                session_id,
                 "Input.dispatchMouseEvent",
                 json!({
                     "type": kind, "x": x, "y": y, "button": button,
@@ -279,101 +262,47 @@ impl Page {
         Ok(())
     }
 
-    async fn dispatch_dom_pointer(&self, request: &PointerRequest) -> Result<PointerOutcome> {
-        let PointerLocation::Element(origin) = &request.origin else {
-            return Err(BrowserError::Protocol(
-                "dom_event pointer actions require a snapshot ref".into(),
-            ));
-        };
-        let object_id = self
-            .resolve_object(origin.backend_node_id)
-            .await?
-            .ok_or_else(|| BrowserError::Protocol("pointer ref has no live object".into()))?;
+    async fn left_click_at(&self, x: f64, y: f64) -> Result<()> {
+        self.left_click_at_on(&self.session_id, x, y).await
+    }
 
-        let (function, arguments) = match request.action {
-            PointerAction::Click => (
-                "function(){const el=this;const base={bubbles:true,cancelable:true,composed:true,button:0,pointerId:1,pointerType:'mouse',isPrimary:true,view:el.ownerDocument.defaultView};const down={...base,buttons:1};const up={...base,buttons:0};el.dispatchEvent(new PointerEvent('pointerover',down));el.dispatchEvent(new PointerEvent('pointerenter',{...down,bubbles:false}));el.dispatchEvent(new MouseEvent('mouseover',down));el.dispatchEvent(new PointerEvent('pointerdown',down));el.dispatchEvent(new MouseEvent('mousedown',down));try{el.focus&&el.focus();}catch(_){}el.dispatchEvent(new PointerEvent('pointerup',up));el.dispatchEvent(new MouseEvent('mouseup',up));el.dispatchEvent(new MouseEvent('click',up));return true;}",
-                json!([]),
-            ),
-            PointerAction::Hover => (
-                "function(){const o={bubbles:true,composed:true,view:this.ownerDocument.defaultView};this.dispatchEvent(new PointerEvent('pointerover',o));this.dispatchEvent(new PointerEvent('pointerenter',{...o,bubbles:false}));this.dispatchEvent(new MouseEvent('mouseover',o));this.dispatchEvent(new MouseEvent('mouseenter',{...o,bubbles:false}));return true;}",
-                json!([]),
-            ),
-            PointerAction::RightClick => (
-                "function(){const o={bubbles:true,cancelable:true,composed:true,button:2,buttons:2,view:this.ownerDocument.defaultView};this.dispatchEvent(new PointerEvent('pointerdown',o));this.dispatchEvent(new MouseEvent('mousedown',o));this.dispatchEvent(new MouseEvent('mouseup',{...o,buttons:0}));this.dispatchEvent(new PointerEvent('pointerup',{...o,buttons:0}));this.dispatchEvent(new MouseEvent('contextmenu',{...o,buttons:0}));return true;}",
-                json!([]),
-            ),
-            PointerAction::DoubleClick => (
-                "function(){const o={bubbles:true,cancelable:true,composed:true,button:0,view:this.ownerDocument.defaultView};for(let detail=1;detail<=2;detail++){this.dispatchEvent(new PointerEvent('pointerdown',{...o,buttons:1,detail}));this.dispatchEvent(new MouseEvent('mousedown',{...o,buttons:1,detail}));this.dispatchEvent(new MouseEvent('mouseup',{...o,buttons:0,detail}));this.dispatchEvent(new PointerEvent('pointerup',{...o,buttons:0,detail}));this.dispatchEvent(new MouseEvent('click',{...o,buttons:0,detail}));}this.dispatchEvent(new MouseEvent('dblclick',{...o,buttons:0,detail:2}));return true;}",
-                json!([]),
-            ),
-            PointerAction::Scroll => (
-                "function(dx,dy){const o={deltaX:dx,deltaY:dy,bubbles:true,cancelable:true,composed:true,view:this.ownerDocument.defaultView};this.dispatchEvent(new WheelEvent('wheel',o));let n=this;while(n&&n!==this.ownerDocument.documentElement){const s=this.ownerDocument.defaultView.getComputedStyle(n);if(/(auto|scroll)/.test(s.overflow+s.overflowX+s.overflowY))break;n=n.parentElement;}const target=n||this.ownerDocument.scrollingElement||this.ownerDocument.documentElement;const bx=target.scrollLeft,by=target.scrollTop;target.scrollBy(dx,dy);return target.scrollLeft!==bx||target.scrollTop!==by;}",
-                json!([{ "value": request.delta_x }, { "value": request.delta_y }]),
-            ),
-            PointerAction::Drag => {
-                let destination = request.destination.as_ref().expect("validated drag");
-                let args = match destination {
-                    PointerLocation::Element(element) => {
-                        let destination_id = self
-                            .resolve_object(element.backend_node_id)
-                            .await?
-                            .ok_or_else(|| BrowserError::Protocol("drag destination is stale".into()))?;
-                        json!([{ "objectId": destination_id }, { "value": Value::Null }, { "value": Value::Null }])
-                    }
-                    PointerLocation::Coordinates { x, y } => {
-                        json!([{ "value": Value::Null }, { "value": x }, { "value": y }])
-                    }
-                };
-                (
-                    "function(destination,x,y){const doc=this.ownerDocument,dest=destination||doc.elementFromPoint(x,y);if(!dest||dest.ownerDocument!==doc)return false;let data=null;try{data=new DataTransfer();}catch(_){}const o={bubbles:true,cancelable:true,composed:true};this.dispatchEvent(new PointerEvent('pointerdown',{...o,button:0,buttons:1}));this.dispatchEvent(new MouseEvent('mousedown',{...o,button:0,buttons:1}));this.dispatchEvent(new DragEvent('dragstart',{...o,dataTransfer:data}));dest.dispatchEvent(new DragEvent('dragenter',{...o,dataTransfer:data}));dest.dispatchEvent(new DragEvent('dragover',{...o,dataTransfer:data}));dest.dispatchEvent(new DragEvent('drop',{...o,dataTransfer:data}));this.dispatchEvent(new DragEvent('dragend',{...o,dataTransfer:data}));dest.dispatchEvent(new MouseEvent('mouseup',{...o,button:0,buttons:0}));dest.dispatchEvent(new PointerEvent('pointerup',{...o,button:0,buttons:0}));return true;}",
-                    args,
-                )
-            }
-        };
-
-        let response = self
-            .client
-            .send_on(
-                &self.session_id,
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": object_id,
-                    "functionDeclaration": function,
-                    "arguments": arguments,
-                    "returnByValue": true,
-                }),
-            )
+    async fn left_click_at_on(&self, session_id: &str, x: f64, y: f64) -> Result<()> {
+        tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+        self.mouse_button_on(session_id, "mousePressed", x, y, "left", (1, 1))
             .await?;
-        if let Some(exception) = response.get("exceptionDetails") {
-            return Err(BrowserError::Protocol(format!(
-                "DOM pointer event raised an exception: {exception}"
-            )));
-        }
-        let result = response.pointer("/result/value").and_then(Value::as_bool);
-        if matches!(request.action, PointerAction::Scroll | PointerAction::Drag)
-            && result != Some(true)
-        {
-            let reason = if request.action == PointerAction::Scroll {
-                "synthetic scroll target did not move"
-            } else {
-                "synthetic drag destination did not resolve in the same document"
-            };
-            return Err(BrowserError::Protocol(reason.into()));
-        }
+        tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
+        self.mouse_button_on(session_id, "mouseReleased", x, y, "left", (0, 1))
+            .await
+    }
 
-        Ok(PointerOutcome {
-            action: request.action,
-            route: request.route,
-            trusted: false,
-            dispatched: true,
-            observed: if request.action == PointerAction::Scroll {
-                "changed"
-            } else {
-                "unknown"
-            },
-            retryable: false,
-        })
+    pub(crate) async fn trusted_click_at(&self, x: f64, y: f64) -> Result<()> {
+        if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+            return Err(BrowserError::Protocol(
+                "trusted click coordinates must be finite and non-negative".into(),
+            ));
+        }
+        let _mutation = self.pointer_mutation.lock().await;
+        self.human_move_to(x, y).await?;
+        self.left_click_at(x, y).await
+    }
+
+    pub(crate) async fn trusted_frame_click_at(
+        &self,
+        session_id: &str,
+        root_point: (f64, f64),
+        frame_point: (f64, f64),
+    ) -> Result<()> {
+        for value in [root_point.0, root_point.1, frame_point.0, frame_point.1] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(BrowserError::Protocol(
+                    "trusted frame click coordinates must be finite and non-negative".into(),
+                ));
+            }
+        }
+        let _mutation = self.pointer_mutation.lock().await;
+        self.human_move_to(root_point.0, root_point.1).await?;
+        self.left_click_at_on(session_id, frame_point.0, frame_point.1)
+            .await
     }
 }
 
@@ -415,13 +344,6 @@ fn validate_request(request: &PointerRequest) -> Result<()> {
     {
         return Err(BrowserError::Protocol("only scroll accepts deltas".into()));
     }
-    if request.route == InputRoute::DomEvent
-        && !matches!(request.origin, PointerLocation::Element(_))
-    {
-        return Err(BrowserError::Protocol(
-            "dom_event requires a snapshot ref".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -433,7 +355,6 @@ mod tests {
     fn request(action: PointerAction) -> PointerRequest {
         PointerRequest {
             action,
-            route: InputRoute::Trusted,
             origin: PointerLocation::Coordinates { x: 10.0, y: 20.0 },
             destination: None,
             delta_x: 0.0,
@@ -463,13 +384,6 @@ mod tests {
         value.delta_y = 120.0;
         assert!(validate_request(&value).is_ok());
         value.delta_y = f64::NAN;
-        assert!(validate_request(&value).is_err());
-    }
-
-    #[test]
-    fn dom_event_rejects_coordinates() {
-        let mut value = request(PointerAction::Hover);
-        value.route = InputRoute::DomEvent;
         assert!(validate_request(&value).is_err());
     }
 

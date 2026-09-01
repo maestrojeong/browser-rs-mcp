@@ -17,7 +17,13 @@ const detector = "file://" + resolve(here, "detector.html");
 // headful with no injection — proven against a real detector by external.mjs.
 const child = spawn(bin, [], {
   stdio: ["pipe", "pipe", "inherit"],
-  env: { ...process.env, AB_HEADLESS: "1", AB_STEALTH: "1" },
+  env: {
+    ...process.env,
+    AB_HEADLESS: "1",
+    AB_STEALTH: "1",
+    // The harness reads detector-owned globals to collect the score.
+    AB_ALLOW_DETECTABLE_TOOLS: "1",
+  },
 });
 let buf = "";
 const waiters = new Map();

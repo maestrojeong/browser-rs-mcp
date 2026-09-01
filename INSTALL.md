@@ -22,7 +22,7 @@ browser-rs --help
 
 ```bash
 # Pin a specific version
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.1.23 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.0 sh
 
 # Choose the install directory
 AB_BIN_DIR=~/bin curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
@@ -64,9 +64,12 @@ browser-rs --port 9321         # HTTP MCP: http://127.0.0.1:9321/mcp (streamable
 
 Common flags: `--host <host>`, `--user-data-dir <path>` (persistent profile),
 `--headless` / `--headed`, `--connect <port|url>` (attach to your own Chrome),
-`--stealth` (headless JS patch layer). Each has an env equivalent (`AB_HTTP`,
-`AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`, `AB_STEALTH`, `AB_CHROME`). In HTTP
-mode, `AB_HTTP_CAPABILITY` optionally requires a matching
+`--stealth` (headless JS patch layer), and `--allow-detectable-tools`
+(explicitly enable main-world JS and Runtime console
+capture; blocked by default). Each has an env equivalent (`AB_HTTP`,
+`AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`, `AB_STEALTH`, `AB_CHROME`,
+`AB_ALLOW_DETECTABLE_TOOLS`). In HTTP mode, `AB_HTTP_CAPABILITY` optionally
+requires a matching
 `X-Browser-Capability` header on every endpoint and is required for non-loopback
 binds.
 

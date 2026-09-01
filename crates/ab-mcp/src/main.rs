@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, Weak};
 
 use ab_browser::{
-    Browser, ConsoleLog, ElementRef, InputRoute, LaunchOptions, NetworkLog, Page, PointerAction,
+    Browser, ConsoleLog, ElementRef, LaunchOptions, NetworkLog, Page, PointerAction,
     PointerLocation, PointerRequest,
 };
 use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
@@ -37,8 +37,12 @@ Loop: browser_navigate -> browser_snapshot -> act (click/type) -> re-snapshot to
 - browser_activate_page explicitly foregrounds a tab and verifies visibility.
 - browser_wheel sends native CDP mouse-wheel input for lazy-loaded feeds.
 - refs go stale when the page changes — re-snapshot before reusing them.
-- browser_evaluate runs one-shot JS; browser_take_screenshot saves a PNG.
-Stealth: default paths avoid Runtime.enable; browser_console_messages opts in on first use."#;
+- browser_evaluate runs one-shot JS in an isolated world; browser_take_screenshot saves a PNG.
+Stealth: observable diagnostics are blocked by default. Start with
+--allow-detectable-tools only when main-world JS or Runtime-enabled console
+capture is explicitly required. All interaction tools use trusted CDP input."#;
+
+const DETECTABLE_TOOLS: &[&str] = &["browser_console_messages"];
 
 tokio::task_local! {
     static REQUEST_OWNER: Option<String>;
@@ -68,6 +72,30 @@ fn parse_allowed_tools(value: Option<String>) -> Option<HashSet<String>> {
             .map(str::to_string)
             .collect()
     })
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn detectable_argument_violation(request: &CallToolRequestParams) -> Option<&'static str> {
+    let arguments = request.arguments.as_ref()?;
+    match request.name.as_ref() {
+        "browser_evaluate"
+            if arguments
+                .get("main_world")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            Some("browser_evaluate main_world=true executes in the page's observable JS world")
+        }
+        _ => None,
+    }
 }
 
 fn force_scoped_owner_argument(request: &mut CallToolRequestParams, owner: &str) {
@@ -108,12 +136,11 @@ fn release_owner_claim(
     Some(page)
 }
 
-fn webauthn_options_match_automatic_defaults(
-    transport: &str,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WebAuthnConfig {
+    transport: String,
     user_verified: bool,
     resident_key: bool,
-) -> bool {
-    transport == "internal" && user_verified && resident_key
 }
 
 struct PageEntry {
@@ -123,7 +150,7 @@ struct PageEntry {
     active_typing: Option<Weak<CancellationToken>>,
     netlog: Option<NetworkLog>,
     consolelog: Option<ConsoleLog>,
-    webauthn_authenticator_id: Option<String>,
+    webauthn_authenticator: Option<(String, WebAuthnConfig)>,
 }
 
 /// Order-insensitive line diff: what appeared / disappeared between snapshots.
@@ -229,6 +256,7 @@ struct BrowserServer {
     tool_router: ToolRouter<Self>,
     default_owner: Option<String>,
     allowed_tools: Option<Arc<HashSet<String>>>,
+    allow_detectable_tools: bool,
     secret_broker: Option<secret_broker::SecretBroker>,
 }
 
@@ -298,9 +326,6 @@ struct PointerArgs {
     page: String,
     /// click, hover, right_click, double_click, scroll, or drag.
     action: String,
-    /// trusted (default) or dom_event. dom_event is untrusted and requires ref.
-    #[serde(default)]
-    input_route: Option<String>,
     #[serde(default, rename = "ref")]
     ref_: Option<String>,
     #[serde(default)]
@@ -625,19 +650,6 @@ struct IframeClickArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct IframeFillArgs {
-    page: String,
-    /// CSS selector for the <iframe> element, or a " >> "-separated chain
-    /// for nested iframes. Same-origin and cross-origin frames are both
-    /// supported and require no special handling from the caller. See the
-    /// `frame_selector` known-limitations note above this struct.
-    frame_selector: String,
-    /// CSS selector for the input inside the innermost iframe.
-    selector: String,
-    value: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct IframeTypeArgs {
     page: String,
     /// CSS selector for the <iframe> element, or a " >> "-separated chain
@@ -739,6 +751,10 @@ fn validate_wheel_input(delta_y: f64, x: f64, y: f64) -> Result<(), &'static str
     Ok(())
 }
 
+fn webdriver_value_is_human(value: &serde_json::Value) -> bool {
+    matches!(value.as_str(), Some("undefined" | "false"))
+}
+
 impl BrowserServer {
     #[cfg(test)]
     fn new() -> Self {
@@ -755,16 +771,37 @@ impl BrowserServer {
             tool_router: Self::tool_router(),
             default_owner,
             allowed_tools: configured_allowed_tools(),
+            allow_detectable_tools: env_flag_enabled("AB_ALLOW_DETECTABLE_TOOLS"),
             secret_broker,
         }
     }
 
     fn tool_is_allowed(&self, name: &str) -> bool {
         name.starts_with("browser_")
+            && (self.allow_detectable_tools || !DETECTABLE_TOOLS.contains(&name))
             && self
                 .allowed_tools
                 .as_ref()
                 .is_none_or(|allowed| allowed.contains(name))
+    }
+
+    fn enforce_detectable_argument_policy(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<(), McpError> {
+        if self.allow_detectable_tools {
+            return Ok(());
+        }
+        if let Some(reason) = detectable_argument_violation(request) {
+            return Err(McpError::invalid_request(
+                format!(
+                    "detectable browser path blocked by strict mode: {reason}; restart with \
+                     --allow-detectable-tools to opt in"
+                ),
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_page_id(st: &State, id_or_owner: &str) -> Option<String> {
@@ -1038,12 +1075,6 @@ impl BrowserServer {
                 .await
                 .map_err(fail)?;
             let netlog = page.enable_network_log().await.ok();
-            let _ = page.enable_dialog_auto_accept().await;
-            let webauthn_authenticator_id = Some(
-                page.webauthn_enable("internal", true, true)
-                    .await
-                    .map_err(fail)?,
-            );
             let snap = page.snapshot().await.map_err(fail)?;
             st.next += 1;
             let id = format!("p{}", st.next);
@@ -1056,7 +1087,7 @@ impl BrowserServer {
                     active_typing: None,
                     netlog,
                     consolelog: None,
-                    webauthn_authenticator_id,
+                    webauthn_authenticator: None,
                 },
             );
             if let Some(owner) = inherited_owner {
@@ -1132,14 +1163,6 @@ impl BrowserServer {
             .await
             .map_err(fail)?;
         let netlog = page.enable_network_log().await.ok();
-        let _ = page.enable_dialog_auto_accept().await;
-        // Install before navigation so a page cannot open a native passkey
-        // chooser during its first load and block browser automation.
-        let webauthn_authenticator_id = Some(
-            page.webauthn_enable("internal", true, true)
-                .await
-                .map_err(fail)?,
-        );
         if !url.is_empty() && url != "about:blank" {
             page.navigate(url).await.map_err(fail)?;
         }
@@ -1155,7 +1178,7 @@ impl BrowserServer {
                 active_typing: None,
                 netlog,
                 consolelog: None,
-                webauthn_authenticator_id,
+                webauthn_authenticator: None,
             },
         );
         if let Some(owner) = request_owner() {
@@ -1260,7 +1283,6 @@ impl BrowserServer {
         let origin = page.element_ref_for_backend(backend).await.map_err(fail)?;
         page.dispatch_pointer(&PointerRequest {
             action: PointerAction::Click,
-            route: InputRoute::Trusted,
             origin: PointerLocation::Element(origin),
             destination: None,
             delta_x: 0.0,
@@ -1286,7 +1308,6 @@ impl BrowserServer {
         let page = self.page_of(&page_id).await?;
         page.dispatch_pointer(&PointerRequest {
             action: PointerAction::Scroll,
-            route: InputRoute::Trusted,
             origin: PointerLocation::Coordinates { x: a.x, y: a.y },
             destination: None,
             delta_x: 0.0,
@@ -1306,9 +1327,9 @@ impl BrowserServer {
         .unwrap_or_else(|_| "{}".into())))
     }
 
-    /// Extended pointer actions with explicit trusted or synthetic DOM delivery.
+    /// Extended pointer actions using trusted browser-generated input.
     #[tool(
-        description = "Click, hover, right-click, double-click, scroll, or drag by ref/selector/coordinates. trusted is default; dom_event is explicitly untrusted and requires a snapshot ref"
+        description = "Click, hover, right-click, double-click, scroll, or drag by ref/selector/coordinates using trusted CDP input"
     )]
     async fn browser_pointer(
         &self,
@@ -1317,11 +1338,6 @@ impl BrowserServer {
         let page_id = self.canonical_page_id(&a.page).await?;
         let page = self.page_of(&page_id).await?;
         let action = PointerAction::parse(&a.action).map_err(fail)?;
-        let route =
-            InputRoute::parse(a.input_route.as_deref().unwrap_or("trusted")).map_err(fail)?;
-        if route == InputRoute::DomEvent && a.ref_.is_none() {
-            return Err(fail("input_route=dom_event requires `ref` for the origin"));
-        }
         let origin = self
             .pointer_location(
                 &page_id,
@@ -1351,7 +1367,6 @@ impl BrowserServer {
             .await?;
         let request = PointerRequest {
             action,
-            route,
             origin,
             destination,
             delta_x: a.delta_x.unwrap_or(0.0),
@@ -1558,8 +1573,10 @@ impl BrowserServer {
         let page = self.page_of(&a.page).await?;
         let accept = a.accept.unwrap_or(true);
         page.set_dialog_policy(accept, a.prompt_text.clone());
+        let started = page.enable_dialog_handler().await.map_err(fail)?;
         Ok(ok(format!(
-            "dialogs on {} will be {}{}",
+            "dialog handling {} on {}; upcoming dialogs will be {}{}",
+            if started { "enabled" } else { "updated" },
             a.page,
             if accept { "accepted" } else { "dismissed" },
             a.prompt_text
@@ -1668,7 +1685,6 @@ impl BrowserServer {
         let destination = page.element_ref_for_backend(to).await.map_err(fail)?;
         page.dispatch_pointer(&PointerRequest {
             action: PointerAction::Drag,
-            route: InputRoute::Trusted,
             origin: PointerLocation::Element(origin),
             destination: Some(PointerLocation::Element(destination)),
             delta_x: 0.0,
@@ -1902,7 +1918,6 @@ impl BrowserServer {
         let origin = page.element_ref_for_backend(backend).await.map_err(fail)?;
         page.dispatch_pointer(&PointerRequest {
             action: PointerAction::Hover,
-            route: InputRoute::Trusted,
             origin: PointerLocation::Element(origin),
             destination: None,
             delta_x: 0.0,
@@ -1914,8 +1929,10 @@ impl BrowserServer {
         Ok(ok(format!("hovered on {}\n\n{}", a.page, diff)))
     }
 
-    /// Select an <option> in a dropdown by ref + value.
-    #[tool(description = "Select a dropdown option by ref and value; returns settle-diff")]
+    /// Select an <option> using trusted browser-generated keyboard input.
+    #[tool(
+        description = "Select an enabled dropdown option by value using trusted CDP keyboard input; returns settle-diff"
+    )]
     async fn browser_select_option(
         &self,
         Parameters(a): Parameters<SelectArgs>,
@@ -1939,38 +1956,49 @@ impl BrowserServer {
         Parameters(a): Parameters<WebAuthnArgs>,
     ) -> Result<CallToolResult, McpError> {
         let page_id = self.canonical_page_id(&a.page).await?;
-        let (page, existing_id) = {
+        let (page, existing) = {
             let st = self.state.lock().await;
             let entry = st
                 .pages
                 .get(&page_id)
                 .ok_or_else(|| fail(format!("unknown page or owner '{}'", a.page)))?;
-            (entry.page.clone(), entry.webauthn_authenticator_id.clone())
+            (entry.page.clone(), entry.webauthn_authenticator.clone())
         };
-        let transport = a.transport.as_deref().unwrap_or("internal");
-        let user_verified = a.user_verified.unwrap_or(true);
-        let resident_key = a.resident_key.unwrap_or(true);
-        let (id, actual_transport, already_installed) = if let Some(id) = existing_id {
-            if !webauthn_options_match_automatic_defaults(transport, user_verified, resident_key) {
+        let requested = WebAuthnConfig {
+            transport: a.transport.unwrap_or_else(|| "internal".into()),
+            user_verified: a.user_verified.unwrap_or(true),
+            resident_key: a.resident_key.unwrap_or(true),
+        };
+        let (id, already_installed) = if let Some((id, installed)) = existing {
+            if installed != requested {
                 return Err(fail(
-                    "this page already has the automatic WebAuthn authenticator (transport=internal, user_verified=true, resident_key=true); replacing it is not supported",
+                    format!(
+                        "this page already has a WebAuthn authenticator \
+                         (transport={}, user_verified={}, resident_key={}); replacing it is not supported",
+                        installed.transport, installed.user_verified, installed.resident_key
+                    ),
                 ));
             }
-            (id, "internal", true)
+            (id, true)
         } else {
             let id = page
-                .webauthn_enable(transport, user_verified, resident_key)
+                .webauthn_enable(
+                    &requested.transport,
+                    requested.user_verified,
+                    requested.resident_key,
+                )
                 .await
                 .map_err(fail)?;
             if let Some(entry) = self.state.lock().await.pages.get_mut(&page_id) {
-                entry.webauthn_authenticator_id = Some(id.clone());
+                entry.webauthn_authenticator = Some((id.clone(), requested.clone()));
             }
-            (id, transport, false)
+            (id, false)
         };
         Ok(ok(format!(
-            "virtual authenticator {} on {} (transport={actual_transport}, authenticatorId={id}). Passkey prompts will no longer block; sites fall back to password when no credential matches.",
+            "virtual authenticator {} on {} (transport={}, authenticatorId={id}). Passkey prompts will no longer block; sites fall back to password when no credential matches.",
             if already_installed { "already installed" } else { "installed" },
             a.page,
+            requested.transport,
         )))
     }
 
@@ -2147,6 +2175,40 @@ impl BrowserServer {
                     .count()
             },
         );
+        let virtual_authenticators = request_owner().map_or_else(
+            || {
+                st.pages
+                    .values()
+                    .filter(|entry| entry.webauthn_authenticator.is_some())
+                    .count()
+            },
+            |owner| {
+                st.pages
+                    .iter()
+                    .filter(|(page_id, entry)| {
+                        entry.webauthn_authenticator.is_some()
+                            && st.page_owners.get(*page_id) == Some(&owner)
+                    })
+                    .count()
+            },
+        );
+        let dialog_handlers = request_owner().map_or_else(
+            || {
+                st.pages
+                    .values()
+                    .filter(|entry| entry.page.dialog_handler_enabled())
+                    .count()
+            },
+            |owner| {
+                st.pages
+                    .iter()
+                    .filter(|(page_id, entry)| {
+                        entry.page.dialog_handler_enabled()
+                            && st.page_owners.get(*page_id) == Some(&owner)
+                    })
+                    .count()
+            },
+        );
         let mode = if std::env::var("AB_CONNECT").is_ok() {
             "connect"
         } else if std::env::var("AB_HEADLESS").is_ok() {
@@ -2158,8 +2220,13 @@ impl BrowserServer {
         } else {
             "headful (be-real)"
         };
+        let detectable_diagnostics = if self.allow_detectable_tools {
+            "allowed (explicit opt-in)"
+        } else {
+            "blocked (strict default)"
+        };
         Ok(ok(format!(
-            "running: {running}\nmode: {mode}\nopen pages: {open_pages}"
+            "running: {running}\nmode: {mode}\ndetectable diagnostics: {detectable_diagnostics}\nopen pages: {open_pages}\nvirtual authenticators: {virtual_authenticators}\ndialog handlers: {dialog_handlers}"
         )))
     }
 
@@ -2201,10 +2268,9 @@ impl BrowserServer {
         }))
     }
 
-    /// Click an element inside an iframe (same-origin or cross-origin,
-    /// including nested chains via " >> ").
+    /// Click inside an iframe with trusted browser-generated pointer input.
     #[tool(
-        description = "Click an element inside an iframe. Handles same-origin and cross-origin frames automatically; chain nested iframes in frame_selector with ' >> '"
+        description = "Click an element inside a same-origin or cross-origin iframe using trusted CDP pointer input; chain nested iframes in frame_selector with ' >> '"
     )]
     async fn browser_iframe_click(
         &self,
@@ -2216,22 +2282,6 @@ impl BrowserServer {
             .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("iframe-clicked on {}\n\n{}", a.page, diff)))
-    }
-
-    /// Fill an input inside an iframe (same-origin or cross-origin,
-    /// including nested chains via " >> ").
-    #[tool(
-        description = "Fill an input inside an iframe. Handles same-origin and cross-origin frames automatically; chain nested iframes in frame_selector with ' >> '"
-    )]
-    async fn browser_iframe_fill(
-        &self,
-        Parameters(a): Parameters<IframeFillArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let page = self.page_of(&a.page).await?;
-        page.iframe_fill(&a.frame_selector, &a.selector, &a.value)
-            .await
-            .map_err(fail)?;
-        Ok(ok(format!("iframe-filled on {}", a.page)))
     }
 
     /// Type into an input inside an iframe using trusted CDP keyboard input.
@@ -2555,7 +2605,7 @@ impl BrowserServer {
 
         let wd = get("webdriver");
         checks.push((
-            wd.as_str() == Some("undefined"),
+            webdriver_value_is_human(&wd),
             format!("navigator.webdriver = {wd}"),
         ));
         let plugins = get("plugins").as_u64().unwrap_or(0);
@@ -2619,6 +2669,7 @@ impl rmcp::ServerHandler for BrowserServer {
         if let Some(owner) = owner.as_ref() {
             force_scoped_owner_argument(&mut request, owner);
         }
+        self.enforce_detectable_argument_policy(&request)?;
         let broker_context = if let Some(broker) = self.secret_broker.as_ref() {
             let input = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
             let transformed = broker
@@ -2751,12 +2802,13 @@ Options:\n\
   --user-data-dir <path>   Persistent browser profile directory\n\
   --headless / --headed    Run headless or headful (default headful)\n\
   --stealth                Inject the JS stealth-patch layer (for headless)\n\
+  --allow-detectable-tools Allow main-world JS and Runtime-enabled console capture\n\
   --connect <port|url>     Attach to a Chrome already running with\n\
                            --remote-debugging-port (identical fingerprint)\n\
   -h, --help               Show this help\n\
   -V, --version            Show the browser-rs version\n\
 \n\
-Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALTH, AB_CONNECT, AB_CHROME.\n";
+Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALTH, AB_CONNECT, AB_CHROME, AB_ALLOW_DETECTABLE_TOOLS.\n";
 
 #[cfg(test)]
 mod tests {
@@ -2764,7 +2816,7 @@ mod tests {
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
         force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
         release_owner_claim, snapshot_diff, truncate_text, validate_wheel_input,
-        webauthn_options_match_automatic_defaults, BrowserServer, IframeTypeArgs, State, TypeArgs,
+        webdriver_value_is_human, BrowserServer, IframeTypeArgs, State, TypeArgs, WebAuthnConfig,
         DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
@@ -2868,6 +2920,54 @@ mod tests {
     }
 
     #[test]
+    fn strict_mode_hides_observable_console_diagnostics_only() {
+        let mut server = BrowserServer::new();
+        server.allow_detectable_tools = false;
+        assert!(!server.tool_is_allowed("browser_console_messages"));
+        assert!(server.tool_is_allowed("browser_click"));
+        assert!(server.tool_is_allowed("browser_evaluate"));
+        assert!(server.tool_is_allowed("browser_iframe_click"));
+        assert!(server.tool_is_allowed("browser_select_option"));
+
+        server.allow_detectable_tools = true;
+        assert!(server.tool_is_allowed("browser_console_messages"));
+    }
+
+    #[test]
+    fn strict_mode_rejects_detectable_options_inside_allowed_tools() {
+        let mut server = BrowserServer::new();
+        server.allow_detectable_tools = false;
+        let request = |tool: &'static str, arguments: serde_json::Value| {
+            CallToolRequestParams::new(tool).with_arguments(
+                arguments
+                    .as_object()
+                    .expect("test arguments must be an object")
+                    .clone(),
+            )
+        };
+
+        assert!(server
+            .enforce_detectable_argument_policy(&request(
+                "browser_evaluate",
+                serde_json::json!({"page":"p1", "expression":"1", "main_world":true})
+            ))
+            .is_err());
+        assert!(server
+            .enforce_detectable_argument_policy(&request(
+                "browser_evaluate",
+                serde_json::json!({"page":"p1", "expression":"1"})
+            ))
+            .is_ok());
+        server.allow_detectable_tools = true;
+        assert!(server
+            .enforce_detectable_argument_policy(&request(
+                "browser_evaluate",
+                serde_json::json!({"page":"p1", "expression":"1", "main_world":true})
+            ))
+            .is_ok());
+    }
+
+    #[test]
     fn scoped_claim_and_release_arguments_cannot_select_another_owner() {
         for tool in ["browser_claim_page", "browser_release_page"] {
             let mut request =
@@ -2896,6 +2996,17 @@ mod tests {
     }
 
     #[test]
+    fn cli_parser_accepts_detectable_tools_opt_in() {
+        std::env::remove_var("AB_ALLOW_DETECTABLE_TOOLS");
+        parse_cli_from(["--allow-detectable-tools"].into_iter().map(str::to_string)).unwrap();
+        assert_eq!(
+            std::env::var("AB_ALLOW_DETECTABLE_TOOLS").as_deref(),
+            Ok("1")
+        );
+        std::env::remove_var("AB_ALLOW_DETECTABLE_TOOLS");
+    }
+
+    #[test]
     fn cli_parser_rejects_missing_invalid_and_unknown_options() {
         for args in [vec!["--port"], vec!["--port", "0"], vec!["--porrt", "9321"]] {
             assert!(parse_cli_from(args.into_iter().map(str::to_string)).is_err());
@@ -2919,19 +3030,21 @@ mod tests {
     }
 
     #[test]
-    fn automatic_webauthn_options_are_not_silently_reconfigured() {
-        assert!(webauthn_options_match_automatic_defaults(
-            "internal", true, true
-        ));
-        assert!(!webauthn_options_match_automatic_defaults(
-            "usb", true, true
-        ));
-        assert!(!webauthn_options_match_automatic_defaults(
-            "internal", false, true
-        ));
-        assert!(!webauthn_options_match_automatic_defaults(
-            "internal", true, false
-        ));
+    fn explicit_webauthn_config_distinguishes_incompatible_reinstall_requests() {
+        let installed = WebAuthnConfig {
+            transport: "internal".into(),
+            user_verified: true,
+            resident_key: true,
+        };
+        assert_eq!(installed, installed.clone());
+        assert_ne!(
+            installed,
+            WebAuthnConfig {
+                transport: "usb".into(),
+                user_verified: true,
+                resident_key: true,
+            }
+        );
     }
 
     #[test]
@@ -2985,6 +3098,13 @@ mod tests {
         assert!(validate_wheel_input(700.0, 650.0, -1.0).is_err());
         assert!(validate_wheel_input(f64::INFINITY, 650.0, 500.0).is_err());
         assert!(validate_wheel_input(700.0, f64::NAN, 500.0).is_err());
+    }
+
+    #[test]
+    fn webdriver_false_and_undefined_are_both_human_browser_states() {
+        assert!(webdriver_value_is_human(&serde_json::json!("undefined")));
+        assert!(webdriver_value_is_human(&serde_json::json!("false")));
+        assert!(!webdriver_value_is_human(&serde_json::json!("true")));
     }
 }
 
@@ -3064,6 +3184,9 @@ fn parse_cli_from(args: impl IntoIterator<Item = String>) -> anyhow::Result<Cli>
             "--headless" if inline_value.is_none() => std::env::set_var("AB_HEADLESS", "1"),
             "--headed" if inline_value.is_none() => std::env::remove_var("AB_HEADLESS"),
             "--stealth" if inline_value.is_none() => std::env::set_var("AB_STEALTH", "1"),
+            "--allow-detectable-tools" if inline_value.is_none() => {
+                std::env::set_var("AB_ALLOW_DETECTABLE_TOOLS", "1")
+            }
             "--connect" | "--cdp-endpoint" => {
                 let port = parse_connect_port(&option_value(&mut it, inline_value, flag)?)?;
                 std::env::set_var("AB_CONNECT", port.to_string());
