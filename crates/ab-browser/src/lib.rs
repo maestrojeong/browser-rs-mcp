@@ -111,9 +111,9 @@ pub struct LaunchOptions {
     /// Headless is a strong fingerprint tell. Off by default — a real headful
     /// window on real hardware is what makes the fingerprint match a human's.
     pub headless: bool,
-    /// Inject the JS stealth-patching layer. Off by default: patching each
-    /// property is itself an anomaly that sophisticated defenses flag. Only
-    /// turn this on as a best-effort fallback when forced to run headless.
+    /// Inject the self-guarding JS stealth layer into launched browsers.
+    /// Enabled by default for both headful and headless launches; callers can
+    /// disable it when an entirely untouched browser surface is required.
     pub inject_stealth: bool,
     pub chrome_path: Option<PathBuf>,
     /// Persistent profile directory. A stable, aged profile (cookies, history)
@@ -129,7 +129,7 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             headless: false,
-            inject_stealth: false,
+            inject_stealth: true,
             chrome_path: None,
             user_data_dir: None,
             port: 0, // 0 => let Chrome pick, we read it back from DevToolsActivePort
@@ -156,11 +156,11 @@ impl Browser {
 
     /// Launch Chrome and connect over CDP.
     ///
-    /// Default mode is headful with a persistent profile and NO JS patching, so
-    /// the page's fingerprint is that of a real, human-driven Chrome. Only the
-    /// `AutomationControlled` blink feature is disabled (a launch flag, not a
-    /// page-visible patch) so `navigator.webdriver` is naturally false.
+    /// Default mode is headful with a persistent profile and the self-guarding
+    /// stealth initialization script. The `AutomationControlled` blink feature
+    /// is also disabled so `navigator.webdriver` is naturally false.
     pub async fn launch(opts: LaunchOptions) -> Result<Self> {
+        let inject_stealth = opts.inject_stealth && std::env::var("AB_NO_STEALTH").is_err();
         let chrome = opts
             .chrome_path
             .clone()
@@ -227,7 +227,7 @@ impl Browser {
 
         // A UA override is only needed to hide the "Headless" token, i.e. only
         // when we're forced to run headless. Headful reports a real UA.
-        let user_agent = if opts.inject_stealth && opts.headless {
+        let user_agent = if inject_stealth && opts.headless {
             client
                 .send("Browser.getVersion", json!({}))
                 .await
@@ -243,7 +243,7 @@ impl Browser {
             client,
             child: Some(child),
             user_agent,
-            inject_stealth: opts.inject_stealth,
+            inject_stealth,
         })
     }
 
@@ -279,7 +279,6 @@ impl Browser {
             .to_string();
 
         let page = self.attach_page(&target_id).await?;
-        // No page patching by default: an untouched real Chrome is the goal.
         if self.inject_stealth {
             page.init_stealth().await?;
             if !self.user_agent.is_empty() {
@@ -839,7 +838,7 @@ impl Page {
                         json!({
                             "frameId": frame,
                             "worldName": "ab_isolated",
-                            "grantUniveralAccess": false,
+                            "grantUniversalAccess": false,
                         }),
                     )
                     .await
@@ -1368,7 +1367,7 @@ impl Page {
                     .send_on(
                         session_id,
                         "Input.dispatchKeyEvent",
-                        json!({ "type": kind, "key": "Delete", "code": "Delete", "windowsVirtualKeyCode": 46 }),
+                        json!({ "type": kind, "key": "Delete", "code": "Delete", "windowsVirtualKeyCode": 46, "nativeVirtualKeyCode": 46, "modifiers": 0 }),
                     )
                     .await?;
             }
@@ -1376,10 +1375,9 @@ impl Page {
 
         ensure_typing_active(cancel)?;
         if uses_insert_text(text) {
-            self.client
-                .send_on(session_id, "Input.insertText", json!({ "text": text }))
-                .await?;
-            return Ok(());
+            return self
+                .dispatch_paste_cancellable(session_id, text, cancel)
+                .await;
         }
 
         let mut shift_held = false;
@@ -1391,6 +1389,7 @@ impl Page {
                 return Err(BrowserError::TypingCancelled);
             }
             let s = ch.to_string();
+            let (code, vk) = us_qwerty_key(ch);
             let need_shift = needs_shift(ch);
             // Real keyboards produce shifted chars (uppercase, @, !, …) only
             // while Shift is physically held. Detectors flag e.g. "@ typed
@@ -1400,7 +1399,7 @@ impl Page {
                     .send_on(
                         session_id,
                         "Input.dispatchKeyEvent",
-                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "modifiers": 8 }),
+                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 8 }),
                     )
                     .await?;
                 shift_held = true;
@@ -1417,7 +1416,7 @@ impl Page {
                 .send_on(
                     session_id,
                     "Input.dispatchKeyEvent",
-                    json!({ "type": "keyDown", "text": s, "key": s, "unmodifiedText": s, "modifiers": modifiers }),
+                    json!({ "type": "keyDown", "text": s, "key": s, "unmodifiedText": s, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": modifiers }),
                 )
                 .await?;
             // Key hold time (press duration), then release.
@@ -1426,7 +1425,7 @@ impl Page {
                 .send_on(
                     session_id,
                     "Input.dispatchKeyEvent",
-                    json!({ "type": "keyUp", "key": s, "modifiers": modifiers }),
+                    json!({ "type": "keyUp", "key": s, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": modifiers }),
                 )
                 .await?;
             if cancelled {
@@ -1459,12 +1458,96 @@ impl Page {
         Ok(())
     }
 
+    async fn dispatch_paste_cancellable(
+        &self,
+        session_id: &str,
+        text: &str,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        ensure_typing_active(cancel)?;
+        typing_delay(cancel, rand_u64(90, 240)).await?;
+
+        #[cfg(target_os = "macos")]
+        let (modifier_key, modifier_code, modifier_vk, modifiers) = ("Meta", "MetaLeft", 91, 4);
+        #[cfg(not(target_os = "macos"))]
+        let (modifier_key, modifier_code, modifier_vk, modifiers) =
+            ("Control", "ControlLeft", 17, 2);
+
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyDown", "key": modifier_key, "code": modifier_code, "windowsVirtualKeyCode": modifier_vk, "nativeVirtualKeyCode": modifier_vk, "modifiers": modifiers }),
+            )
+            .await?;
+        if typing_delay(cancel, rand_u64(20, 55)).await.is_err() {
+            self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
+                .await?;
+            return Err(BrowserError::TypingCancelled);
+        }
+
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyDown", "key": "v", "code": "KeyV", "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86, "modifiers": modifiers }),
+            )
+            .await?;
+        let cancelled = typing_delay(cancel, rand_u64(25, 75)).await.is_err();
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyUp", "key": "v", "code": "KeyV", "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86, "modifiers": modifiers }),
+            )
+            .await?;
+        if cancelled {
+            self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
+                .await?;
+            return Err(BrowserError::TypingCancelled);
+        }
+
+        if typing_delay(cancel, rand_u64(10, 35)).await.is_err() {
+            self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
+                .await?;
+            return Err(BrowserError::TypingCancelled);
+        }
+        self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
+            .await?;
+        ensure_typing_active(cancel)?;
+
+        // CDP cannot populate a trusted ClipboardEvent's clipboardData without
+        // an OS clipboard or observable main-world JS. insertText carries the
+        // content after the trusted shortcut while preserving stealth policy.
+        self.client
+            .send_on(session_id, "Input.insertText", json!({ "text": text }))
+            .await?;
+        Ok(())
+    }
+
+    async fn release_modifier_on(
+        &self,
+        session_id: &str,
+        key: &str,
+        code: &str,
+        vk: u32,
+    ) -> Result<()> {
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": 0 }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn release_shift_on(&self, session_id: &str) -> Result<()> {
         self.client
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft" }),
+                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 0 }),
             )
             .await?;
         Ok(())
@@ -2064,16 +2147,20 @@ impl Page {
     }
 
     async fn press_key_on(&self, session_id: &str, key: &str) -> Result<()> {
-        let (code, vk) = match key {
-            "Enter" => ("Enter", 13),
-            "Tab" => ("Tab", 9),
-            "Escape" => ("Escape", 27),
-            "Backspace" => ("Backspace", 8),
-            "ArrowDown" => ("ArrowDown", 40),
-            "ArrowUp" => ("ArrowUp", 38),
-            "Home" => ("Home", 36),
-            "End" => ("End", 35),
-            _ => (key, 0),
+        let (event_key, code, vk) = match key {
+            "Enter" => (key, "Enter", 13),
+            "Tab" => (key, "Tab", 9),
+            "Escape" => (key, "Escape", 27),
+            "Backspace" => (key, "Backspace", 8),
+            "ArrowDown" => (key, "ArrowDown", 40),
+            "ArrowUp" => (key, "ArrowUp", 38),
+            "Home" => (key, "Home", 36),
+            "End" => (key, "End", 35),
+            _ if key.chars().count() == 1 => {
+                let (code, vk) = us_qwerty_key(key.chars().next().unwrap());
+                (key, code, vk)
+            }
+            _ => (key, "", 0),
         };
         self.client
             .send_on(
@@ -2081,7 +2168,7 @@ impl Page {
                 "Input.dispatchKeyEvent",
                 json!({
                     "type": "keyDown",
-                    "key": code,
+                    "key": event_key,
                     "code": code,
                     "windowsVirtualKeyCode": vk,
                     "nativeVirtualKeyCode": vk,
@@ -2095,7 +2182,7 @@ impl Page {
                 "Input.dispatchKeyEvent",
                 json!({
                     "type": "keyUp",
-                    "key": code,
+                    "key": event_key,
                     "code": code,
                     "windowsVirtualKeyCode": vk,
                     "nativeVirtualKeyCode": vk,
@@ -2109,6 +2196,8 @@ impl Page {
     async fn type_select_search_on(&self, session_id: &str, label: &str) -> Result<()> {
         for ch in label.to_lowercase().chars() {
             let key = ch.to_string();
+            let (code, vk) = us_qwerty_key(ch);
+            let modifiers = if needs_shift(ch) { 8 } else { 0 };
             self.client
                 .send_on(
                     session_id,
@@ -2118,6 +2207,10 @@ impl Page {
                         "text": key,
                         "key": key,
                         "unmodifiedText": key,
+                        "code": code,
+                        "windowsVirtualKeyCode": vk,
+                        "nativeVirtualKeyCode": vk,
+                        "modifiers": modifiers,
                     }),
                 )
                 .await?;
@@ -2126,7 +2219,7 @@ impl Page {
                 .send_on(
                     session_id,
                     "Input.dispatchKeyEvent",
-                    json!({ "type": "keyUp", "key": key }),
+                    json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": modifiers }),
                 )
                 .await?;
             tokio::time::sleep(Duration::from_millis(rand_u64(35, 120))).await;
@@ -2945,6 +3038,61 @@ fn needs_shift(ch: char) -> bool {
     ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
 }
 
+fn us_qwerty_key(ch: char) -> (&'static str, u32) {
+    match ch {
+        'a' | 'A' => ("KeyA", 65),
+        'b' | 'B' => ("KeyB", 66),
+        'c' | 'C' => ("KeyC", 67),
+        'd' | 'D' => ("KeyD", 68),
+        'e' | 'E' => ("KeyE", 69),
+        'f' | 'F' => ("KeyF", 70),
+        'g' | 'G' => ("KeyG", 71),
+        'h' | 'H' => ("KeyH", 72),
+        'i' | 'I' => ("KeyI", 73),
+        'j' | 'J' => ("KeyJ", 74),
+        'k' | 'K' => ("KeyK", 75),
+        'l' | 'L' => ("KeyL", 76),
+        'm' | 'M' => ("KeyM", 77),
+        'n' | 'N' => ("KeyN", 78),
+        'o' | 'O' => ("KeyO", 79),
+        'p' | 'P' => ("KeyP", 80),
+        'q' | 'Q' => ("KeyQ", 81),
+        'r' | 'R' => ("KeyR", 82),
+        's' | 'S' => ("KeyS", 83),
+        't' | 'T' => ("KeyT", 84),
+        'u' | 'U' => ("KeyU", 85),
+        'v' | 'V' => ("KeyV", 86),
+        'w' | 'W' => ("KeyW", 87),
+        'x' | 'X' => ("KeyX", 88),
+        'y' | 'Y' => ("KeyY", 89),
+        'z' | 'Z' => ("KeyZ", 90),
+        '0' | ')' => ("Digit0", 48),
+        '1' | '!' => ("Digit1", 49),
+        '2' | '@' => ("Digit2", 50),
+        '3' | '#' => ("Digit3", 51),
+        '4' | '$' => ("Digit4", 52),
+        '5' | '%' => ("Digit5", 53),
+        '6' | '^' => ("Digit6", 54),
+        '7' | '&' => ("Digit7", 55),
+        '8' | '*' => ("Digit8", 56),
+        '9' | '(' => ("Digit9", 57),
+        ' ' => ("Space", 32),
+        '-' | '_' => ("Minus", 189),
+        '=' | '+' => ("Equal", 187),
+        '[' | '{' => ("BracketLeft", 219),
+        ']' | '}' => ("BracketRight", 221),
+        '\\' | '|' => ("Backslash", 220),
+        ';' | ':' => ("Semicolon", 186),
+        '\'' | '"' => ("Quote", 222),
+        ',' | '<' => ("Comma", 188),
+        '.' | '>' => ("Period", 190),
+        '/' | '?' => ("Slash", 191),
+        '`' | '~' => ("Backquote", 192),
+        _ => ("", 0),
+    }
+}
+
+// Short strings are typed key-by-key; long strings are more plausibly pasted.
 const INSERT_TEXT_THRESHOLD: usize = 30;
 
 fn uses_insert_text(text: &str) -> bool {
@@ -3059,7 +3207,8 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 mod tests {
     use super::{
         activation_verified, build_descend_js, build_frame_element_js, require_frame_chain,
-        resolve_frame_id, split_frame_chain, uses_insert_text, FrameAction, ReadMode,
+        resolve_frame_id, split_frame_chain, us_qwerty_key, uses_insert_text, FrameAction,
+        ReadMode,
     };
 
     #[test]
@@ -3067,6 +3216,16 @@ mod tests {
         assert!(!uses_insert_text(&"한".repeat(29)));
         assert!(uses_insert_text(&"한".repeat(30)));
         assert!(uses_insert_text(&"a".repeat(30)));
+    }
+
+    #[test]
+    fn us_qwerty_mapping_covers_shifted_and_unshifted_keys() {
+        assert_eq!(us_qwerty_key('a'), ("KeyA", 65));
+        assert_eq!(us_qwerty_key('A'), ("KeyA", 65));
+        assert_eq!(us_qwerty_key('1'), ("Digit1", 49));
+        assert_eq!(us_qwerty_key('!'), ("Digit1", 49));
+        assert_eq!(us_qwerty_key('?'), ("Slash", 191));
+        assert_eq!(us_qwerty_key('한'), ("", 0));
     }
 
     #[test]

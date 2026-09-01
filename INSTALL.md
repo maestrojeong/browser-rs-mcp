@@ -22,7 +22,7 @@ browser-rs --help
 
 ```bash
 # Pin a specific version
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.1 sh
 
 # Choose the install directory
 AB_BIN_DIR=~/bin curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh

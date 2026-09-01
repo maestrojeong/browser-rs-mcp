@@ -715,11 +715,11 @@ struct DragArgs {
     target_selector: Option<String>,
 }
 
-/// Build the browser per environment. Default: headful, real profile, no JS
-/// patching (fingerprint == a real human Chrome). Overrides:
+/// Build the browser per environment. Default: headful, real profile, and the
+/// self-guarding JS stealth layer. Overrides:
 ///   AB_CONNECT=<port>  attach to a Chrome the user already launched (strongest)
-///   AB_HEADLESS=1      run headless (a tell; enable AB_STEALTH to compensate)
-///   AB_STEALTH=1       inject the JS stealth-patch fallback (headless only)
+///   AB_HEADLESS=1      run headless (a strong fingerprint tell)
+///   AB_NO_STEALTH=1    disable stealth injection for launched browsers
 ///   AB_PROFILE=<dir>   persistent profile location
 async fn make_browser() -> ab_browser::Result<Browser> {
     if let Ok(port) = std::env::var("AB_CONNECT") {
@@ -727,7 +727,7 @@ async fn make_browser() -> ab_browser::Result<Browser> {
     }
     Browser::launch(LaunchOptions {
         headless: std::env::var("AB_HEADLESS").is_ok(),
-        inject_stealth: std::env::var("AB_STEALTH").is_ok(),
+        inject_stealth: std::env::var("AB_NO_STEALTH").is_err(),
         ..Default::default()
     })
     .await
@@ -2212,13 +2212,15 @@ impl BrowserServer {
         let mode = if std::env::var("AB_CONNECT").is_ok() {
             "connect"
         } else if std::env::var("AB_HEADLESS").is_ok() {
-            if std::env::var("AB_STEALTH").is_ok() {
-                "headless+stealth"
+            if std::env::var("AB_NO_STEALTH").is_ok() {
+                "headless (stealth disabled)"
             } else {
-                "headless"
+                "headless+stealth"
             }
+        } else if std::env::var("AB_NO_STEALTH").is_ok() {
+            "headful (stealth disabled)"
         } else {
-            "headful (be-real)"
+            "headful+stealth"
         };
         let detectable_diagnostics = if self.allow_detectable_tools {
             "allowed (explicit opt-in)"
@@ -2586,15 +2588,48 @@ impl BrowserServer {
         Parameters(a): Parameters<PageArg>,
     ) -> Result<CallToolResult, McpError> {
         let page = self.page_of(&a.page).await?;
-        let js = r#"JSON.stringify({
-            webdriver: navigator.webdriver === undefined ? 'undefined' : String(navigator.webdriver),
-            plugins: navigator.plugins.length,
-            languages: (navigator.languages || []).join(','),
-            hasChrome: !!window.chrome,
-            hasChromeRuntime: !!(window.chrome && window.chrome.runtime),
-            headlessUA: /headless/i.test(navigator.userAgent),
-            userAgent: navigator.userAgent
-        })"#;
+        let js = r#"(async () => {
+            let webglVendor = '';
+            let webglRenderer = '';
+            try {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+                const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                if (gl && ext) {
+                    webglVendor = String(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || '');
+                    webglRenderer = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '');
+                }
+            } catch (_) {}
+            let notificationPermission = 'unavailable';
+            let notificationQuery = 'unavailable';
+            try {
+                notificationPermission = Notification.permission;
+                notificationQuery = (await navigator.permissions.query({ name: 'notifications' })).state;
+            } catch (_) {}
+            return JSON.stringify({
+                webdriver: navigator.webdriver === undefined ? 'undefined' : String(navigator.webdriver),
+                plugins: navigator.plugins.length,
+                languages: (navigator.languages || []).join(','),
+                hasChrome: !!window.chrome,
+                hasChromeRuntime: !!(window.chrome && window.chrome.runtime),
+                headlessUA: /headless/i.test(navigator.userAgent),
+                userAgent: navigator.userAgent,
+                webglVendor,
+                webglRenderer,
+                softwareWebgl: /swiftshader|llvmpipe|software|mesa/i.test(webglVendor + ' ' + webglRenderer),
+                voices: speechSynthesis ? speechSynthesis.getVoices().length : 0,
+                notificationPermission,
+                notificationQuery,
+                outerWidth: window.outerWidth,
+                outerHeight: window.outerHeight,
+                screenWidth: screen.width,
+                screenHeight: screen.height,
+                screenAvailWidth: screen.availWidth,
+                screenAvailHeight: screen.availHeight,
+                innerWidth: window.innerWidth,
+                innerHeight: window.innerHeight
+            });
+        })()"#;
         let raw = page.evaluate(js).await.map_err(fail)?;
         let s = raw.as_str().unwrap_or("{}");
         let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
@@ -2619,8 +2654,60 @@ impl BrowserServer {
             get("hasChrome").as_bool().unwrap_or(false),
             "window.chrome present".into(),
         ));
+        checks.push((
+            get("hasChromeRuntime").as_bool().unwrap_or(false),
+            "chrome.runtime present".into(),
+        ));
         let headless = get("headlessUA").as_bool().unwrap_or(false);
         checks.push((!headless, format!("headless in UA = {headless}")));
+        let webgl_vendor = get("webglVendor").as_str().unwrap_or("").to_string();
+        let webgl_renderer = get("webglRenderer").as_str().unwrap_or("").to_string();
+        let software_webgl = get("softwareWebgl").as_bool().unwrap_or(true);
+        checks.push((
+            !webgl_renderer.is_empty() && !software_webgl,
+            format!("WebGL = {webgl_vendor} / {webgl_renderer}"),
+        ));
+        let voices = get("voices").as_u64().unwrap_or(0);
+        checks.push((voices > 0, format!("speechSynthesis voices = {voices}")));
+        let notification_permission = get("notificationPermission")
+            .as_str()
+            .unwrap_or("unavailable")
+            .to_string();
+        let notification_query = get("notificationQuery")
+            .as_str()
+            .unwrap_or("unavailable")
+            .to_string();
+        checks.push((
+            notification_permission != "unavailable"
+                && notification_permission == notification_query,
+            format!(
+                "Notification.permission/query = {notification_permission}/{notification_query}"
+            ),
+        ));
+        let outer_width = get("outerWidth").as_u64().unwrap_or(0);
+        let outer_height = get("outerHeight").as_u64().unwrap_or(0);
+        checks.push((
+            outer_width > 0 && outer_height > 0,
+            format!("outer size = {outer_width}x{outer_height}"),
+        ));
+        let screen_width = get("screenWidth").as_u64().unwrap_or(0);
+        let screen_height = get("screenHeight").as_u64().unwrap_or(0);
+        let avail_width = get("screenAvailWidth").as_u64().unwrap_or(0);
+        let avail_height = get("screenAvailHeight").as_u64().unwrap_or(0);
+        let inner_width = get("innerWidth").as_u64().unwrap_or(0);
+        let inner_height = get("innerHeight").as_u64().unwrap_or(0);
+        let sane_screen = screen_width >= inner_width
+            && screen_height >= inner_height
+            && avail_width > 0
+            && avail_height > 0
+            && avail_width <= screen_width
+            && avail_height <= screen_height;
+        checks.push((
+            sane_screen,
+            format!(
+                "screen/available/inner = {screen_width}x{screen_height} / {avail_width}x{avail_height} / {inner_width}x{inner_height}"
+            ),
+        ));
 
         let mut passed = 0;
         for (good, label) in &checks {
@@ -2632,6 +2719,9 @@ impl BrowserServer {
             }
         }
         report.push_str(&format!("\nscore: {passed}/{} passed", checks.len()));
+        report.push_str(
+            "\nlimited probe: does not cover input-layer code/keyCode, canvas/audio, TLS/JA3, or CDP tells",
+        );
         Ok(ok(report))
     }
 }
@@ -2801,14 +2891,14 @@ Options:\n\
   --port <port>            Enable HTTP mode on this port\n\
   --user-data-dir <path>   Persistent browser profile directory\n\
   --headless / --headed    Run headless or headful (default headful)\n\
-  --stealth                Inject the JS stealth-patch layer (for headless)\n\
+  --stealth                Compatibility no-op (stealth is enabled by default)\n\
   --allow-detectable-tools Allow main-world JS and Runtime-enabled console capture\n\
   --connect <port|url>     Attach to a Chrome already running with\n\
                            --remote-debugging-port (identical fingerprint)\n\
   -h, --help               Show this help\n\
   -V, --version            Show the browser-rs version\n\
 \n\
-Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_STEALTH, AB_CONNECT, AB_CHROME, AB_ALLOW_DETECTABLE_TOOLS.\n";
+Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_NO_STEALTH, AB_CONNECT, AB_CHROME, AB_ALLOW_DETECTABLE_TOOLS.\n";
 
 #[cfg(test)]
 mod tests {

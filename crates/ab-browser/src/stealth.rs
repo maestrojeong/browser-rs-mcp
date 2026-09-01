@@ -122,13 +122,67 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
     }
   } catch (_) {}
 
-  // window.chrome runtime shim (present in real Chrome, missing when driven).
+  // Small window.chrome shim for surfaces present in normal Chrome. Define
+  // only missing pieces so a real browser/profile keeps its native objects.
   try {
     if (!window.chrome) {
       window.chrome = {};
     }
     if (!window.chrome.runtime) {
-      window.chrome.runtime = {};
+      const listener = () => ({
+        addListener: mark(function addListener() {}, 'addListener'),
+        removeListener: mark(function removeListener() {}, 'removeListener'),
+        hasListener: mark(function hasListener() { return false; }, 'hasListener'),
+      });
+      const connect = mark(function connect() {
+        const onDisconnect = listener();
+        const onMessage = listener();
+        return {
+          name: '', sender: undefined, onDisconnect, onMessage,
+          postMessage: mark(function postMessage() {}, 'postMessage'),
+          disconnect: mark(function disconnect() {}, 'disconnect'),
+        };
+      }, 'connect');
+      const sendMessage = mark(function sendMessage() {}, 'sendMessage');
+      window.chrome.runtime = {
+        id: undefined,
+        connect,
+        sendMessage,
+        onMessage: listener(),
+        onConnect: listener(),
+      };
+    }
+    if (!window.chrome.csi) {
+      window.chrome.csi = mark(function csi() {
+        const timing = performance.timing || {};
+        return {
+          onloadT: timing.domContentLoadedEventEnd || Date.now(),
+          startE: timing.navigationStart || Date.now(),
+          pageT: Math.max(0, performance.now()),
+          tran: 15,
+        };
+      }, 'csi');
+    }
+    if (!window.chrome.loadTimes) {
+      window.chrome.loadTimes = mark(function loadTimes() {
+        const timing = performance.timing || {};
+        const navigation = performance.getEntriesByType('navigation')[0];
+        return {
+          requestTime: (timing.navigationStart || Date.now()) / 1000,
+          startLoadTime: (timing.navigationStart || Date.now()) / 1000,
+          commitLoadTime: (timing.responseStart || Date.now()) / 1000,
+          finishDocumentLoadTime: (timing.domContentLoadedEventEnd || Date.now()) / 1000,
+          finishLoadTime: (timing.loadEventEnd || Date.now()) / 1000,
+          firstPaintTime: (timing.responseStart || Date.now()) / 1000,
+          firstPaintAfterLoadTime: 0,
+          navigationType: 'Other',
+          wasFetchedViaSpdy: !!(navigation && /^h2|h3$/.test(navigation.nextHopProtocol)),
+          wasNpnNegotiated: true,
+          npnNegotiatedProtocol: navigation ? navigation.nextHopProtocol : 'h2',
+          wasAlternateProtocolAvailable: false,
+          connectionInfo: navigation ? navigation.nextHopProtocol : 'h2',
+        };
+      }, 'loadTimes');
     }
   } catch (_) {}
 
