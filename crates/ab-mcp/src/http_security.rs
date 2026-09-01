@@ -101,7 +101,7 @@ impl HttpSecurity {
         }
     }
 
-    async fn authorize_request(&self, auth: RequestAuth) -> Result<Option<String>, Response> {
+    async fn authorize_request(&self, auth: RequestAuth) -> Result<Option<String>, Box<Response>> {
         let RequestAuth {
             path,
             provided,
@@ -118,44 +118,50 @@ impl HttpSecurity {
                     .as_deref()
                     .is_some_and(|value| constant_time_eq(value, expected))
                 {
-                    return Err(unauthorized("invalid browser capability"));
+                    return Err(Box::new(unauthorized("invalid browser capability")));
                 }
             }
             return Ok(None);
         }
 
         let Some(root) = self.root_capability.as_deref() else {
-            return Err(unauthorized("browser capability is unavailable"));
+            return Err(Box::new(unauthorized("browser capability is unavailable")));
         };
         if path == "/owners" {
             if !provided
                 .as_deref()
                 .is_some_and(|value| constant_time_eq(value, root))
             {
-                return Err(unauthorized("invalid browser administrative capability"));
+                return Err(Box::new(unauthorized(
+                    "invalid browser administrative capability",
+                )));
             }
             return Ok(None);
         }
 
         let Some(owner) = owner else {
-            return Err((StatusCode::BAD_REQUEST, "browser owner is required").into_response());
+            return Err(Box::new(
+                (StatusCode::BAD_REQUEST, "browser owner is required").into_response(),
+            ));
         };
         let expected = owner_capability(root, &owner);
         if !provided
             .as_deref()
             .is_some_and(|value| constant_time_eq(value, &expected))
         {
-            return Err(unauthorized("invalid browser owner capability"));
+            return Err(Box::new(unauthorized("invalid browser owner capability")));
         }
 
         if let Some(session_id) = session_id {
             let owners = self.session_owners.lock().await;
             if owners.get(&session_id) != Some(&owner) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    "browser owner does not match this session",
-                )
-                    .into_response());
+                return Err(Box::new(
+                    (
+                        StatusCode::FORBIDDEN,
+                        "browser owner does not match this session",
+                    )
+                        .into_response(),
+                ));
             }
         }
         Ok(Some(owner))
@@ -247,7 +253,7 @@ pub async fn authorize_http(security: HttpSecurity, request: Request, next: Next
     let request_session = request_session(&request);
     let owner = match security.authorize_request(request_auth(&request)).await {
         Ok(owner) => owner,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let method = request.method().clone();

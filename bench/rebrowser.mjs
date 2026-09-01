@@ -5,7 +5,8 @@
 import { spawn } from "node:child_process";
 
 const bin = process.argv[2] || "target/release/browser-rs";
-const c = spawn(bin, [], { stdio: ["pipe", "pipe", "ignore"] });
+// Opt in only because the harness reads the detector's main-world result table.
+const c = spawn(bin, ["--allow-detectable-tools"], { stdio: ["pipe", "pipe", "ignore"] });
 let b = "";
 const w = new Map();
 c.stdout.on("data", (d) => {

@@ -104,23 +104,20 @@ if (!firstRef) {
   child.kill();
   throw new Error("navigation snapshot had no interactive ref");
 }
-for (const inputRoute of ["trusted", "dom_event"]) {
-  const hover = await send("tools/call", {
-    name: "browser_pointer",
-    arguments: {
-      page: "p1",
-      action: "hover",
-      input_route: inputRoute,
-      ref: firstRef,
-    },
-  });
-  if (hover.result?.isError || hover.error) {
-    child.kill();
-    throw new Error(`${inputRoute} pointer hover failed: ${JSON.stringify(hover)}`);
-  }
-  console.log(`browser_pointer hover (${inputRoute}):`, hover.result?.content?.[0]?.text);
-  firstRef = await freshRef();
+const hover = await send("tools/call", {
+  name: "browser_pointer",
+  arguments: {
+    page: "p1",
+    action: "hover",
+    ref: firstRef,
+  },
+});
+if (hover.result?.isError || hover.error) {
+  child.kill();
+  throw new Error(`trusted pointer hover failed: ${JSON.stringify(hover)}`);
 }
+console.log("browser_pointer hover (trusted):", hover.result?.content?.[0]?.text);
+firstRef = await freshRef();
 const click = await send("tools/call", {
   name: "browser_click",
   arguments: { page: "p1", ref: firstRef },
