@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.1 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,18 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.2.0)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.2.1)</strong></summary>
+
+**v0.2.1 — input-layer and stealth hardening.** Character key events now carry
+a real US-QWERTY `code`/`windowsVirtualKeyCode`/`nativeVirtualKeyCode` alongside
+`key`/`text`, closing the `KeyboardEvent.code === ""` / `keyCode === 0` tell.
+Long (>=30 char) input now emulates a human Ctrl/Cmd+V paste gesture (trusted
+modifier+V key events around the text delivery) instead of a bare, keyless
+`Input.insertText`. The JS stealth-patch layer now injects by default in both
+headful and headless launches (self-guarding; opt out with `AB_NO_STEALTH=1`),
+gained a more realistic `chrome.runtime`/`chrome.csi`/`chrome.loadTimes` shim,
+and `browser_fingerprint_check` now also reports WebGL renderer, speech-voice,
+`window.chrome`, notification-permission, and viewport-sanity signals.
 
 **v0.2.0 — trusted-only interaction defaults.** Synthetic pointer delivery and
 `browser_iframe_fill` have been removed. `browser_iframe_click` now resolves
@@ -423,13 +434,15 @@ browser-rs --port 9321 [options]    # HTTP MCP transport
   --headless               Run headless
   --headed                 Run headful (default)
   --connect <port|url>     Attach to an existing Chrome
-  --stealth                Enable the JS fallback layer
+  --stealth                Compatibility no-op (enabled by default)
   --allow-detectable-tools Opt in to observable debugging paths
 ```
 
 `--port` enables HTTP mode; without it, the server uses stdio. The equivalent
 environment variables are `AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`,
-`AB_STEALTH`, `AB_CHROME`, and `AB_ALLOW_DETECTABLE_TOOLS`.
+`AB_NO_STEALTH`, `AB_CHROME`, and `AB_ALLOW_DETECTABLE_TOOLS`. Set
+`AB_NO_STEALTH=1` to disable initialization-script injection for launched
+browsers; `--connect` browsers are always left untouched.
 `AB_HTTP_CAPABILITY` protects HTTP/SSE requests with `X-Browser-Capability`
 and is required for non-loopback binds.
 
