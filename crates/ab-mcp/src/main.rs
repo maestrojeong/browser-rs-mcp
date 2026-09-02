@@ -407,7 +407,7 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PressArgs {
     page: String,
-    /// Key name: Enter, Tab, Escape, Backspace, ArrowUp, ArrowDown, or a character.
+    /// Key name or modifier combo, such as Enter, Meta+c, or Control+Shift+v.
     key: String,
     /// Optionally focus this ref/selector before pressing.
     #[serde(default, rename = "ref")]
@@ -645,7 +645,8 @@ struct IframeClickArgs {
     /// both supported and require no special handling from the caller. See
     /// the `frame_selector` known-limitations note above this struct.
     frame_selector: String,
-    /// CSS selector for the element inside the innermost iframe.
+    /// CSS selector for the element inside the innermost iframe. Click and
+    /// hover resolution pierce open and closed shadow roots.
     selector: String,
 }
 
@@ -1461,7 +1462,9 @@ impl BrowserServer {
     }
 
     /// Press a named key on a page, then report what changed.
-    #[tool(description = "Press a key (Enter, Tab, Escape, ...); returns settle-diff")]
+    #[tool(
+        description = "Press a key or modifier combo (Enter, Meta+c, Control+v, ...); returns settle-diff"
+    )]
     async fn browser_press_key(
         &self,
         Parameters(a): Parameters<PressArgs>,
@@ -2284,6 +2287,22 @@ impl BrowserServer {
             .map_err(fail)?;
         let diff = self.settle_diff(&a.page, &page).await?;
         Ok(ok(format!("iframe-clicked on {}\n\n{}", a.page, diff)))
+    }
+
+    /// Hover inside an iframe with trusted browser-generated pointer input.
+    #[tool(
+        description = "Hover an element inside a same-origin or cross-origin iframe using trusted CDP pointer input; pierces closed shadow roots; chain nested iframes in frame_selector with ' >> '"
+    )]
+    async fn browser_iframe_hover(
+        &self,
+        Parameters(a): Parameters<IframeClickArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        page.iframe_hover(&a.frame_selector, &a.selector)
+            .await
+            .map_err(fail)?;
+        let diff = self.settle_diff(&a.page, &page).await?;
+        Ok(ok(format!("iframe-hovered on {}\n\n{}", a.page, diff)))
     }
 
     /// Type into an input inside an iframe using trusted CDP keyboard input.
@@ -3148,6 +3167,7 @@ mod tests {
         assert!(names.contains(&"browser_pointer"));
         assert!(names.contains(&"browser_wheel"));
         assert!(names.contains(&"browser_cancel_typing"));
+        assert!(names.contains(&"browser_iframe_hover"));
         assert!(names.contains(&"browser_iframe_type"));
     }
 

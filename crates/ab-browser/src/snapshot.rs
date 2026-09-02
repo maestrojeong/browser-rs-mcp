@@ -77,8 +77,8 @@ fn is_noise(role: &str) -> bool {
 /// (cross-origin) iframe's content is invisible to `Accessibility.getFullAXTree`
 /// entirely (separate renderer, separate CDP target) — without this line the
 /// agent would have no signal that an iframe exists at all. Use
-/// `browser_iframe_read` / `browser_iframe_click` / `browser_iframe_type` to
-/// reach inside it.
+/// `browser_iframe_read` / `browser_iframe_click` / `browser_iframe_hover` /
+/// `browser_iframe_type` to reach inside it.
 fn is_iframe(role: &str) -> bool {
     matches!(role, "Iframe" | "iframe" | "IframePresentational")
 }
@@ -172,7 +172,7 @@ fn walk(
             line.push_str(&format!(" \"{}\"", truncate(&name, 120)));
         }
         if is_iframe(role) {
-            line.push_str(" [iframe: use browser_iframe_read/_click/_fill]");
+            line.push_str(" [iframe: use browser_iframe_read/_click/_hover/_type]");
         }
         if is_interactive(role) {
             *counter += 1;

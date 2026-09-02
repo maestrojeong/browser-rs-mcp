@@ -387,7 +387,6 @@ pub enum ReadMode {
 /// Action to perform on the element resolved at the bottom of an iframe chain
 /// (see `Page::descend_and_act`).
 enum FrameAction {
-    Point,
     Focus { clear: bool },
     Read(ReadMode),
 }
@@ -443,7 +442,6 @@ fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction) -> Str
     let chain_json = serde_json::to_string(chain).unwrap_or_else(|_| "[]".into());
     let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let act_js = match action {
-        FrameAction::Point => "el.scrollIntoView({block:'center',inline:'center'}); const r=el.getBoundingClientRect(); if(r.width<=0||r.height<=0) throw new Error('element has no visible box'); return {ok:true,x:offsetX+r.left+r.width/2,y:offsetY+r.top+r.height/2,halfWidth:r.width/2,halfHeight:r.height/2};".to_string(),
         FrameAction::Focus { clear } => {
             let select_js = if *clear {
                 " if (typeof el.select === 'function') el.select(); else if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, (el.value || '').length);"
@@ -458,26 +456,17 @@ fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction) -> Str
                 .to_string()
         }
     };
-    let locate = matches!(action, FrameAction::Point);
     format!(
         r#"(() => {{
   const chain = {chain_json};
-  const locate = {locate};
   let doc = document;
-  let offsetX = 0, offsetY = 0;
   for (let i = 0; i < chain.length; i++) {{
     const f = doc.querySelector(chain[i]);
     if (!f) throw new Error('iframe not found at step ' + i + ': ' + chain[i]);
-    if (locate) {{
-      f.scrollIntoView({{block:'center',inline:'center'}});
-      const r = f.getBoundingClientRect();
-      offsetX += r.left + (f.clientLeft || 0);
-      offsetY += r.top + (f.clientTop || 0);
-    }}
     let inner = null;
     try {{ inner = f.contentDocument; }} catch (e) {{ inner = null; }}
     if (!inner) {{
-      return {{ ok: false, index: i, src: f.src || f.getAttribute('src') || '', name: f.name || f.getAttribute('name') || '', offsetX, offsetY }};
+      return {{ ok: false, index: i, src: f.src || f.getAttribute('src') || '', name: f.name || f.getAttribute('name') || '' }};
     }}
     doc = inner;
   }}
@@ -485,7 +474,6 @@ fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction) -> Str
   if (!el) throw new Error('element not found: ' + {sel_json});
   {act_js}
 }})()"#,
-        locate = locate,
     )
 }
 
@@ -637,6 +625,13 @@ pub struct Page {
 struct FrameExecutionContext {
     session_id: String,
     context_id: i64,
+}
+
+#[derive(Clone, Debug)]
+struct FramePointerTarget {
+    session_id: String,
+    root_point: (f64, f64),
+    frame_point: (f64, f64),
 }
 
 impl Page {
@@ -1026,6 +1021,43 @@ impl Page {
     }
 }
 
+fn ax_hit_has_backend_ancestor(nodes: &[Value], hit_backend: i64, target_backend: i64) -> bool {
+    let mut current = nodes
+        .iter()
+        .find(|node| node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(hit_backend));
+    for _ in 0..nodes.len() {
+        let Some(node) = current else { return false };
+        if node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(target_backend) {
+            return true;
+        }
+        let Some(parent_id) = node.get("parentId").and_then(Value::as_str) else {
+            return false;
+        };
+        current = nodes
+            .iter()
+            .find(|candidate| candidate.get("nodeId").and_then(Value::as_str) == Some(parent_id));
+    }
+    false
+}
+
+fn collect_piercing_query_roots(node: &Value, include_node: bool, out: &mut Vec<i64>) {
+    if include_node {
+        if let Some(backend) = node.get("backendNodeId").and_then(Value::as_i64) {
+            out.push(backend);
+        }
+    }
+    if let Some(shadow_roots) = node.get("shadowRoots").and_then(Value::as_array) {
+        for shadow_root in shadow_roots {
+            collect_piercing_query_roots(shadow_root, true, out);
+        }
+    }
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            collect_piercing_query_roots(child, false, out);
+        }
+    }
+}
+
 /// Actions driven by an accessibility `[ref]` (its backendDOMNodeId).
 impl Page {
     /// Resolve the on-screen center of a node from its box model.
@@ -1140,37 +1172,63 @@ impl Page {
         self.evaluate(&js).await
     }
 
-    /// Actionability hit-test: is the target node (or a descendant of it)
-    /// actually the element at viewport point (x, y)? Playwright does this before
-    /// every click so an overlay/animation covering the target doesn't steal the
-    /// click. Returns Ok(true) if the point lands on the target, Ok(false) if it
-    /// is occluded, Err only on a protocol failure (caller may then assume true).
+    /// Actionability hit-test using only browser protocol domains, avoiding
+    /// main-world Runtime execution that a page can observe. Returns true when
+    /// the point lands on the target or its accessibility ancestor chain.
     async fn point_hits_node(&self, backend: i64, x: f64, y: f64) -> Result<bool> {
-        let Some(obj) = self.resolve_object(backend).await? else {
-            return Ok(true);
-        };
-        let res = self
+        // Input events use viewport coordinates, while DOM.getNodeForLocation
+        // expects document coordinates.
+        let metrics = self
+            .client
+            .send_on(&self.session_id, "Page.getLayoutMetrics", json!({}))
+            .await?;
+        let viewport = metrics
+            .get("cssVisualViewport")
+            .or_else(|| metrics.get("visualViewport"));
+        let page_x = viewport
+            .and_then(|value| value.get("pageX"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let page_y = viewport
+            .and_then(|value| value.get("pageY"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let hit = self
             .client
             .send_on(
                 &self.session_id,
-                "Runtime.callFunctionOn",
+                "DOM.getNodeForLocation",
                 json!({
-                    "objectId": obj,
-                    "arguments": [{ "value": x }, { "value": y }],
-                    "returnByValue": true,
-                    "functionDeclaration": r#"function(x, y){
-                        const hit = document.elementFromPoint(x, y);
-                        if (!hit) return false;
-                        return this === hit || this.contains(hit);
-                    }"#,
+                    "x": (x + page_x).round() as i64,
+                    "y": (y + page_y).round() as i64,
+                }),
+            )
+            .await
+            .map_err(|error| {
+                BrowserError::Protocol(format!("DOM hit-test failed at ({x:.2}, {y:.2}): {error}"))
+            })?;
+        let Some(hit_backend) = hit.get("backendNodeId").and_then(Value::as_i64) else {
+            return Ok(false);
+        };
+        if hit_backend == backend {
+            return Ok(true);
+        }
+
+        let relatives = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Accessibility.getPartialAXTree",
+                json!({
+                    "backendNodeId": hit_backend,
+                    "fetchRelatives": true,
                 }),
             )
             .await?;
-        Ok(res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true))
+        Ok(relatives
+            .get("nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|nodes| ax_hit_has_backend_ancestor(nodes, hit_backend, backend)))
     }
 
     /// Resolve a backend node to a Runtime objectId (for JS calls on it).
@@ -1587,55 +1645,303 @@ impl Page {
     /// Click an element inside an iframe with trusted browser-generated pointer
     /// input. `frame_selector` may chain multiple
     /// CSS selectors with `>>` to descend through nested iframes (e.g.
-    /// `"iframe.wrapper >> iframe.popup"`). Same-origin frames are resolved
-    /// with isolated-world DOM access; if a cross-origin boundary is
-    /// hit, resolution automatically falls back to CDP (`Page.getFrameTree` +
-    /// `Page.createIsolatedWorld`), which is not subject to the Same-Origin
-    /// Policy. The resolved element box is translated into top-level viewport
-    /// coordinates before CDP mouse press/release events are dispatched.
+    /// `"iframe.wrapper >> iframe.popup"`). Each frame is entered through an
+    /// isolated CDP execution context, including OOPIF targets. The final CSS
+    /// selector is queried against the document and every CDP-exposed shadow
+    /// root, so open and closed shadow trees are supported. The resolved box is
+    /// translated into top-level viewport coordinates before trusted input is
+    /// dispatched.
     pub async fn iframe_click(&self, frame_selector: &str, selector: &str) -> Result<()> {
         let chain = require_frame_chain(frame_selector)?;
-        // The first pass brings every frame and the target into view. A deep
-        // target scroll can move an ancestor browsing context, so resolve once
-        // more after scrolling and dispatch only from the stable coordinates.
-        self.descend_and_act_with_session(&chain, selector, &FrameAction::Point)
+        let target = self.iframe_pointer_target(&chain, selector).await?;
+        if target.session_id == self.session_id {
+            self.trusted_click_at(target.root_point.0, target.root_point.1)
+                .await
+        } else {
+            self.trusted_frame_click_at(&target.session_id, target.root_point, target.frame_point)
+                .await
+        }
+    }
+
+    /// Hover an element inside an iframe with trusted browser-generated pointer
+    /// input. Selector resolution pierces open and closed shadow roots through
+    /// CDP, matching [`iframe_click`](Self::iframe_click).
+    pub async fn iframe_hover(&self, frame_selector: &str, selector: &str) -> Result<()> {
+        let chain = require_frame_chain(frame_selector)?;
+        let target = self.iframe_pointer_target(&chain, selector).await?;
+        self.trusted_frame_hover_at(&target.session_id, target.root_point, target.frame_point)
+            .await
+    }
+
+    async fn iframe_pointer_target(
+        &self,
+        chain: &[&str],
+        selector: &str,
+    ) -> Result<FramePointerTarget> {
+        // A target scroll can move an ancestor browsing context. Resolve and
+        // scroll once, then repeat the full chain before using coordinates.
+        let (context, _) = self.resolve_frame_chain_for_pointer(chain).await?;
+        self.frame_selector_point(&context, selector).await?;
+        let (context, root_offset) = self.resolve_frame_chain_for_pointer(chain).await?;
+        let (frame_point, half_size) = self.frame_selector_point(&context, selector).await?;
+        let frame_point = (
+            frame_point.0 + off_center(half_size.0),
+            frame_point.1 + off_center(half_size.1),
+        );
+        Ok(FramePointerTarget {
+            session_id: context.session_id,
+            root_point: (root_offset.0 + frame_point.0, root_offset.1 + frame_point.1),
+            frame_point,
+        })
+    }
+
+    async fn resolve_frame_chain_for_pointer(
+        &self,
+        chain: &[&str],
+    ) -> Result<(FrameExecutionContext, (f64, f64))> {
+        let mut context: Option<FrameExecutionContext> = None;
+        let mut root_offset = (0.0, 0.0);
+        for selector in chain {
+            let js = build_frame_element_js(&[selector], 0);
+            let remote = self.eval_remote(&js, context.as_ref()).await?;
+            let result = remote
+                .get("result")
+                .ok_or_else(|| BrowserError::Protocol("iframe query returned no result".into()))?;
+            let object_id = result
+                .get("objectId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrowserError::Protocol(format!(
+                        "iframe element `{selector}` did not return a remote object"
+                    ))
+                })?;
+            let session_id = context
+                .as_ref()
+                .map(|value| value.session_id.as_str())
+                .unwrap_or(&self.session_id);
+            let rect = self
+                .client
+                .send_on(
+                    session_id,
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function() { this.scrollIntoView({block:'center',inline:'center'}); const r=this.getBoundingClientRect(); return {x:r.left+(this.clientLeft||0),y:r.top+(this.clientTop||0)}; }",
+                        "returnByValue": true,
+                    }),
+                )
+                .await?;
+            let desc = self
+                .client
+                .send_on(
+                    session_id,
+                    "DOM.describeNode",
+                    json!({ "objectId": object_id }),
+                )
+                .await;
+            let _ = self
+                .client
+                .send_on(
+                    session_id,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": object_id }),
+                )
+                .await;
+            let rect = rect.pointer("/result/value").ok_or_else(|| {
+                BrowserError::Protocol(format!("iframe `{selector}` has no viewport box"))
+            })?;
+            root_offset.0 += rect.get("x").and_then(Value::as_f64).ok_or_else(|| {
+                BrowserError::Protocol(format!("iframe `{selector}` has no viewport x"))
+            })?;
+            root_offset.1 += rect.get("y").and_then(Value::as_f64).ok_or_else(|| {
+                BrowserError::Protocol(format!("iframe `{selector}` has no viewport y"))
+            })?;
+            let frame_id = desc?
+                .pointer("/node/frameId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrowserError::Protocol(format!(
+                        "iframe element `{selector}` has no CDP frame id"
+                    ))
+                })?
+                .to_string();
+            context = Some(
+                self.create_isolated_world_for_frame(&frame_id, session_id)
+                    .await?,
+            );
+        }
+        context
+            .map(|value| (value, root_offset))
+            .ok_or_else(|| BrowserError::Protocol("iframe chain is empty".into()))
+    }
+
+    async fn frame_selector_point(
+        &self,
+        context: &FrameExecutionContext,
+        selector: &str,
+    ) -> Result<((f64, f64), (f64, f64))> {
+        let backend = self
+            .backend_for_piercing_selector(context, selector)
+            .await?
+            .ok_or_else(|| BrowserError::Protocol(format!("element not found: {selector}")))?;
+        self.client
+            .send_on(
+                &context.session_id,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "backendNodeId": backend }),
+            )
             .await?;
-        let (point, session_id) = self
-            .descend_and_act_with_session(&chain, selector, &FrameAction::Point)
+        tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
+        let resolved = self
+            .client
+            .send_on(
+                &context.session_id,
+                "DOM.resolveNode",
+                json!({
+                    "backendNodeId": backend,
+                    "executionContextId": context.context_id,
+                }),
+            )
             .await?;
-        let x = point
-            .get("x")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| BrowserError::Protocol("iframe target has no viewport x".into()))?;
-        let y = point
-            .get("y")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| BrowserError::Protocol("iframe target has no viewport y".into()))?;
-        let half_width = point
-            .get("halfWidth")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let half_height = point
+        let object_id = resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Protocol("iframe target did not resolve".into()))?;
+        let rect = self
+            .client
+            .send_on(
+                &context.session_id,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": "function() { const r=this.getBoundingClientRect(); return {x:r.left+r.width/2,y:r.top+r.height/2,halfWidth:r.width/2,halfHeight:r.height/2}; }",
+                    "returnByValue": true,
+                }),
+            )
+            .await;
+        let _ = self
+            .client
+            .send_on(
+                &context.session_id,
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+            )
+            .await;
+        let rect = rect?
+            .pointer("/result/value")
+            .cloned()
+            .ok_or_else(|| BrowserError::Protocol("iframe target has no viewport box".into()))?;
+        let width = rect.get("halfWidth").and_then(Value::as_f64).unwrap_or(0.0);
+        let height = rect
             .get("halfHeight")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
-        let dx = off_center(half_width);
-        let dy = off_center(half_height);
-        let root_point = (x + dx, y + dy);
-        if session_id == self.session_id {
-            self.trusted_click_at(root_point.0, root_point.1).await
-        } else {
-            let local_x = point
-                .get("localX")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| BrowserError::Protocol("iframe target has no local x".into()))?;
-            let local_y = point
-                .get("localY")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| BrowserError::Protocol("iframe target has no local y".into()))?;
-            self.trusted_frame_click_at(&session_id, root_point, (local_x + dx, local_y + dy))
-                .await
+        if width <= 0.0 || height <= 0.0 {
+            return Err(BrowserError::Protocol(
+                "iframe target has no visible box".into(),
+            ));
         }
+        Ok((
+            (
+                rect.get("x").and_then(Value::as_f64).ok_or_else(|| {
+                    BrowserError::Protocol("iframe target has no viewport x".into())
+                })?,
+                rect.get("y").and_then(Value::as_f64).ok_or_else(|| {
+                    BrowserError::Protocol("iframe target has no viewport y".into())
+                })?,
+            ),
+            (width, height),
+        ))
+    }
+
+    async fn backend_for_piercing_selector(
+        &self,
+        context: &FrameExecutionContext,
+        selector: &str,
+    ) -> Result<Option<i64>> {
+        // Populate frontend node ids, then describe this frame's exact document
+        // with `pierce` so closed shadow roots are represented as query roots.
+        self.client
+            .send_on(
+                &context.session_id,
+                "DOM.getDocument",
+                json!({ "depth": 0, "pierce": true }),
+            )
+            .await?;
+        let remote = self.eval_remote("document", Some(context)).await?;
+        let object_id = remote
+            .pointer("/result/objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BrowserError::Protocol("frame document did not resolve".into()))?;
+        let described = self
+            .client
+            .send_on(
+                &context.session_id,
+                "DOM.describeNode",
+                json!({ "objectId": object_id, "depth": -1, "pierce": true }),
+            )
+            .await;
+        let _ = self
+            .client
+            .send_on(
+                &context.session_id,
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+            )
+            .await;
+        let described = described?;
+        let root = described
+            .get("node")
+            .ok_or_else(|| BrowserError::Protocol("frame document has no DOM node".into()))?;
+        let mut root_backends = Vec::new();
+        collect_piercing_query_roots(root, true, &mut root_backends);
+        let pushed = self
+            .client
+            .send_on(
+                &context.session_id,
+                "DOM.pushNodesByBackendIdsToFrontend",
+                json!({ "backendNodeIds": root_backends }),
+            )
+            .await?;
+        let roots = pushed
+            .get("nodeIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_i64)
+            .filter(|node_id| *node_id != 0);
+        for node_id in roots {
+            let result = self
+                .client
+                .send_on(
+                    &context.session_id,
+                    "DOM.querySelector",
+                    json!({ "nodeId": node_id, "selector": selector }),
+                )
+                .await
+                .map_err(|error| {
+                    BrowserError::Protocol(format!(
+                        "failed to query iframe DOM root {node_id} for {selector:?}: {error}"
+                    ))
+                })?;
+            let Some(node_id) = result
+                .get("nodeId")
+                .and_then(Value::as_i64)
+                .filter(|value| *value != 0)
+            else {
+                continue;
+            };
+            let node = self
+                .client
+                .send_on(
+                    &context.session_id,
+                    "DOM.describeNode",
+                    json!({ "nodeId": node_id }),
+                )
+                .await?;
+            return Ok(node.pointer("/node/backendNodeId").and_then(Value::as_i64));
+        }
+        Ok(None)
     }
 
     /// Focus an input inside a same-origin, cross-origin, or OOPIF iframe and
@@ -1716,39 +2022,19 @@ impl Page {
     ) -> Result<(Value, String)> {
         let mut context: Option<FrameExecutionContext> = None;
         let mut remaining: Vec<&str> = chain.to_vec();
-        let mut root_offset_x = 0.0;
-        let mut root_offset_y = 0.0;
         // Bound the loop: at most one CDP hop per chain element, plus one.
         for _ in 0..=chain.len() {
             let js = build_descend_js(&remaining, selector, action);
-            let mut result = match context.as_ref() {
+            let result = match context.as_ref() {
                 None => self.evaluate(&js).await?,
                 Some(ctx) => self.eval_with_context(&js, ctx).await?,
             };
             if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                if matches!(action, FrameAction::Point) {
-                    let local_x = result.get("x").and_then(Value::as_f64).ok_or_else(|| {
-                        BrowserError::Protocol("iframe point result has no x".into())
-                    })?;
-                    let local_y = result.get("y").and_then(Value::as_f64).ok_or_else(|| {
-                        BrowserError::Protocol("iframe point result has no y".into())
-                    })?;
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert("localX".into(), json!(local_x));
-                        object.insert("localY".into(), json!(local_y));
-                        object.insert("x".into(), json!(root_offset_x + local_x));
-                        object.insert("y".into(), json!(root_offset_y + local_y));
-                    }
-                }
                 let session_id = context
                     .as_ref()
                     .map(|ctx| ctx.session_id.clone())
                     .unwrap_or_else(|| self.session_id.clone());
                 return Ok((result, session_id));
-            }
-            if matches!(action, FrameAction::Point) {
-                root_offset_x += result.get("offsetX").and_then(Value::as_f64).unwrap_or(0.0);
-                root_offset_y += result.get("offsetY").and_then(Value::as_f64).unwrap_or(0.0);
             }
             let index = result.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let src = result
@@ -2147,21 +2433,11 @@ impl Page {
     }
 
     async fn press_key_on(&self, session_id: &str, key: &str) -> Result<()> {
-        let (event_key, code, vk) = match key {
-            "Enter" => (key, "Enter", 13),
-            "Tab" => (key, "Tab", 9),
-            "Escape" => (key, "Escape", 27),
-            "Backspace" => (key, "Backspace", 8),
-            "ArrowDown" => (key, "ArrowDown", 40),
-            "ArrowUp" => (key, "ArrowUp", 38),
-            "Home" => (key, "Home", 36),
-            "End" => (key, "End", 35),
-            _ if key.chars().count() == 1 => {
-                let (code, vk) = us_qwerty_key(key.chars().next().unwrap());
-                (key, code, vk)
-            }
-            _ => (key, "", 0),
-        };
+        if let Some(combo) = parse_key_combo(key)? {
+            return self.dispatch_key_combo(session_id, combo).await;
+        }
+
+        let (event_key, code, vk) = key_definition(key);
         self.client
             .send_on(
                 session_id,
@@ -2189,6 +2465,80 @@ impl Page {
                 }),
             )
             .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
+        Ok(())
+    }
+
+    async fn dispatch_key_combo(&self, session_id: &str, combo: KeyCombo<'_>) -> Result<()> {
+        let mut modifiers = 0;
+        for modifier in &combo.modifiers {
+            modifiers |= modifier.mask();
+            self.client
+                .send_on(
+                    session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "rawKeyDown",
+                        "key": modifier.key(),
+                        "code": modifier.code(),
+                        "windowsVirtualKeyCode": modifier.windows_vk(),
+                        "modifiers": modifiers,
+                    }),
+                )
+                .await?;
+        }
+
+        let (event_key, code, vk) = key_definition(combo.key);
+        // CDP key events bypass Chrome's native UI accelerator routing. Attach
+        // the matching editor command so Copy/Paste reaches the OS clipboard.
+        let commands = shortcut_command(&combo.modifiers, combo.key)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "rawKeyDown",
+                    "key": event_key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "modifiers": modifiers,
+                    "commands": commands,
+                }),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(25, 95))).await;
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": event_key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "modifiers": modifiers,
+                }),
+            )
+            .await?;
+
+        for modifier in combo.modifiers.iter().rev() {
+            modifiers &= !modifier.mask();
+            self.client
+                .send_on(
+                    session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "keyUp",
+                        "key": modifier.key(),
+                        "code": modifier.code(),
+                        "windowsVirtualKeyCode": modifier.windows_vk(),
+                        "modifiers": modifiers,
+                    }),
+                )
+                .await?;
+        }
         tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
         Ok(())
     }
@@ -3038,6 +3388,137 @@ fn needs_shift(ch: char) -> bool {
     ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyModifier {
+    Alt,
+    Control,
+    Meta,
+    Shift,
+}
+
+impl KeyModifier {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "Alt" | "Option" => Some(Self::Alt),
+            "Control" | "Ctrl" => Some(Self::Control),
+            "Meta" | "Cmd" | "Command" => Some(Self::Meta),
+            "Shift" => Some(Self::Shift),
+            _ => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Alt => "Alt",
+            Self::Control => "Control",
+            Self::Meta => "Meta",
+            Self::Shift => "Shift",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Alt => "AltLeft",
+            Self::Control => "ControlLeft",
+            Self::Meta => "MetaLeft",
+            Self::Shift => "ShiftLeft",
+        }
+    }
+
+    fn windows_vk(self) -> u32 {
+        match self {
+            Self::Alt => 18,
+            Self::Control => 17,
+            Self::Meta => 91,
+            Self::Shift => 16,
+        }
+    }
+
+    fn mask(self) -> u32 {
+        match self {
+            Self::Alt => 1,
+            Self::Control => 2,
+            Self::Meta => 4,
+            Self::Shift => 8,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct KeyCombo<'a> {
+    modifiers: Vec<KeyModifier>,
+    key: &'a str,
+}
+
+fn parse_key_combo(key: &str) -> Result<Option<KeyCombo<'_>>> {
+    if !key.contains('+') {
+        return Ok(None);
+    }
+
+    let mut parts = key.split('+').collect::<Vec<_>>();
+    let event_key = parts
+        .pop()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| BrowserError::Protocol(format!("invalid key combo: {key}")))?;
+    let mut modifiers = Vec::with_capacity(parts.len());
+    for part in parts {
+        let modifier = KeyModifier::parse(part)
+            .ok_or_else(|| BrowserError::Protocol(format!("unknown key modifier: {part}")))?;
+        if modifiers.contains(&modifier) {
+            return Err(BrowserError::Protocol(format!(
+                "duplicate key modifier: {part}"
+            )));
+        }
+        modifiers.push(modifier);
+    }
+    if modifiers.is_empty() {
+        return Err(BrowserError::Protocol(format!("invalid key combo: {key}")));
+    }
+    Ok(Some(KeyCombo {
+        modifiers,
+        key: event_key,
+    }))
+}
+
+fn key_definition(key: &str) -> (&str, &'static str, u32) {
+    match key {
+        "Enter" => (key, "Enter", 13),
+        "Tab" => (key, "Tab", 9),
+        "Escape" => (key, "Escape", 27),
+        "Backspace" => (key, "Backspace", 8),
+        "Delete" => (key, "Delete", 46),
+        "ArrowDown" => (key, "ArrowDown", 40),
+        "ArrowUp" => (key, "ArrowUp", 38),
+        "ArrowLeft" => (key, "ArrowLeft", 37),
+        "ArrowRight" => (key, "ArrowRight", 39),
+        "Home" => (key, "Home", 36),
+        "End" => (key, "End", 35),
+        _ if key.chars().count() == 1 => {
+            let (code, vk) = us_qwerty_key(key.chars().next().expect("one character checked"));
+            (key, code, vk)
+        }
+        _ => (key, "", 0),
+    }
+}
+
+fn shortcut_command(modifiers: &[KeyModifier], key: &str) -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    let primary = KeyModifier::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let primary = KeyModifier::Control;
+
+    if modifiers != [primary] {
+        return None;
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "a" => Some("SelectAll"),
+        "c" => Some("Copy"),
+        "v" => Some("Paste"),
+        "x" => Some("Cut"),
+        _ => None,
+    }
+}
+
 fn us_qwerty_key(ch: char) -> (&'static str, u32) {
     match ch {
         'a' | 'A' => ("KeyA", 65),
@@ -3206,10 +3687,12 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_verified, build_descend_js, build_frame_element_js, require_frame_chain,
-        resolve_frame_id, split_frame_chain, us_qwerty_key, uses_insert_text, FrameAction,
-        ReadMode,
+        activation_verified, ax_hit_has_backend_ancestor, build_descend_js, build_frame_element_js,
+        collect_piercing_query_roots, parse_key_combo, require_frame_chain, resolve_frame_id,
+        shortcut_command, split_frame_chain, us_qwerty_key, uses_insert_text, FrameAction,
+        KeyCombo, KeyModifier, ReadMode,
     };
+    use serde_json::json;
 
     #[test]
     fn long_text_uses_atomic_trusted_insertion_by_unicode_character_count() {
@@ -3229,10 +3712,66 @@ mod tests {
     }
 
     #[test]
+    fn key_combo_parser_maps_aliases_and_cdp_modifier_bits() {
+        assert_eq!(
+            parse_key_combo("Meta+c").unwrap(),
+            Some(KeyCombo {
+                modifiers: vec![KeyModifier::Meta],
+                key: "c",
+            })
+        );
+        assert_eq!(
+            parse_key_combo("Control+Shift+v").unwrap(),
+            Some(KeyCombo {
+                modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+                key: "v",
+            })
+        );
+        assert_eq!(KeyModifier::Alt.mask(), 1);
+        assert_eq!(KeyModifier::Control.mask(), 2);
+        assert_eq!(KeyModifier::Meta.mask(), 4);
+        assert_eq!(KeyModifier::Shift.mask(), 8);
+        assert!(parse_key_combo("Enter").unwrap().is_none());
+        assert!(parse_key_combo("Meta+").is_err());
+        assert!(parse_key_combo("Hyper+c").is_err());
+    }
+
+    #[test]
+    fn primary_clipboard_shortcuts_map_to_cdp_editor_commands() {
+        #[cfg(target_os = "macos")]
+        let primary = KeyModifier::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let primary = KeyModifier::Control;
+
+        assert_eq!(shortcut_command(&[primary], "a"), Some("SelectAll"));
+        assert_eq!(shortcut_command(&[primary], "c"), Some("Copy"));
+        assert_eq!(shortcut_command(&[primary], "v"), Some("Paste"));
+        assert_eq!(shortcut_command(&[primary], "x"), Some("Cut"));
+        assert_eq!(shortcut_command(&[primary], "q"), None);
+        assert_eq!(shortcut_command(&[primary, KeyModifier::Shift], "v"), None);
+    }
+
+    #[test]
     fn activation_requires_visible_and_focused_document() {
         assert!(activation_verified("visible", true));
         assert!(!activation_verified("visible", false));
         assert!(!activation_verified("hidden", true));
+    }
+
+    #[test]
+    fn ax_relatives_follow_ancestors_without_accepting_siblings() {
+        let nodes = serde_json::json!([
+            { "nodeId": "hit", "parentId": "target", "backendDOMNodeId": 21 },
+            { "nodeId": "target", "parentId": "root", "backendDOMNodeId": 10 },
+            { "nodeId": "sibling", "parentId": "target", "backendDOMNodeId": 99 },
+            { "nodeId": "root", "backendDOMNodeId": 1 }
+        ]);
+        let nodes = nodes.as_array().unwrap();
+
+        assert!(ax_hit_has_backend_ancestor(nodes, 21, 10));
+        assert!(ax_hit_has_backend_ancestor(nodes, 21, 1));
+        assert!(!ax_hit_has_backend_ancestor(nodes, 21, 99));
+        assert!(!ax_hit_has_backend_ancestor(nodes, 21, 404));
     }
 
     #[test]
@@ -3254,28 +3793,6 @@ mod tests {
         // empty selectors that would blow up `document.querySelector("")`.
         assert_eq!(split_frame_chain(">> iframe.a >>"), vec!["iframe.a"]);
         assert_eq!(split_frame_chain(""), Vec::<&str>::new());
-    }
-
-    #[test]
-    fn descend_js_locates_iframe_target_without_synthetic_clicks() {
-        let js = build_descend_js(&["iframe#f"], "button#go", &FrameAction::Point);
-        assert!(js.contains(r#"["iframe#f"]"#));
-        assert!(js.contains(r#"querySelector("button#go")"#));
-        assert!(js.contains("getBoundingClientRect"));
-        assert!(js.contains("offsetX"));
-        assert!(!js.contains("el.click();"));
-        assert!(!js.contains("dispatchEvent"));
-        assert!(js.contains("ok: false"));
-        assert!(js.contains("ok:true"));
-    }
-
-    #[test]
-    fn point_lookup_on_current_document_returns_a_box_only() {
-        let js = build_descend_js(&[], "button#go", &FrameAction::Point);
-        assert!(js.contains(r#"const chain = [];"#));
-        assert!(js.contains("halfWidth"));
-        assert!(js.contains("halfHeight"));
-        assert!(!js.contains("dispatchEvent"));
     }
 
     #[test]
@@ -3324,6 +3841,30 @@ mod tests {
         let js = build_frame_element_js(&["iframe.inner-wrapper", "iframe.payment"], 1);
         assert!(js.contains(r#"["iframe.inner-wrapper","iframe.payment"]"#));
         assert!(!js.contains("iframe.same-origin"));
+    }
+
+    #[test]
+    fn piercing_query_roots_include_nested_shadow_roots_not_child_frames() {
+        let tree = json!({
+            "backendNodeId": 1,
+            "children": [{
+                "backendNodeId": 2,
+                "shadowRoots": [{
+                    "backendNodeId": 3,
+                    "children": [{
+                        "backendNodeId": 4,
+                        "shadowRoots": [{"backendNodeId": 5}]
+                    }]
+                }],
+                "contentDocument": {
+                    "backendNodeId": 6,
+                    "shadowRoots": [{"backendNodeId": 7}]
+                }
+            }]
+        });
+        let mut roots = Vec::new();
+        collect_piercing_query_roots(&tree, true, &mut roots);
+        assert_eq!(roots, vec![1, 3, 5]);
     }
 
     #[test]

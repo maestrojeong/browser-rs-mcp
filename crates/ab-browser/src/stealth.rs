@@ -144,12 +144,56 @@ pub const STEALTH_INIT_SCRIPT: &str = r#"
         };
       }, 'connect');
       const sendMessage = mark(function sendMessage() {}, 'sendMessage');
+      // Real Chrome exposes these frozen extension-API enums on chrome.runtime
+      // even with no extension installed. A shim that stops at connect/
+      // sendMessage/onMessage is a detectable "half a chrome.runtime".
+      const enumObj = (values) => Object.freeze({ ...values });
       window.chrome.runtime = {
         id: undefined,
         connect,
         sendMessage,
         onMessage: listener(),
         onConnect: listener(),
+        OnInstalledReason: enumObj({
+          INSTALL: 'install',
+          UPDATE: 'update',
+          CHROME_UPDATE: 'chrome_update',
+          SHARED_MODULE_UPDATE: 'shared_module_update',
+        }),
+        OnRestartRequiredReason: enumObj({
+          APP_UPDATE: 'app_update',
+          OS_UPDATE: 'os_update',
+          PERIODIC: 'periodic',
+        }),
+        PlatformArch: enumObj({
+          ARM: 'arm',
+          ARM64: 'arm64',
+          MIPS: 'mips',
+          MIPS64: 'mips64',
+          X86_32: 'x86-32',
+          X86_64: 'x86-64',
+        }),
+        PlatformNaclArch: enumObj({
+          ARM: 'arm',
+          MIPS: 'mips',
+          MIPS64: 'mips64',
+          PNACL: 'pnacl',
+          X86_32: 'x86-32',
+          X86_64: 'x86-64',
+        }),
+        PlatformOs: enumObj({
+          ANDROID: 'android',
+          CROS: 'cros',
+          LINUX: 'linux',
+          MAC: 'mac',
+          OPENBSD: 'openbsd',
+          WIN: 'win',
+        }),
+        RequestUpdateCheckStatus: enumObj({
+          THROTTLED: 'throttled',
+          NO_UPDATE: 'no_update',
+          UPDATE_AVAILABLE: 'update_available',
+        }),
       };
     }
     if (!window.chrome.csi) {
