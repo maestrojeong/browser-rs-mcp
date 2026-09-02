@@ -10,7 +10,7 @@
 browser-rs is a lightweight, stealth-oriented browser MCP server. It lets
 multiple AI agents share one logged-in Chrome — each agent controls only its
 own tabs — for parallel scraping, web automation, and QA without every agent
-spinning up its own browser. 67 Playwright-style tools, one Rust binary, no
+spinning up its own browser. 68 Playwright-style tools, one Rust binary, no
 Node.js runtime.
 
 ```mermaid
@@ -389,11 +389,11 @@ allowlist and cannot override strict mode.
 
 ## Tools
 
-MCP implements 67 `browser_*` tools; strict mode advertises 66 by default:
+MCP implements 68 `browser_*` tools; strict mode advertises 67 by default:
 
 **Navigation and inspection:** `browser_navigate` · `browser_new_page` · `browser_snapshot` · `browser_activate_page` · `browser_read` · `browser_get_visible_html` · `browser_get_visible_text` · `browser_find` · `browser_take_screenshot` · `browser_save_pdf` · `browser_pages` · `browser_tabs` · `browser_switch_page` · `browser_profile` · `browser_status`
 
-**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_type` · `browser_iframe_read` · `browser_close_page` · `browser_close`
+**Interaction:** `browser_click` · `browser_pointer` · `browser_wheel` · `browser_type` · `browser_cancel_typing` · `browser_press_key` · `browser_hover` · `browser_select_option` · `browser_fill_form` · `browser_drag` · `browser_file_upload` · `browser_navigate_back` · `browser_wait_for` · `browser_resize` · `browser_evaluate` · `browser_run_code_unsafe` · `browser_iframe_click` · `browser_iframe_hover` · `browser_iframe_type` · `browser_iframe_read` · `browser_close_page` · `browser_close`
 
 Use `browser_activate_page({ "page": "p5" })` before automating a background
 tab whose site throttles lazy loading. It calls CDP `Target.activateTarget`,
@@ -407,8 +407,10 @@ v0.2 has no synthetic `input_route`.
 atomic insertion for paste/IME-like text of 30 characters or more.
 `browser_iframe_type` applies the same input behavior after focusing the target
 inside a nested iframe chain and routes OOPIF input through that frame's CDP
-session. `browser_iframe_click` similarly uses trusted pointer input, while
-`browser_select_option` performs native select type-ahead with trusted keys.
+session. `browser_iframe_click` and `browser_iframe_hover` use trusted pointer
+input and resolve selectors through open or closed shadow roots inside the
+target frame. `browser_select_option` performs native select type-ahead with
+trusted keys.
 `browser_cancel_typing` stops active typing started with `wait: false`; text
 already entered remains.
 

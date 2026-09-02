@@ -337,6 +337,33 @@ impl Page {
         self.left_click_at_on(session_id, frame_point.0, frame_point.1)
             .await
     }
+
+    pub(crate) async fn trusted_frame_hover_at(
+        &self,
+        session_id: &str,
+        root_point: (f64, f64),
+        frame_point: (f64, f64),
+    ) -> Result<()> {
+        for value in [root_point.0, root_point.1, frame_point.0, frame_point.1] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(BrowserError::Protocol(
+                    "trusted frame hover coordinates must be finite and non-negative".into(),
+                ));
+            }
+        }
+        let _mutation = self.pointer_mutation.lock().await;
+        self.human_move_to(root_point.0, root_point.1).await?;
+        if session_id != self.session_id {
+            self.client
+                .send_on(
+                    session_id,
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": frame_point.0, "y": frame_point.1 }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn same_document(origin: &ElementRef, destination: &ElementRef) -> bool {

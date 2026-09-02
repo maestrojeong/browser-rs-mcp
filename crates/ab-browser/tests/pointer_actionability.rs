@@ -70,6 +70,7 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
       <button id="vanish">Vanish on hover</button>
       <button id="replace">Replace after first click</button>
       <div id="replace-status">replace pending</div>
+      <iframe id="action-frame" style="width: 360px; height: 180px;"></iframe>
       <script>
         const nested = document.querySelector('#nested');
         const nestedStatus = document.querySelector('#nested-status');
@@ -105,6 +106,35 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
           replacement.textContent = 'Replacement';
           replace.replaceWith(replacement);
         }, {once: true});
+
+        const frame = document.querySelector('#action-frame');
+        frame.srcdoc = `<!doctype html>
+          <style>
+            body { margin: 0; font: 16px sans-serif; }
+            button { width: 220px; height: 48px; margin: 8px; }
+          </style>
+          <div id="shadow-host"></div>
+          <div id="status">iframe pending</div>
+          <script>
+            const status = document.querySelector('#status');
+            const root = document.querySelector('#shadow-host').attachShadow({mode: 'closed'});
+            const direct = document.createElement('button');
+            direct.id = 'shadow-direct';
+            direct.textContent = 'Iframe shadow action';
+            direct.addEventListener('click', () => status.textContent = 'iframe shadow clicked');
+            const menu = document.createElement('div');
+            const trigger = document.createElement('button');
+            trigger.id = 'menu-trigger';
+            trigger.textContent = 'Iframe payment method';
+            const option = document.createElement('button');
+            option.id = 'menu-option';
+            option.textContent = 'Iframe Kakao Pay';
+            option.style.display = 'none';
+            trigger.addEventListener('mouseenter', () => option.style.display = 'block');
+            option.addEventListener('click', () => status.textContent = 'iframe menu clicked');
+            menu.append(trigger, option);
+            root.append(direct, menu);
+          <\/script>`;
       </script>"#;
     let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
     let browser = Browser::launch(LaunchOptions {
@@ -194,6 +224,21 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         .await?
         .text
         .contains("first click dispatched"));
+
+    page.iframe_click("#action-frame", "#shadow-direct").await?;
+    assert_eq!(
+        page.iframe_read("#action-frame", "#status", ab_browser::ReadMode::Text)
+            .await?,
+        "iframe shadow clicked"
+    );
+
+    page.iframe_hover("#action-frame", "#menu-trigger").await?;
+    page.iframe_click("#action-frame", "#menu-option").await?;
+    assert_eq!(
+        page.iframe_read("#action-frame", "#status", ab_browser::ReadMode::Text)
+            .await?,
+        "iframe menu clicked"
+    );
 
     browser.close().await;
     Ok(())
