@@ -2433,21 +2433,11 @@ impl Page {
     }
 
     async fn press_key_on(&self, session_id: &str, key: &str) -> Result<()> {
-        let (event_key, code, vk) = match key {
-            "Enter" => (key, "Enter", 13),
-            "Tab" => (key, "Tab", 9),
-            "Escape" => (key, "Escape", 27),
-            "Backspace" => (key, "Backspace", 8),
-            "ArrowDown" => (key, "ArrowDown", 40),
-            "ArrowUp" => (key, "ArrowUp", 38),
-            "Home" => (key, "Home", 36),
-            "End" => (key, "End", 35),
-            _ if key.chars().count() == 1 => {
-                let (code, vk) = us_qwerty_key(key.chars().next().unwrap());
-                (key, code, vk)
-            }
-            _ => (key, "", 0),
-        };
+        if let Some(combo) = parse_key_combo(key)? {
+            return self.dispatch_key_combo(session_id, combo).await;
+        }
+
+        let (event_key, code, vk) = key_definition(key);
         self.client
             .send_on(
                 session_id,
@@ -2475,6 +2465,80 @@ impl Page {
                 }),
             )
             .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
+        Ok(())
+    }
+
+    async fn dispatch_key_combo(&self, session_id: &str, combo: KeyCombo<'_>) -> Result<()> {
+        let mut modifiers = 0;
+        for modifier in &combo.modifiers {
+            modifiers |= modifier.mask();
+            self.client
+                .send_on(
+                    session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "rawKeyDown",
+                        "key": modifier.key(),
+                        "code": modifier.code(),
+                        "windowsVirtualKeyCode": modifier.windows_vk(),
+                        "modifiers": modifiers,
+                    }),
+                )
+                .await?;
+        }
+
+        let (event_key, code, vk) = key_definition(combo.key);
+        // CDP key events bypass Chrome's native UI accelerator routing. Attach
+        // the matching editor command so Copy/Paste reaches the OS clipboard.
+        let commands = shortcut_command(&combo.modifiers, combo.key)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "rawKeyDown",
+                    "key": event_key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "modifiers": modifiers,
+                    "commands": commands,
+                }),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(rand_u64(25, 95))).await;
+        self.client
+            .send_on(
+                session_id,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": event_key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "modifiers": modifiers,
+                }),
+            )
+            .await?;
+
+        for modifier in combo.modifiers.iter().rev() {
+            modifiers &= !modifier.mask();
+            self.client
+                .send_on(
+                    session_id,
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "keyUp",
+                        "key": modifier.key(),
+                        "code": modifier.code(),
+                        "windowsVirtualKeyCode": modifier.windows_vk(),
+                        "modifiers": modifiers,
+                    }),
+                )
+                .await?;
+        }
         tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
         Ok(())
     }
@@ -3324,6 +3388,137 @@ fn needs_shift(ch: char) -> bool {
     ch.is_ascii_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyModifier {
+    Alt,
+    Control,
+    Meta,
+    Shift,
+}
+
+impl KeyModifier {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "Alt" | "Option" => Some(Self::Alt),
+            "Control" | "Ctrl" => Some(Self::Control),
+            "Meta" | "Cmd" | "Command" => Some(Self::Meta),
+            "Shift" => Some(Self::Shift),
+            _ => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Alt => "Alt",
+            Self::Control => "Control",
+            Self::Meta => "Meta",
+            Self::Shift => "Shift",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Alt => "AltLeft",
+            Self::Control => "ControlLeft",
+            Self::Meta => "MetaLeft",
+            Self::Shift => "ShiftLeft",
+        }
+    }
+
+    fn windows_vk(self) -> u32 {
+        match self {
+            Self::Alt => 18,
+            Self::Control => 17,
+            Self::Meta => 91,
+            Self::Shift => 16,
+        }
+    }
+
+    fn mask(self) -> u32 {
+        match self {
+            Self::Alt => 1,
+            Self::Control => 2,
+            Self::Meta => 4,
+            Self::Shift => 8,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct KeyCombo<'a> {
+    modifiers: Vec<KeyModifier>,
+    key: &'a str,
+}
+
+fn parse_key_combo(key: &str) -> Result<Option<KeyCombo<'_>>> {
+    if !key.contains('+') {
+        return Ok(None);
+    }
+
+    let mut parts = key.split('+').collect::<Vec<_>>();
+    let event_key = parts
+        .pop()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| BrowserError::Protocol(format!("invalid key combo: {key}")))?;
+    let mut modifiers = Vec::with_capacity(parts.len());
+    for part in parts {
+        let modifier = KeyModifier::parse(part)
+            .ok_or_else(|| BrowserError::Protocol(format!("unknown key modifier: {part}")))?;
+        if modifiers.contains(&modifier) {
+            return Err(BrowserError::Protocol(format!(
+                "duplicate key modifier: {part}"
+            )));
+        }
+        modifiers.push(modifier);
+    }
+    if modifiers.is_empty() {
+        return Err(BrowserError::Protocol(format!("invalid key combo: {key}")));
+    }
+    Ok(Some(KeyCombo {
+        modifiers,
+        key: event_key,
+    }))
+}
+
+fn key_definition(key: &str) -> (&str, &'static str, u32) {
+    match key {
+        "Enter" => (key, "Enter", 13),
+        "Tab" => (key, "Tab", 9),
+        "Escape" => (key, "Escape", 27),
+        "Backspace" => (key, "Backspace", 8),
+        "Delete" => (key, "Delete", 46),
+        "ArrowDown" => (key, "ArrowDown", 40),
+        "ArrowUp" => (key, "ArrowUp", 38),
+        "ArrowLeft" => (key, "ArrowLeft", 37),
+        "ArrowRight" => (key, "ArrowRight", 39),
+        "Home" => (key, "Home", 36),
+        "End" => (key, "End", 35),
+        _ if key.chars().count() == 1 => {
+            let (code, vk) = us_qwerty_key(key.chars().next().expect("one character checked"));
+            (key, code, vk)
+        }
+        _ => (key, "", 0),
+    }
+}
+
+fn shortcut_command(modifiers: &[KeyModifier], key: &str) -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    let primary = KeyModifier::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let primary = KeyModifier::Control;
+
+    if modifiers != [primary] {
+        return None;
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "a" => Some("SelectAll"),
+        "c" => Some("Copy"),
+        "v" => Some("Paste"),
+        "x" => Some("Cut"),
+        _ => None,
+    }
+}
+
 fn us_qwerty_key(ch: char) -> (&'static str, u32) {
     match ch {
         'a' | 'A' => ("KeyA", 65),
@@ -3493,8 +3688,9 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 mod tests {
     use super::{
         activation_verified, ax_hit_has_backend_ancestor, build_descend_js, build_frame_element_js,
-        collect_piercing_query_roots, require_frame_chain, resolve_frame_id, split_frame_chain,
-        us_qwerty_key, uses_insert_text, FrameAction, ReadMode,
+        collect_piercing_query_roots, parse_key_combo, require_frame_chain, resolve_frame_id,
+        shortcut_command, split_frame_chain, us_qwerty_key, uses_insert_text, FrameAction,
+        KeyCombo, KeyModifier, ReadMode,
     };
     use serde_json::json;
 
@@ -3513,6 +3709,46 @@ mod tests {
         assert_eq!(us_qwerty_key('!'), ("Digit1", 49));
         assert_eq!(us_qwerty_key('?'), ("Slash", 191));
         assert_eq!(us_qwerty_key('한'), ("", 0));
+    }
+
+    #[test]
+    fn key_combo_parser_maps_aliases_and_cdp_modifier_bits() {
+        assert_eq!(
+            parse_key_combo("Meta+c").unwrap(),
+            Some(KeyCombo {
+                modifiers: vec![KeyModifier::Meta],
+                key: "c",
+            })
+        );
+        assert_eq!(
+            parse_key_combo("Control+Shift+v").unwrap(),
+            Some(KeyCombo {
+                modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+                key: "v",
+            })
+        );
+        assert_eq!(KeyModifier::Alt.mask(), 1);
+        assert_eq!(KeyModifier::Control.mask(), 2);
+        assert_eq!(KeyModifier::Meta.mask(), 4);
+        assert_eq!(KeyModifier::Shift.mask(), 8);
+        assert!(parse_key_combo("Enter").unwrap().is_none());
+        assert!(parse_key_combo("Meta+").is_err());
+        assert!(parse_key_combo("Hyper+c").is_err());
+    }
+
+    #[test]
+    fn primary_clipboard_shortcuts_map_to_cdp_editor_commands() {
+        #[cfg(target_os = "macos")]
+        let primary = KeyModifier::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let primary = KeyModifier::Control;
+
+        assert_eq!(shortcut_command(&[primary], "a"), Some("SelectAll"));
+        assert_eq!(shortcut_command(&[primary], "c"), Some("Copy"));
+        assert_eq!(shortcut_command(&[primary], "v"), Some("Paste"));
+        assert_eq!(shortcut_command(&[primary], "x"), Some("Cut"));
+        assert_eq!(shortcut_command(&[primary], "q"), None);
+        assert_eq!(shortcut_command(&[primary, KeyModifier::Shift], "v"), None);
     }
 
     #[test]

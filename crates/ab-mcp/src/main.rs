@@ -407,7 +407,7 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PressArgs {
     page: String,
-    /// Key name: Enter, Tab, Escape, Backspace, ArrowUp, ArrowDown, or a character.
+    /// Key name or modifier combo, such as Enter, Meta+c, or Control+Shift+v.
     key: String,
     /// Optionally focus this ref/selector before pressing.
     #[serde(default, rename = "ref")]
@@ -1462,7 +1462,9 @@ impl BrowserServer {
     }
 
     /// Press a named key on a page, then report what changed.
-    #[tool(description = "Press a key (Enter, Tab, Escape, ...); returns settle-diff")]
+    #[tool(
+        description = "Press a key or modifier combo (Enter, Meta+c, Control+v, ...); returns settle-diff"
+    )]
     async fn browser_press_key(
         &self,
         Parameters(a): Parameters<PressArgs>,
