@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.1 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.2 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,28 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.2.1)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.2.2)</strong></summary>
+
+**v0.2.2 — closed-shadow/iframe hit-testing, real clipboard, chrome.runtime
+fidelity.** Actionability hit-testing (used before every ref-based click) is
+now Runtime-free and pierces closed shadow roots — including inside iframes —
+via `Page.getLayoutMetrics` + `DOM.getNodeForLocation` +
+`Accessibility.getPartialAXTree`, instead of a main-world
+`document.elementFromPoint` call that always failed for closed-shadow targets.
+The same target is re-verified immediately before every `mousePressed` (not
+just once before the human-like travel), so a hover-menu closing mid-move
+fails loudly instead of silently pressing the wrong element.
+`browser_iframe_click` gained the same closed-shadow-piercing resolution, and
+a new `browser_iframe_hover` tool lets a hover-to-reveal menu inside an
+iframe open without any manual coordinate math. Modifier-combo key dispatch
+(`Meta+c`, `Ctrl+v`, …) now attaches the matching `Input.dispatchKeyEvent`
+`commands` (Copy/Paste/Cut/SelectAll) — CDP-synthesized key events bypass
+Chrome's native UI accelerator table, so Copy/Paste never reached the real OS
+clipboard without this. The `chrome.runtime` shim gained the six frozen
+extension-API enums (`OnInstalledReason`, `OnRestartRequiredReason`,
+`PlatformArch`, `PlatformNaclArch`, `PlatformOs`, `RequestUpdateCheckStatus`)
+real Chrome exposes even with no extension installed — their total absence
+was previously the single biggest passive-fingerprint tell.
 
 **v0.2.1 — input-layer and stealth hardening.** Character key events now carry
 a real US-QWERTY `code`/`windowsVirtualKeyCode`/`nativeVirtualKeyCode` alongside
