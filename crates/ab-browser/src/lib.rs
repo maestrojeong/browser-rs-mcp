@@ -1026,6 +1026,25 @@ impl Page {
     }
 }
 
+fn ax_hit_has_backend_ancestor(nodes: &[Value], hit_backend: i64, target_backend: i64) -> bool {
+    let mut current = nodes
+        .iter()
+        .find(|node| node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(hit_backend));
+    for _ in 0..nodes.len() {
+        let Some(node) = current else { return false };
+        if node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(target_backend) {
+            return true;
+        }
+        let Some(parent_id) = node.get("parentId").and_then(Value::as_str) else {
+            return false;
+        };
+        current = nodes
+            .iter()
+            .find(|candidate| candidate.get("nodeId").and_then(Value::as_str) == Some(parent_id));
+    }
+    false
+}
+
 /// Actions driven by an accessibility `[ref]` (its backendDOMNodeId).
 impl Page {
     /// Resolve the on-screen center of a node from its box model.
@@ -1140,37 +1159,63 @@ impl Page {
         self.evaluate(&js).await
     }
 
-    /// Actionability hit-test: is the target node (or a descendant of it)
-    /// actually the element at viewport point (x, y)? Playwright does this before
-    /// every click so an overlay/animation covering the target doesn't steal the
-    /// click. Returns Ok(true) if the point lands on the target, Ok(false) if it
-    /// is occluded, Err only on a protocol failure (caller may then assume true).
+    /// Actionability hit-test using only browser protocol domains, avoiding
+    /// main-world Runtime execution that a page can observe. Returns true when
+    /// the point lands on the target or its accessibility ancestor chain.
     async fn point_hits_node(&self, backend: i64, x: f64, y: f64) -> Result<bool> {
-        let Some(obj) = self.resolve_object(backend).await? else {
-            return Ok(true);
-        };
-        let res = self
+        // Input events use viewport coordinates, while DOM.getNodeForLocation
+        // expects document coordinates.
+        let metrics = self
+            .client
+            .send_on(&self.session_id, "Page.getLayoutMetrics", json!({}))
+            .await?;
+        let viewport = metrics
+            .get("cssVisualViewport")
+            .or_else(|| metrics.get("visualViewport"));
+        let page_x = viewport
+            .and_then(|value| value.get("pageX"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let page_y = viewport
+            .and_then(|value| value.get("pageY"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let hit = self
             .client
             .send_on(
                 &self.session_id,
-                "Runtime.callFunctionOn",
+                "DOM.getNodeForLocation",
                 json!({
-                    "objectId": obj,
-                    "arguments": [{ "value": x }, { "value": y }],
-                    "returnByValue": true,
-                    "functionDeclaration": r#"function(x, y){
-                        const hit = document.elementFromPoint(x, y);
-                        if (!hit) return false;
-                        return this === hit || this.contains(hit);
-                    }"#,
+                    "x": (x + page_x).round() as i64,
+                    "y": (y + page_y).round() as i64,
+                }),
+            )
+            .await
+            .map_err(|error| {
+                BrowserError::Protocol(format!("DOM hit-test failed at ({x:.2}, {y:.2}): {error}"))
+            })?;
+        let Some(hit_backend) = hit.get("backendNodeId").and_then(Value::as_i64) else {
+            return Ok(false);
+        };
+        if hit_backend == backend {
+            return Ok(true);
+        }
+
+        let relatives = self
+            .client
+            .send_on(
+                &self.session_id,
+                "Accessibility.getPartialAXTree",
+                json!({
+                    "backendNodeId": hit_backend,
+                    "fetchRelatives": true,
                 }),
             )
             .await?;
-        Ok(res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true))
+        Ok(relatives
+            .get("nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|nodes| ax_hit_has_backend_ancestor(nodes, hit_backend, backend)))
     }
 
     /// Resolve a backend node to a Runtime objectId (for JS calls on it).
@@ -3206,9 +3251,9 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_verified, build_descend_js, build_frame_element_js, require_frame_chain,
-        resolve_frame_id, split_frame_chain, us_qwerty_key, uses_insert_text, FrameAction,
-        ReadMode,
+        activation_verified, ax_hit_has_backend_ancestor, build_descend_js, build_frame_element_js,
+        require_frame_chain, resolve_frame_id, split_frame_chain, us_qwerty_key, uses_insert_text,
+        FrameAction, ReadMode,
     };
 
     #[test]
@@ -3233,6 +3278,22 @@ mod tests {
         assert!(activation_verified("visible", true));
         assert!(!activation_verified("visible", false));
         assert!(!activation_verified("hidden", true));
+    }
+
+    #[test]
+    fn ax_relatives_follow_ancestors_without_accepting_siblings() {
+        let nodes = serde_json::json!([
+            { "nodeId": "hit", "parentId": "target", "backendDOMNodeId": 21 },
+            { "nodeId": "target", "parentId": "root", "backendDOMNodeId": 10 },
+            { "nodeId": "sibling", "parentId": "target", "backendDOMNodeId": 99 },
+            { "nodeId": "root", "backendDOMNodeId": 1 }
+        ]);
+        let nodes = nodes.as_array().unwrap();
+
+        assert!(ax_hit_has_backend_ancestor(nodes, 21, 10));
+        assert!(ax_hit_has_backend_ancestor(nodes, 21, 1));
+        assert!(!ax_hit_has_backend_ancestor(nodes, 21, 99));
+        assert!(!ax_hit_has_backend_ancestor(nodes, 21, 404));
     }
 
     #[test]

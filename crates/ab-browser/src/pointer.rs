@@ -128,11 +128,20 @@ impl Page {
 
         match request.action {
             PointerAction::Click => {
-                self.left_click_at(x, y).await?;
+                tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+                self.require_click_target_after_move(&request.origin, (x, y))
+                    .await?;
+                self.mouse_button("mousePressed", x, y, "left", 1, 1)
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
+                self.mouse_button("mouseReleased", x, y, "left", 0, 1)
+                    .await?;
             }
             PointerAction::Hover => {}
             PointerAction::RightClick => {
                 tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+                self.require_click_target_after_move(&request.origin, (x, y))
+                    .await?;
                 self.mouse_button("mousePressed", x, y, "right", 2, 1)
                     .await?;
                 tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
@@ -141,6 +150,8 @@ impl Page {
             }
             PointerAction::DoubleClick => {
                 for count in [1, 2] {
+                    self.require_click_target_after_move(&request.origin, (x, y))
+                        .await?;
                     self.mouse_button("mousePressed", x, y, "left", 1, count)
                         .await?;
                     tokio::time::sleep(Duration::from_millis(rand_u64(35, 95))).await;
@@ -219,7 +230,29 @@ impl Page {
                 .await?
             {
                 return Err(BrowserError::Protocol(
-                    "drag endpoint is outside the visible hit target".into(),
+                    "pointer target is outside the visible hit area".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Humanized travel can leave a hover-sensitive container and close its
+    /// menu. Re-check element refs immediately before pressing so that failure
+    /// is reported instead of silently clicking whatever replaced the target.
+    async fn require_click_target_after_move(
+        &self,
+        location: &PointerLocation,
+        point: (f64, f64),
+    ) -> Result<()> {
+        if let PointerLocation::Element(element) = location {
+            if !self
+                .point_hits_node(element.backend_node_id, point.0, point.1)
+                .await?
+            {
+                return Err(BrowserError::Protocol(
+                    "pointer target moved, closed, or became occluded before the click landed; retry with a fresh ref"
+                        .into(),
                 ));
             }
         }
