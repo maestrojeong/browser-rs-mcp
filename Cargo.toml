@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ab-cdp", "crates/ab-browser", "crates/ab-mcp"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -28,6 +28,7 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 rand = "0.8"
+rand_distr = "0.4"
 tokio-util = "0.7"
 tempfile = "3"
 rmcp = { version = "2.2", features = ["server", "transport-io", "transport-streamable-http-server"] }

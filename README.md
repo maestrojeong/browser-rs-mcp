@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.2.2 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.3.0 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,29 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.2.2)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.3.0)</strong></summary>
+
+**v0.3.0 — native page APIs and grounded input models.** browser-rs no longer
+injects a pre-document JavaScript stealth script. A real Chrome now exposes its
+native `chrome`, Screen, Permissions, SpeechSynthesis, WebGL, plugin, language,
+device-memory, and window geometry surfaces without page-level shims or a
+`Function.prototype.toString` proxy. The process-level
+`AutomationControlled` suppression remains, as does the headless-only user
+agent normalization.
+
+Input behavior no longer has the fixed signatures from v0.2.x. Typing versus
+paste delivery follows a session-stable logistic random-utility model instead
+of switching deterministically at 30 characters. Pointer duration follows
+Fitts's law with log-normal variation, trajectories use minimum-jerk progress
+with correlated lateral noise, and click points use a center-biased truncated
+normal distribution. Dragging replaces the fixed eight linear moves with
+`4 + Binomial(8, sigmoid((ID - 3) / 1.2))`, bounding each drag to 4–12
+`mouseMoved` events based on Fitts index of difficulty. Positive key, click,
+and event-interval timings use bounded log-normal distributions instead of
+flat bounded-uniform ranges. The built-in fingerprint check now treats the
+native absence of `chrome.runtime`, asynchronous voice loading, and
+`Notification.permission=default` / Permissions state `prompt` as valid Chrome
+behavior.
 
 **v0.2.2 — closed-shadow/iframe hit-testing, real clipboard, chrome.runtime
 fidelity.** Actionability hit-testing (used before every ref-based click) is
@@ -464,8 +486,9 @@ browser-rs --port 9321 [options]    # HTTP MCP transport
 `--port` enables HTTP mode; without it, the server uses stdio. The equivalent
 environment variables are `AB_HTTP`, `AB_PROFILE`, `AB_HEADLESS`, `AB_CONNECT`,
 `AB_NO_STEALTH`, `AB_CHROME`, and `AB_ALLOW_DETECTABLE_TOOLS`. Set
-`AB_NO_STEALTH=1` to disable initialization-script injection for launched
-browsers; `--connect` browsers are always left untouched.
+`AB_NO_STEALTH=1` to disable headless user-agent normalization for launched
+browsers; browser-rs does not inject page-level stealth shims, and `--connect`
+browsers are always left untouched.
 `AB_HTTP_CAPABILITY` protects HTTP/SSE requests with `X-Browser-Capability`
 and is required for non-loopback binds.
 

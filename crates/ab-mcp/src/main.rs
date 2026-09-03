@@ -716,11 +716,11 @@ struct DragArgs {
     target_selector: Option<String>,
 }
 
-/// Build the browser per environment. Default: headful, real profile, and the
-/// self-guarding JS stealth layer. Overrides:
+/// Build the browser per environment. Default: headful, real profile, and
+/// native browser-visible APIs. Overrides:
 ///   AB_CONNECT=<port>  attach to a Chrome the user already launched (strongest)
 ///   AB_HEADLESS=1      run headless (a strong fingerprint tell)
-///   AB_NO_STEALTH=1    disable stealth injection for launched browsers
+///   AB_NO_STEALTH=1    disable headless user-agent normalization
 ///   AB_PROFILE=<dir>   persistent profile location
 async fn make_browser() -> ab_browser::Result<Browser> {
     if let Ok(port) = std::env::var("AB_CONNECT") {
@@ -2216,14 +2216,12 @@ impl BrowserServer {
             "connect"
         } else if std::env::var("AB_HEADLESS").is_ok() {
             if std::env::var("AB_NO_STEALTH").is_ok() {
-                "headless (stealth disabled)"
+                "headless (native user agent)"
             } else {
-                "headless+stealth"
+                "headless (user agent normalized)"
             }
-        } else if std::env::var("AB_NO_STEALTH").is_ok() {
-            "headful (stealth disabled)"
         } else {
-            "headful+stealth"
+            "headful (native page APIs)"
         };
         let detectable_diagnostics = if self.allow_detectable_tools {
             "allowed (explicit opt-in)"
@@ -2636,6 +2634,7 @@ impl BrowserServer {
                 webglVendor,
                 webglRenderer,
                 softwareWebgl: /swiftshader|llvmpipe|software|mesa/i.test(webglVendor + ' ' + webglRenderer),
+                hasSpeechSynthesis: 'speechSynthesis' in window,
                 voices: speechSynthesis ? speechSynthesis.getVoices().length : 0,
                 notificationPermission,
                 notificationQuery,
@@ -2674,8 +2673,8 @@ impl BrowserServer {
             "window.chrome present".into(),
         ));
         checks.push((
-            get("hasChromeRuntime").as_bool().unwrap_or(false),
-            "chrome.runtime present".into(),
+            !get("hasChromeRuntime").as_bool().unwrap_or(true),
+            "chrome.runtime absent on a normal web page".into(),
         ));
         let headless = get("headlessUA").as_bool().unwrap_or(false);
         checks.push((!headless, format!("headless in UA = {headless}")));
@@ -2687,7 +2686,10 @@ impl BrowserServer {
             format!("WebGL = {webgl_vendor} / {webgl_renderer}"),
         ));
         let voices = get("voices").as_u64().unwrap_or(0);
-        checks.push((voices > 0, format!("speechSynthesis voices = {voices}")));
+        checks.push((
+            get("hasSpeechSynthesis").as_bool().unwrap_or(false),
+            format!("speechSynthesis native voices = {voices} (may load asynchronously)"),
+        ));
         let notification_permission = get("notificationPermission")
             .as_str()
             .unwrap_or("unavailable")
@@ -2696,9 +2698,13 @@ impl BrowserServer {
             .as_str()
             .unwrap_or("unavailable")
             .to_string();
+        let expected_notification_query = match notification_permission.as_str() {
+            "default" => "prompt",
+            other => other,
+        };
         checks.push((
             notification_permission != "unavailable"
-                && notification_permission == notification_query,
+                && expected_notification_query == notification_query,
             format!(
                 "Notification.permission/query = {notification_permission}/{notification_query}"
             ),
