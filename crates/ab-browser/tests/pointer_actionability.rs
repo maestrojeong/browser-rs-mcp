@@ -70,6 +70,9 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
       <button id="vanish">Vanish on hover</button>
       <button id="replace">Replace after first click</button>
       <div id="replace-status">replace pending</div>
+      <button id="drag-source">Drag source</button>
+      <button id="drag-target">Drag target</button>
+      <div id="drag-status">drag pending</div>
       <iframe id="action-frame" style="width: 360px; height: 180px;"></iframe>
       <script>
         const nested = document.querySelector('#nested');
@@ -81,6 +84,8 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         const vanish = document.querySelector('#vanish');
         const replace = document.querySelector('#replace');
         const replaceStatus = document.querySelector('#replace-status');
+        const dragSource = document.querySelector('#drag-source');
+        const dragStatus = document.querySelector('#drag-status');
         nested.addEventListener('click', () => nestedStatus.textContent = 'nested clicked');
 
         const root = document.querySelector('#shadow-host').attachShadow({mode: 'closed'});
@@ -106,6 +111,18 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
           replacement.textContent = 'Replacement';
           replace.replaceWith(replacement);
         }, {once: true});
+
+        let dragMoves = 0;
+        dragSource.addEventListener('pointerdown', event => {
+          dragMoves = 0;
+          dragSource.setPointerCapture(event.pointerId);
+        });
+        dragSource.addEventListener('pointermove', event => {
+          if (event.buttons === 1) dragMoves += 1;
+        });
+        dragSource.addEventListener('pointerup', () => {
+          dragStatus.textContent = `dragged with ${dragMoves} moves`;
+        });
 
         const frame = document.querySelector('#action-frame');
         frame.srcdoc = `<!doctype html>
@@ -137,8 +154,10 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
           <\/script>`;
       </script>"#;
     let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let profile = tempfile::tempdir()?;
     let browser = Browser::launch(LaunchOptions {
         headless: true,
+        user_data_dir: Some(profile.path().to_path_buf()),
         ..Default::default()
     })
     .await?;
@@ -224,6 +243,30 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         .await?
         .text
         .contains("first click dispatched"));
+
+    let snapshot = page.snapshot().await?;
+    page.dispatch_pointer(&PointerRequest {
+        action: PointerAction::Drag,
+        origin: PointerLocation::Element(element(&snapshot, "Drag source")?),
+        destination: Some(PointerLocation::Element(element(&snapshot, "Drag target")?)),
+        delta_x: 0.0,
+        delta_y: 0.0,
+    })
+    .await?;
+    let drag_snapshot = snapshot_after(&page, 50).await?;
+    let drag_status = drag_snapshot
+        .text
+        .lines()
+        .find(|line| line.contains("dragged with"))
+        .ok_or_else(|| anyhow::anyhow!("drag status was not updated"))?;
+    let drag_moves: usize = drag_status
+        .split_whitespace()
+        .find_map(|part| part.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("drag move count missing: {drag_status}"))?;
+    assert!(
+        (4..=12).contains(&drag_moves),
+        "drag move count escaped bounded binomial range: {drag_status}"
+    );
 
     page.iframe_click("#action-frame", "#shadow-direct").await?;
     assert_eq!(

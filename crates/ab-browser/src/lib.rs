@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ab_cdp::CdpClient;
+use rand::thread_rng;
+use rand_distr::{Binomial, Distribution, LogNormal, Normal};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
@@ -111,9 +113,7 @@ pub struct LaunchOptions {
     /// Headless is a strong fingerprint tell. Off by default — a real headful
     /// window on real hardware is what makes the fingerprint match a human's.
     pub headless: bool,
-    /// Inject the self-guarding JS stealth layer into launched browsers.
-    /// Enabled by default for both headful and headless launches; callers can
-    /// disable it when an entirely untouched browser surface is required.
+    /// Enable the headless-only user-agent normalization.
     pub inject_stealth: bool,
     pub chrome_path: Option<PathBuf>,
     /// Persistent profile directory. A stable, aged profile (cookies, history)
@@ -145,8 +145,26 @@ pub struct Browser {
     child: Option<Child>,
     /// UA override applied to new pages (only set in headless+stealth mode).
     user_agent: String,
-    /// Whether to inject the JS stealth-patching layer into new pages.
+    /// Whether to normalize the user agent for headless pages.
     inject_stealth: bool,
+    input_profile: InputProfile,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InputProfile {
+    cadence_hz: f64,
+    paste_midpoint_chars: f64,
+    paste_slope: f64,
+}
+
+impl InputProfile {
+    fn sample() -> Self {
+        Self {
+            cadence_hz: sample_lognormal(90.0, 0.22).clamp(55.0, 144.0),
+            paste_midpoint_chars: sample_lognormal(30.0, 0.28).clamp(15.0, 70.0),
+            paste_slope: sample_lognormal(0.18, 0.16).clamp(0.10, 0.32),
+        }
+    }
 }
 
 impl Browser {
@@ -156,9 +174,9 @@ impl Browser {
 
     /// Launch Chrome and connect over CDP.
     ///
-    /// Default mode is headful with a persistent profile and the self-guarding
-    /// stealth initialization script. The `AutomationControlled` blink feature
-    /// is also disabled so `navigator.webdriver` is naturally false.
+    /// Default mode is headful with a persistent profile. Browser-visible
+    /// values remain native; the `AutomationControlled` blink feature is
+    /// disabled so `navigator.webdriver` is naturally false.
     pub async fn launch(opts: LaunchOptions) -> Result<Self> {
         let inject_stealth = opts.inject_stealth && std::env::var("AB_NO_STEALTH").is_err();
         let chrome = opts
@@ -244,6 +262,7 @@ impl Browser {
             child: Some(child),
             user_agent,
             inject_stealth,
+            input_profile: InputProfile::sample(),
         })
     }
 
@@ -263,6 +282,7 @@ impl Browser {
             child: None,
             user_agent: String::new(),
             inject_stealth: false,
+            input_profile: InputProfile::sample(),
         })
     }
 
@@ -279,11 +299,8 @@ impl Browser {
             .to_string();
 
         let page = self.attach_page(&target_id).await?;
-        if self.inject_stealth {
-            page.init_stealth().await?;
-            if !self.user_agent.is_empty() {
-                page.set_user_agent(&self.user_agent).await?;
-            }
+        if self.inject_stealth && !self.user_agent.is_empty() {
+            page.set_user_agent(&self.user_agent).await?;
         }
         if !url.is_empty() && url != "about:blank" {
             page.navigate(url).await?;
@@ -345,6 +362,7 @@ impl Browser {
             dialog: Arc::new(Mutex::new((true, None))),
             dialog_handler_started: Arc::new(AtomicBool::new(false)),
             routes: Arc::new(Mutex::new(RouteState::default())),
+            input_profile: self.input_profile,
         })
     }
 
@@ -619,6 +637,8 @@ pub struct Page {
     dialog_handler_started: Arc<AtomicBool>,
     /// Network mock rules + intercept-loop state.
     routes: Arc<Mutex<RouteState>>,
+    /// Stable latent input characteristics shared by all actions on this page.
+    input_profile: InputProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -731,18 +751,6 @@ impl Page {
 
     #[cfg(not(target_os = "macos"))]
     async fn bring_browser_process_to_front(&self) {}
-
-    async fn init_stealth(&self) -> Result<()> {
-        // Inject before any page script. Does NOT require Runtime.enable.
-        self.client
-            .send_on(
-                &self.session_id,
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": stealth::STEALTH_INIT_SCRIPT }),
-            )
-            .await?;
-        Ok(())
-    }
 
     /// Override the User-Agent for this page (session-scoped, not page-visible).
     pub async fn set_user_agent(&self, ua: &str) -> Result<()> {
@@ -1060,8 +1068,9 @@ fn collect_piercing_query_roots(node: &Value, include_node: bool, out: &mut Vec<
 
 /// Actions driven by an accessibility `[ref]` (its backendDOMNodeId).
 impl Page {
-    /// Resolve the on-screen center of a node from its box model.
-    async fn node_center(&self, backend: i64) -> Result<Option<(f64, f64)>> {
+    /// Resolve an interior click point and effective target width from a node's
+    /// box model. The width feeds the Fitts-law movement-time model.
+    async fn node_pointer_target(&self, backend: i64) -> Result<Option<(f64, f64, f64)>> {
         let res = self
             .client
             .send_on(
@@ -1100,7 +1109,11 @@ impl Page {
         let half_h = (ys.iter().cloned().fold(f64::MIN, f64::max)
             - ys.iter().cloned().fold(f64::MAX, f64::min))
             / 2.0;
-        Ok(Some((cx + off_center(half_w), cy + off_center(half_h))))
+        Ok(Some((
+            cx + centered_offset(half_w),
+            cy + centered_offset(half_h),
+            (half_w * 2.0).min(half_h * 2.0).max(8.0),
+        )))
     }
 
     /// Resolve a CSS selector to a backendDOMNodeId (for act-by-selector).
@@ -1274,14 +1287,10 @@ impl Page {
         }))
     }
 
-    /// Move the pointer to (x, y) like a human: a curved (cubic-Bézier) path
-    /// with many small steps (~1 per few px, matching a real ~60-120 Hz
-    /// pointer), an ease-in-out velocity profile, per-step jitter, and a final
-    /// settle. Behavioral detectors flag the sparse, uniform jumps a naive
-    /// automation makes; this produces dense, non-uniform, curved motion.
-    async fn human_move_to(&self, x: f64, y: f64) -> Result<()> {
-        // Continue from wherever the pointer currently is (continuous motion).
-        // On the very first move, begin from a plausible resting point.
+    /// Move the pointer to (x, y) along a curved path sampled at a variable
+    /// input cadence. Event count follows estimated movement time rather than
+    /// a fixed pixels-per-event ratio.
+    async fn human_move_to(&self, x: f64, y: f64, target_width: f64) -> Result<()> {
         let (sx, sy) = {
             let p = self.pointer.lock().unwrap();
             match *p {
@@ -1289,59 +1298,60 @@ impl Page {
                 None => (x - 120.0 + rand_f64(90.0), y - 90.0 + rand_f64(70.0)),
             }
         };
+        self.move_pointer_path(sx, sy, x, y, target_width, 0).await
+    }
+
+    /// Dispatch one pointer trajectory. `buttons` is zero for ordinary travel
+    /// and one while carrying an active left-button drag.
+    async fn move_pointer_path(
+        &self,
+        sx: f64,
+        sy: f64,
+        x: f64,
+        y: f64,
+        target_width: f64,
+        buttons: u8,
+    ) -> Result<()> {
         let dx = x - sx;
         let dy = y - sy;
         let dist = (dx * dx + dy * dy).sqrt().max(1.0);
-        // ~1 step per 3.5 px so even fast flicks stay dense (small per-event
-        // deltas, like a real 60-120 Hz pointer).
-        let steps = ((dist / 3.5) as usize).clamp(16, 120);
+        let drag_scale = if buttons == 0 { 1.0 } else { 1.15 };
+        let duration_ms =
+            fitts_duration_ms(dist, target_width) * sample_lognormal(1.0, 0.18) * drag_scale;
+        let index_of_difficulty = fitts_index_of_difficulty(dist, target_width);
+        let steps = if buttons == 0 {
+            movement_step_count(duration_ms, self.input_profile.cadence_hz)
+        } else {
+            drag_step_count(index_of_difficulty)
+        };
+        let cadence_ms = duration_ms / steps as f64;
 
-        // Perpendicular unit vector, for a curved (not straight) path.
+        // Correlated lateral deviation, tapered to zero at both endpoints.
         let nx = -dy / dist;
         let ny = dx / dist;
-        let bow = rand_f64(0.22 * dist); // curvature magnitude (signed)
-        let c1x = sx + dx * 0.3 + nx * bow;
-        let c1y = sy + dy * 0.3 + ny * bow;
-        let c2x = sx + dx * 0.7 + nx * bow * 0.6;
-        let c2y = sy + dy * 0.7 + ny * bow * 0.6;
+        let lateral_scale = if buttons == 0 { 0.08 } else { 0.04 };
+        let bow = sample_normal(0.0, (dist * lateral_scale).min(36.0));
+        let mut correlated_noise = 0.0;
 
         for i in 1..=steps {
-            let raw = i as f64 / steps as f64;
-            // ease-in-out → slow start, fast middle, slow end (human velocity)
-            let t = raw * raw * (3.0 - 2.0 * raw);
-            let mt = 1.0 - t;
-            let px = mt * mt * mt * sx
-                + 3.0 * mt * mt * t * c1x
-                + 3.0 * mt * t * t * c2x
-                + t * t * t * x
-                + rand_f64(1.1);
-            let py = mt * mt * mt * sy
-                + 3.0 * mt * mt * t * c1y
-                + 3.0 * mt * t * t * c2y
-                + t * t * t * y
-                + rand_f64(1.1);
-            self.client
-                .send_on(
-                    &self.session_id,
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseMoved", "x": px, "y": py }),
-                )
-                .await?;
-            // Occasional longer dwell, like a human hesitating mid-move.
-            let mut ms = rand_u64(3, 13);
-            if rand_u64(0, 100) < 8 {
-                ms += rand_u64(20, 70);
+            let u = i as f64 / steps as f64;
+            let progress = minimum_jerk(u);
+            let envelope = 4.0 * u * (1.0 - u);
+            correlated_noise = 0.82 * correlated_noise + sample_normal(0.0, 0.7);
+            let lateral = envelope * (bow + correlated_noise);
+            let px = sx + dx * progress + nx * lateral;
+            let py = sy + dy * progress + ny * lateral;
+            let mut params = json!({ "type": "mouseMoved", "x": px, "y": py });
+            if buttons != 0 {
+                params["button"] = json!("left");
+                params["buttons"] = json!(buttons);
             }
+            self.client
+                .send_on(&self.session_id, "Input.dispatchMouseEvent", params)
+                .await?;
+            let ms = sample_lognormal(cadence_ms, 0.16).clamp(2.0, 40.0) as u64;
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
-        // Land exactly on the target and remember it as the current position.
-        self.client
-            .send_on(
-                &self.session_id,
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": x, "y": y }),
-            )
-            .await?;
         *self.pointer.lock().unwrap() = Some((x, y));
         Ok(())
     }
@@ -1362,9 +1372,8 @@ impl Page {
         tokio::time::sleep(Duration::from_millis(rand_u64(30, 80))).await;
     }
 
-    /// Focus a node and enter text. Long text uses one trusted
-    /// `Input.insertText` command, matching a paste/IME-style workflow;
-    /// shorter text retains humanized per-character key events.
+    /// Focus a node and enter text. Delivery is selected from a smooth,
+    /// length-weighted mix of per-character key events and paste-style input.
     pub async fn type_text(&self, backend: i64, text: &str, clear: bool) -> Result<()> {
         self.type_text_cancellable(backend, text, clear, &CancellationToken::new())
             .await
@@ -1432,7 +1441,11 @@ impl Page {
         }
 
         ensure_typing_active(cancel)?;
-        if uses_insert_text(text) {
+        if should_paste_text(
+            text,
+            self.input_profile.paste_midpoint_chars,
+            self.input_profile.paste_slope,
+        ) {
             return self
                 .dispatch_paste_cancellable(session_id, text, cancel)
                 .await;
@@ -1461,7 +1474,10 @@ impl Page {
                     )
                     .await?;
                 shift_held = true;
-                if typing_delay(cancel, rand_u64(15, 45)).await.is_err() {
+                if typing_delay(cancel, sample_lognormal_ms(27.0, 0.28, 12, 70))
+                    .await
+                    .is_err()
+                {
                     self.release_shift_on(session_id).await?;
                     return Err(BrowserError::TypingCancelled);
                 }
@@ -1478,7 +1494,9 @@ impl Page {
                 )
                 .await?;
             // Key hold time (press duration), then release.
-            let cancelled = typing_delay(cancel, rand_u64(20, 90)).await.is_err();
+            let cancelled = typing_delay(cancel, sample_lognormal_ms(48.0, 0.35, 15, 140))
+                .await
+                .is_err();
             self.client
                 .send_on(
                     session_id,
@@ -1495,13 +1513,13 @@ impl Page {
             // Inter-key gap with real human burstiness (bimodal): most keys are
             // moderate, ~12% are fast bursts, ~18% are longer "thinking" pauses.
             // High variance is itself a human signal — metronomic typing is a tell.
-            let roll = rand_u64(0, 100);
-            let gap = if roll < 12 {
-                rand_u64(18, 55) // fast burst
-            } else if roll < 30 {
-                rand_u64(190, 560) // pause
+            let roll = rand::random::<f64>();
+            let gap = if roll < 0.12 {
+                sample_lognormal_ms(32.0, 0.28, 12, 80)
+            } else if roll < 0.30 {
+                sample_lognormal_ms(320.0, 0.38, 120, 900)
             } else {
-                rand_u64(55, 175) // normal
+                sample_lognormal_ms(105.0, 0.32, 35, 300)
             };
             if typing_delay(cancel, gap).await.is_err() {
                 if shift_held {
@@ -1523,7 +1541,7 @@ impl Page {
         cancel: &CancellationToken,
     ) -> Result<()> {
         ensure_typing_active(cancel)?;
-        typing_delay(cancel, rand_u64(90, 240)).await?;
+        typing_delay(cancel, sample_lognormal_ms(145.0, 0.30, 60, 400)).await?;
 
         #[cfg(target_os = "macos")]
         let (modifier_key, modifier_code, modifier_vk, modifiers) = ("Meta", "MetaLeft", 91, 4);
@@ -1538,7 +1556,10 @@ impl Page {
                 json!({ "type": "keyDown", "key": modifier_key, "code": modifier_code, "windowsVirtualKeyCode": modifier_vk, "nativeVirtualKeyCode": modifier_vk, "modifiers": modifiers }),
             )
             .await?;
-        if typing_delay(cancel, rand_u64(20, 55)).await.is_err() {
+        if typing_delay(cancel, sample_lognormal_ms(34.0, 0.28, 15, 90))
+            .await
+            .is_err()
+        {
             self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
                 .await?;
             return Err(BrowserError::TypingCancelled);
@@ -1551,7 +1572,9 @@ impl Page {
                 json!({ "type": "keyDown", "key": "v", "code": "KeyV", "windowsVirtualKeyCode": 86, "nativeVirtualKeyCode": 86, "modifiers": modifiers }),
             )
             .await?;
-        let cancelled = typing_delay(cancel, rand_u64(25, 75)).await.is_err();
+        let cancelled = typing_delay(cancel, sample_lognormal_ms(45.0, 0.30, 15, 120))
+            .await
+            .is_err();
         self.client
             .send_on(
                 session_id,
@@ -1565,7 +1588,10 @@ impl Page {
             return Err(BrowserError::TypingCancelled);
         }
 
-        if typing_delay(cancel, rand_u64(10, 35)).await.is_err() {
+        if typing_delay(cancel, sample_lognormal_ms(20.0, 0.28, 8, 60))
+            .await
+            .is_err()
+        {
             self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
                 .await?;
             return Err(BrowserError::TypingCancelled);
@@ -1685,8 +1711,8 @@ impl Page {
         let (context, root_offset) = self.resolve_frame_chain_for_pointer(chain).await?;
         let (frame_point, half_size) = self.frame_selector_point(&context, selector).await?;
         let frame_point = (
-            frame_point.0 + off_center(half_size.0),
-            frame_point.1 + off_center(half_size.1),
+            frame_point.0 + centered_offset(half_size.0),
+            frame_point.1 + centered_offset(half_size.1),
         );
         Ok(FramePointerTarget {
             session_id: context.session_id,
@@ -2451,7 +2477,10 @@ impl Page {
                 }),
             )
             .await?;
-        tokio::time::sleep(Duration::from_millis(rand_u64(25, 95))).await;
+        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+            48.0, 0.35, 15, 150,
+        )))
+        .await;
         self.client
             .send_on(
                 session_id,
@@ -2465,7 +2494,10 @@ impl Page {
                 }),
             )
             .await?;
-        tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
+        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+            82.0, 0.32, 25, 240,
+        )))
+        .await;
         Ok(())
     }
 
@@ -2508,7 +2540,10 @@ impl Page {
                 }),
             )
             .await?;
-        tokio::time::sleep(Duration::from_millis(rand_u64(25, 95))).await;
+        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+            48.0, 0.35, 15, 150,
+        )))
+        .await;
         self.client
             .send_on(
                 session_id,
@@ -2539,7 +2574,10 @@ impl Page {
                 )
                 .await?;
         }
-        tokio::time::sleep(Duration::from_millis(rand_u64(45, 140))).await;
+        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+            82.0, 0.32, 25, 240,
+        )))
+        .await;
         Ok(())
     }
 
@@ -3381,6 +3419,66 @@ fn rand_f64(spread: f64) -> f64 {
     (r * 2.0 - 1.0) * spread
 }
 
+fn sample_normal(mean: f64, std_dev: f64) -> f64 {
+    if std_dev <= f64::EPSILON {
+        return mean;
+    }
+    Normal::new(mean, std_dev)
+        .map(|distribution| distribution.sample(&mut thread_rng()))
+        .unwrap_or(mean)
+}
+
+/// Sample a positive multiplicative quantity around `median`.
+fn sample_lognormal(median: f64, sigma: f64) -> f64 {
+    if median <= 0.0 || sigma <= f64::EPSILON {
+        return median.max(0.0);
+    }
+    LogNormal::new(median.ln(), sigma)
+        .map(|distribution| distribution.sample(&mut thread_rng()))
+        .unwrap_or(median)
+}
+
+fn sample_lognormal_ms(median: f64, sigma: f64, min: u64, max: u64) -> u64 {
+    sample_lognormal(median, sigma)
+        .round()
+        .clamp(min as f64, max as f64) as u64
+}
+
+/// Shannon-form Fitts law for aimed movement. Target width prevents equal-
+/// distance moves toward large and tiny controls from sharing one duration.
+fn fitts_duration_ms(distance: f64, target_width: f64) -> f64 {
+    const INTERCEPT_MS: f64 = 80.0;
+    const SLOPE_MS_PER_BIT: f64 = 110.0;
+    let index_of_difficulty = fitts_index_of_difficulty(distance, target_width);
+    INTERCEPT_MS + SLOPE_MS_PER_BIT * index_of_difficulty
+}
+
+fn fitts_index_of_difficulty(distance: f64, target_width: f64) -> f64 {
+    (distance.max(0.0) / target_width.max(1.0) + 1.0).log2()
+}
+
+fn movement_step_count(duration_ms: f64, cadence_hz: f64) -> usize {
+    ((duration_ms.max(0.0) * cadence_hz.max(1.0) / 1_000.0).round() as usize).clamp(6, 96)
+}
+
+fn drag_step_probability(index_of_difficulty: f64) -> f64 {
+    1.0 / (1.0 + (-((index_of_difficulty - 3.0) / 1.2)).exp())
+}
+
+fn drag_step_count(index_of_difficulty: f64) -> usize {
+    let probability = drag_step_probability(index_of_difficulty).clamp(0.0, 1.0);
+    let extra = Binomial::new(8, probability)
+        .map(|distribution| distribution.sample(&mut thread_rng()) as usize)
+        .unwrap_or(0);
+    4 + extra
+}
+
+/// Minimum-jerk progress has zero velocity and acceleration at both endpoints.
+fn minimum_jerk(u: f64) -> f64 {
+    let u = u.clamp(0.0, 1.0);
+    10.0 * u.powi(3) - 15.0 * u.powi(4) + 6.0 * u.powi(5)
+}
+
 /// Whether producing this character on a US keyboard requires the Shift key
 /// (uppercase letters and the shifted symbol row). Typing e.g. '@' without a
 /// modifier is physically impossible for a human — a behavioral tell.
@@ -3573,11 +3671,23 @@ fn us_qwerty_key(ch: char) -> (&'static str, u32) {
     }
 }
 
-// Short strings are typed key-by-key; long strings are more plausibly pasted.
-const INSERT_TEXT_THRESHOLD: usize = 30;
+/// Binary random-utility choice: direct typing cost grows with length while
+/// paste cost is approximately constant, yielding a logistic choice curve.
+fn paste_probability(text_len: usize, midpoint_chars: f64, slope: f64) -> f64 {
+    if text_len == 0 {
+        return 0.0;
+    }
+    1.0 / (1.0 + (-slope * (text_len as f64 - midpoint_chars)).exp())
+}
 
-fn uses_insert_text(text: &str) -> bool {
-    text.chars().count() >= INSERT_TEXT_THRESHOLD
+fn should_paste_text_for_draw(text: &str, midpoint_chars: f64, slope: f64, draw: f64) -> bool {
+    debug_assert!((0.0..1.0).contains(&draw));
+    draw < paste_probability(text.chars().count(), midpoint_chars, slope)
+}
+
+fn should_paste_text(text: &str, midpoint_chars: f64, slope: f64) -> bool {
+    let draw = rand::random::<f64>();
+    should_paste_text_for_draw(text, midpoint_chars, slope, draw)
 }
 
 fn ensure_typing_active(cancel: &CancellationToken) -> Result<()> {
@@ -3595,16 +3705,10 @@ async fn typing_delay(cancel: &CancellationToken, millis: u64) -> Result<()> {
     }
 }
 
-/// A signed offset that is clearly *off* the center of a box axis: 12–40 % of
-/// the half-dimension, so clicks land inside the element but never on its exact
-/// center (which behavioral detectors flag).
-fn off_center(half: f64) -> f64 {
-    if half < 3.0 {
-        return rand_f64(half.max(0.0));
-    }
-    let frac = 0.12 + (rand_u64(0, 28) as f64) / 100.0; // 0.12..0.40
-    let sign = if rand_u64(0, 1) == 0 { -1.0 } else { 1.0 };
-    sign * frac * half
+/// Center-biased click location with tails truncated inside the hit box.
+fn centered_offset(half: f64) -> f64 {
+    let half = half.max(0.0);
+    sample_normal(0.0, half * 0.28).clamp(-half * 0.72, half * 0.72)
 }
 
 /// Minimal glob matcher supporting `*` (matches any run, including empty), to
@@ -3688,17 +3792,57 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 mod tests {
     use super::{
         activation_verified, ax_hit_has_backend_ancestor, build_descend_js, build_frame_element_js,
-        collect_piercing_query_roots, parse_key_combo, require_frame_chain, resolve_frame_id,
-        shortcut_command, split_frame_chain, us_qwerty_key, uses_insert_text, FrameAction,
-        KeyCombo, KeyModifier, ReadMode,
+        collect_piercing_query_roots, drag_step_probability, fitts_duration_ms, minimum_jerk,
+        movement_step_count, parse_key_combo, paste_probability, require_frame_chain,
+        resolve_frame_id, shortcut_command, should_paste_text_for_draw, split_frame_chain,
+        us_qwerty_key, FrameAction, KeyCombo, KeyModifier, ReadMode,
     };
     use serde_json::json;
 
     #[test]
-    fn long_text_uses_atomic_trusted_insertion_by_unicode_character_count() {
-        assert!(!uses_insert_text(&"한".repeat(29)));
-        assert!(uses_insert_text(&"한".repeat(30)));
-        assert!(uses_insert_text(&"a".repeat(30)));
+    fn logistic_paste_choice_is_centered_on_equal_cost() {
+        assert_eq!(paste_probability(0, 30.0, 0.18), 0.0);
+        assert!((paste_probability(30, 30.0, 0.18) - 0.5).abs() < f64::EPSILON);
+        assert!(paste_probability(20, 30.0, 0.18) < 0.15);
+        assert!(paste_probability(40, 30.0, 0.18) > 0.85);
+        assert!(should_paste_text_for_draw(
+            &"한".repeat(30),
+            30.0,
+            0.18,
+            0.499
+        ));
+        assert!(!should_paste_text_for_draw(
+            &"한".repeat(30),
+            30.0,
+            0.18,
+            0.5
+        ));
+    }
+
+    #[test]
+    fn fitts_sampling_accounts_for_distance_width_and_cadence() {
+        assert!(fitts_duration_ms(400.0, 20.0) > fitts_duration_ms(100.0, 20.0));
+        assert!(fitts_duration_ms(400.0, 20.0) > fitts_duration_ms(400.0, 100.0));
+        assert!(movement_step_count(420.0, 120.0) > movement_step_count(420.0, 60.0));
+    }
+
+    #[test]
+    fn drag_binomial_probability_tracks_fitts_difficulty() {
+        let easy = drag_step_probability(1.0);
+        let typical = drag_step_probability(3.0);
+        let hard = drag_step_probability(5.0);
+        assert!(easy < typical);
+        assert_eq!(typical, 0.5);
+        assert!(hard > typical);
+        assert!((4.0 + 8.0 * easy) < 6.0);
+        assert!((4.0 + 8.0 * hard) > 10.0);
+    }
+
+    #[test]
+    fn minimum_jerk_has_exact_endpoints_and_midpoint() {
+        assert_eq!(minimum_jerk(0.0), 0.0);
+        assert_eq!(minimum_jerk(0.5), 0.5);
+        assert_eq!(minimum_jerk(1.0), 1.0);
     }
 
     #[test]

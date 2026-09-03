@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{rand_u64, BrowserError, ElementRef, Page, Result};
+use crate::{sample_lognormal_ms, BrowserError, ElementRef, Page, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,12 +91,12 @@ impl Page {
         Ok(())
     }
 
-    async fn point_for_location(&self, location: &PointerLocation) -> Result<(f64, f64)> {
+    async fn point_for_location(&self, location: &PointerLocation) -> Result<(f64, f64, f64)> {
         match location {
-            PointerLocation::Coordinates { x, y } => Ok((*x, *y)),
+            PointerLocation::Coordinates { x, y } => Ok((*x, *y, 24.0)),
             PointerLocation::Element(element) => {
                 self.scroll_into_view(element.backend_node_id).await;
-                self.node_center(element.backend_node_id)
+                self.node_pointer_target(element.backend_node_id)
                     .await?
                     .ok_or_else(|| {
                         BrowserError::Protocol("pointer target has no layout box".into())
@@ -106,7 +106,7 @@ impl Page {
     }
 
     async fn dispatch_trusted_pointer(&self, request: &PointerRequest) -> Result<PointerOutcome> {
-        let ((x, y), drag_destination) = if request.action == PointerAction::Drag {
+        let ((x, y, target_width), drag_destination) = if request.action == PointerAction::Drag {
             let destination = request.destination.as_ref().expect("validated drag");
             if let PointerLocation::Element(element) = destination {
                 self.scroll_into_view(element.backend_node_id).await;
@@ -116,35 +116,51 @@ impl Page {
             }
             let origin = self.point_without_scroll(&request.origin).await?;
             let destination = self.point_without_scroll(destination).await?;
-            self.require_visible_hit(&request.origin, origin).await?;
-            self.require_visible_hit(request.destination.as_ref().unwrap(), destination)
+            self.require_visible_hit(&request.origin, (origin.0, origin.1))
                 .await?;
+            self.require_visible_hit(
+                request.destination.as_ref().unwrap(),
+                (destination.0, destination.1),
+            )
+            .await?;
             (origin, Some(destination))
         } else {
             (self.point_for_location(&request.origin).await?, None)
         };
         self.require_visible_hit(&request.origin, (x, y)).await?;
-        self.human_move_to(x, y).await?;
+        self.human_move_to(x, y, target_width).await?;
 
         match request.action {
             PointerAction::Click => {
-                tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+                tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+                    34.0, 0.30, 12, 110,
+                )))
+                .await;
                 self.require_click_target_after_move(&request.origin, (x, y))
                     .await?;
                 self.mouse_button("mousePressed", x, y, "left", 1, 1)
                     .await?;
-                tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
+                tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+                    62.0, 0.32, 20, 180,
+                )))
+                .await;
                 self.mouse_button("mouseReleased", x, y, "left", 0, 1)
                     .await?;
             }
             PointerAction::Hover => {}
             PointerAction::RightClick => {
-                tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+                tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+                    34.0, 0.30, 12, 110,
+                )))
+                .await;
                 self.require_click_target_after_move(&request.origin, (x, y))
                     .await?;
                 self.mouse_button("mousePressed", x, y, "right", 2, 1)
                     .await?;
-                tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
+                tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+                    62.0, 0.32, 20, 180,
+                )))
+                .await;
                 self.mouse_button("mouseReleased", x, y, "right", 0, 1)
                     .await?;
             }
@@ -154,11 +170,17 @@ impl Page {
                         .await?;
                     self.mouse_button("mousePressed", x, y, "left", 1, count)
                         .await?;
-                    tokio::time::sleep(Duration::from_millis(rand_u64(35, 95))).await;
+                    tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+                        54.0, 0.30, 18, 150,
+                    )))
+                    .await;
                     self.mouse_button("mouseReleased", x, y, "left", 0, count)
                         .await?;
                     if count == 1 {
-                        tokio::time::sleep(Duration::from_millis(rand_u64(55, 145))).await;
+                        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+                            88.0, 0.28, 35, 240,
+                        )))
+                        .await;
                     }
                 }
             }
@@ -175,28 +197,13 @@ impl Page {
                     .await?;
             }
             PointerAction::Drag => {
-                let (to_x, to_y) = drag_destination.expect("validated drag point");
+                let (to_x, to_y, to_width) = drag_destination.expect("validated drag point");
                 self.mouse_button("mousePressed", x, y, "left", 1, 1)
                     .await?;
-                for step in 1..=8 {
-                    let progress = f64::from(step) / 8.0;
-                    self.client
-                        .send_on(
-                            &self.session_id,
-                            "Input.dispatchMouseEvent",
-                            json!({
-                                "type": "mouseMoved",
-                                "x": x + (to_x - x) * progress,
-                                "y": y + (to_y - y) * progress,
-                                "button": "left", "buttons": 1,
-                            }),
-                        )
-                        .await?;
-                    tokio::time::sleep(Duration::from_millis(rand_u64(8, 22))).await;
-                }
+                self.move_pointer_path(x, y, to_x, to_y, to_width, 1)
+                    .await?;
                 self.mouse_button("mouseReleased", to_x, to_y, "left", 0, 1)
                     .await?;
-                *self.pointer.lock().unwrap() = Some((to_x, to_y));
             }
         }
 
@@ -209,11 +216,11 @@ impl Page {
         })
     }
 
-    async fn point_without_scroll(&self, location: &PointerLocation) -> Result<(f64, f64)> {
+    async fn point_without_scroll(&self, location: &PointerLocation) -> Result<(f64, f64, f64)> {
         match location {
-            PointerLocation::Coordinates { x, y } => Ok((*x, *y)),
+            PointerLocation::Coordinates { x, y } => Ok((*x, *y, 24.0)),
             PointerLocation::Element(element) => self
-                .node_center(element.backend_node_id)
+                .node_pointer_target(element.backend_node_id)
                 .await?
                 .ok_or_else(|| BrowserError::Protocol("pointer target has no layout box".into())),
         }
@@ -300,10 +307,16 @@ impl Page {
     }
 
     async fn left_click_at_on(&self, session_id: &str, x: f64, y: f64) -> Result<()> {
-        tokio::time::sleep(Duration::from_millis(rand_u64(20, 70))).await;
+        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+            34.0, 0.30, 12, 110,
+        )))
+        .await;
         self.mouse_button_on(session_id, "mousePressed", x, y, "left", (1, 1))
             .await?;
-        tokio::time::sleep(Duration::from_millis(rand_u64(40, 110))).await;
+        tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
+            62.0, 0.32, 20, 180,
+        )))
+        .await;
         self.mouse_button_on(session_id, "mouseReleased", x, y, "left", (0, 1))
             .await
     }
@@ -315,7 +328,7 @@ impl Page {
             ));
         }
         let _mutation = self.pointer_mutation.lock().await;
-        self.human_move_to(x, y).await?;
+        self.human_move_to(x, y, 24.0).await?;
         self.left_click_at(x, y).await
     }
 
@@ -333,7 +346,7 @@ impl Page {
             }
         }
         let _mutation = self.pointer_mutation.lock().await;
-        self.human_move_to(root_point.0, root_point.1).await?;
+        self.human_move_to(root_point.0, root_point.1, 24.0).await?;
         self.left_click_at_on(session_id, frame_point.0, frame_point.1)
             .await
     }
@@ -352,7 +365,7 @@ impl Page {
             }
         }
         let _mutation = self.pointer_mutation.lock().await;
-        self.human_move_to(root_point.0, root_point.1).await?;
+        self.human_move_to(root_point.0, root_point.1, 24.0).await?;
         if session_id != self.session_id {
             self.client
                 .send_on(

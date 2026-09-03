@@ -17,9 +17,12 @@ thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 base64.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+tempfile.workspace = true
 
 [[example]]
 name = "smoke"

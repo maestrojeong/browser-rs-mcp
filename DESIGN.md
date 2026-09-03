@@ -32,8 +32,7 @@ delivered as a lean Rust MCP server driving stock Chrome.
    **stealth by omission** at the protocol level: never send the detectable
    `Runtime.enable` / `Console.enable` (`Runtime.evaluate` works one-shot
    without `enable`; the accessibility tree needs only the non-page-visible
-   `Accessibility.enable`). The JS patch layer still exists but is an opt-in
-   *headless fallback*, not the default.
+   `Accessibility.enable`).
 3. **The agent's world model is the accessibility tree,** not raw HTML. It is
    smaller (fewer tokens), more stable across re-renders, and maps cleanly to
    "act by ref". Interactive nodes carry snapshot-scoped refs that bind a
@@ -51,7 +50,7 @@ MCP client (Claude Code / agent)
         │
         ▼
  ab-browser ── Browser (process + connection) / Page (tab session)
-        │        launch flags + stealth injection + snapshot/act/screenshot
+        │        launch flags + native page APIs + snapshot/act/screenshot
         ▼
    ab-cdp   ── one WebSocket, flatten sessions, id→response routing, event bus
         │
@@ -66,17 +65,15 @@ MCP client (Claude Code / agent)
 - Deliberately dumb: it does not auto-enable any domain.
 
 ### ab-browser
-- `Browser::launch(LaunchOptions)`: spawn Chrome (temp user-data-dir, stealth
+- `Browser::launch(LaunchOptions)`: spawn Chrome (persistent user-data-dir, minimal
   flags, `--remote-debugging-port=0`), read `DevToolsActivePort`, discover the
   WS endpoint via `/json/version`, connect.
-- `Browser::new_page(url)`: `Target.createTarget` + `attachToTarget{flatten}`,
-  inject the stealth script via `Page.addScriptToEvaluateOnNewDocument` **before**
-  navigation, then navigate.
+- `Browser::new_page(url)`: `Target.createTarget` + `attachToTarget{flatten}`;
+  apply the headless-only user-agent override when requested, then navigate.
 - `Page`: `navigate` (Page.enable + load wait), `evaluate` (Runtime.evaluate,
   no enable), `snapshot` (Accessibility.getFullAXTree → compact outline),
   `screenshot` (Page.captureScreenshot).
-- `stealth.rs`: launch flags + a small pre-document JS patch (webdriver,
-  plugins, languages, window.chrome, permissions).
+- `stealth.rs`: minimal launch flags; page-visible API behavior stays native.
 - `snapshot.rs`: prune ignored/noise nodes, print `role "name"` indented, assign
   `[ref]` to interactive roles, keep a ref→backendDOMNodeId map for act tools.
 

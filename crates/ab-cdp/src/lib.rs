@@ -2,7 +2,7 @@
 //!
 //! One WebSocket multiplexes the browser target and every attached page
 //! session (CDP "flatten" mode). We deliberately keep full control over which
-//! CDP domains get enabled — this is what lets the stealth layer avoid the
+//! CDP domains get enabled — this is what lets browser-rs avoid the
 //! `Runtime.enable` fingerprint that anti-bot systems watch for.
 
 use std::collections::HashMap;

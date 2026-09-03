@@ -1,4 +1,4 @@
-// Stealth benchmark: drive browser-rs (over MCP) against the bot detector,
+// Native-surface benchmark: drive browser-rs (over MCP) against the detector,
 // scrape its verdict, print a scorecard. Exit nonzero on any failed check so it
 // can gate CI — this is the regression guard that makes browser + detector grow
 // together.
@@ -6,21 +6,24 @@
 // Usage: bun bench/run.mjs [path-to-browser-rs-binary]
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = process.argv[2] || resolve(here, "../target/release/browser-rs");
 const detector = "file://" + resolve(here, "detector.html");
 
-// This bench validates the *headless injection fallback* (AB_STEALTH), which
-// must be deterministic across machines/CI. The recommended default mode is
-// headful with no injection — proven against a real detector by external.mjs.
+// Headless CI has genuine environment traits (for example SwiftShader and an
+// 800x600 screen). This bench guards native object shape and shim residue; it
+// does not require those real values to imitate a desktop workstation.
+const profile = mkdtempSync(join(tmpdir(), "browser-rs-bench-"));
 const child = spawn(bin, [], {
   stdio: ["pipe", "pipe", "inherit"],
   env: {
     ...process.env,
     AB_HEADLESS: "1",
-    AB_STEALTH: "1",
+    AB_PROFILE: profile,
     // The harness reads detector-owned globals to collect the score.
     AB_ALLOW_DETECTABLE_TOOLS: "1",
   },
@@ -72,16 +75,21 @@ for (let i = 0; i < 30; i++) {
 }
 
 child.kill();
+await Promise.race([
+  new Promise((resolveExit) => child.once("exit", resolveExit)),
+  new Promise((resolveTimeout) => setTimeout(resolveTimeout, 3000)),
+]);
 
 if (!result) {
   console.error("detector did not produce a result");
   process.exit(2);
 }
 
-console.log(`\n  browser-rs stealth benchmark — ${detector}\n`);
+console.log(`\n  browser-rs native-surface benchmark — ${detector}\n`);
 for (const c of result.checks) {
   console.log(`  ${c.pass ? "✓" : "✗"}  ${c.name.padEnd(24)} ${c.detail}`);
 }
 const ok = result.passed === result.total;
-console.log(`\n  score: ${result.passed}/${result.total} ${ok ? "— looks human ✓" : "— LEAKS DETECTED ✗"}\n`);
+console.log(`\n  score: ${result.passed}/${result.total} ${ok ? "— native surfaces intact ✓" : "— RESIDUE DETECTED ✗"}\n`);
+rmSync(profile, { recursive: true, force: true });
 process.exit(ok ? 0 : 1);
