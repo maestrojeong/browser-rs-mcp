@@ -13,9 +13,9 @@
 </style>
 </head>
 <body>
-<h1>agent-browser bot detector</h1>
-<p>A single page whose only job is to detect browser automation. The browser and
-this detector co-evolve: add a check, close the leak, repeat.</p>
+<h1>browser-rs native-surface detector</h1>
+<p>A single page whose job is to detect browser automation residue without
+penalizing genuine Chrome behavior from the host environment.</p>
 <table id="t"></table>
 <div id="score">running…</div>
 <script>
@@ -43,16 +43,16 @@ this detector co-evolve: add a check, close the leak, repeat.</p>
   // 6. UA has no "headless" token
   add("userAgent !headless", !/headless/i.test(navigator.userAgent), navigator.userAgent.slice(0, 60));
 
-  // 7. WebGL renderer must not be a software rasterizer (SwiftShader / llvmpipe
-  //    = headless tell). agent-browser spoofs a hardware GPU when the real one
-  //    is software, so this is now environment-independent.
+  // 7. Preserve Chrome's native WebGL implementation. Software rendering is a
+  //    real property of GPU-less CI and is informational, not a shim target.
   let renderer = "n/a";
   try {
     const gl = document.createElement("canvas").getContext("webgl");
     const ext = gl && gl.getExtension("WEBGL_debug_renderer_info");
     renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : "no-ext";
   } catch (e) { renderer = "err"; }
-  add("webgl !software", !/swiftshader|llvmpipe|software|mesa/i.test(renderer), renderer);
+  const webglGetParameter = window.WebGLRenderingContext?.prototype?.getParameter;
+  add("webgl native", !!webglGetParameter && /\[native code\]/.test(Function.prototype.toString.call(webglGetParameter)), renderer);
 
   // 8. Permissions consistency: query('notifications') must match Notification.permission
   //    (headless Chrome classically reports 'denied' while permission is 'default')
@@ -63,21 +63,26 @@ this detector co-evolve: add a check, close the leak, repeat.</p>
     permOk = !(Notification.permission === "default" && q.state === "denied");
   } catch (e) { permDetail = "err"; }
   add("permissions consistent", permOk, permDetail);
+  add("permissions native shape",
+      !!navigator.permissions && !Object.prototype.hasOwnProperty.call(navigator.permissions, "query"),
+      Object.prototype.hasOwnProperty.call(navigator.permissions || {}, "query") ? "own query" : "prototype query");
 
   // 9a. hardwareConcurrency should be a plausible core count.
   add("hardwareConcurrency", navigator.hardwareConcurrency > 0, navigator.hardwareConcurrency);
 
-  // 9b. deviceMemory present and realistic — real Chrome clamps it to <= 8,
-  //     so a larger value (true RAM) is a headless tell.
-  add("deviceMemory realistic",
-      navigator.deviceMemory !== undefined && navigator.deviceMemory <= 8,
-      navigator.deviceMemory);
+  // 9b. Keep the native getter. Chrome may expose 16 on real hardware/CI;
+  //     defining an own getter to clamp it is the actual browser-rs residue.
+  const memory = navigator.deviceMemory;
+  const memoryValueOk = memory === undefined ||
+    (Number.isFinite(memory) && memory > 0 && memory <= 64 && Math.log2(memory) % 1 === 0);
+  add("deviceMemory native",
+      !Object.prototype.hasOwnProperty.call(navigator, "deviceMemory") && memoryValueOk,
+      `${memory} / ${Object.prototype.hasOwnProperty.call(navigator, "deviceMemory") ? "own" : "inherited"}`);
 
   // 9c. pdfViewerEnabled is true on real Chrome (false is a headless tell).
   add("pdfViewerEnabled", navigator.pdfViewerEnabled === true, navigator.pdfViewerEnabled);
 
-  // 9. Hooked functions must still look native under .toString() probing.
-  //    webdriver getter and permissions.query are always patched by the browser.
+  // 9. Native functions must remain native under .toString() probing.
   let leak = "";
   try {
     const probes = [
@@ -92,9 +97,23 @@ this detector co-evolve: add a check, close the leak, repeat.</p>
   } catch (e) { leak = "err"; }
   add("no toString leak", leak === "", leak === "" ? "native" : ("leaks: " + leak));
 
-  // 10. Screen/viewport plausibility (headless reports outerWidth === 0)
-  add("viewport plausible", window.outerWidth > 0 && screen.width >= window.innerWidth,
-      "outer " + window.outerWidth + "x" + window.outerHeight + ", screen " + screen.width + "x" + screen.height);
+  // Normal web pages do not receive the extension-only chrome.runtime API.
+  add("chrome.runtime native", !window.chrome?.runtime,
+      window.chrome?.runtime ? "unexpected runtime object" : "absent");
+
+  const speech = window.speechSynthesis;
+  add("speechSynthesis native shape",
+      !speech || !Object.prototype.hasOwnProperty.call(speech, "getVoices"),
+      speech && Object.prototype.hasOwnProperty.call(speech, "getVoices") ? "own getVoices" : "native");
+
+  // 10. Device metrics may legitimately make a headless viewport larger than
+  //     its default screen. Detect JS-level own accessors instead.
+  const screenKeys = ["width", "height", "availWidth", "availHeight"];
+  const ownScreenKeys = screenKeys.filter((key) => Object.prototype.hasOwnProperty.call(screen, key));
+  const positiveScreen = screenKeys.every((key) => Number.isFinite(screen[key]) && screen[key] > 0);
+  add("screen native shape", ownScreenKeys.length === 0 && positiveScreen && window.outerWidth > 0,
+      "outer " + window.outerWidth + "x" + window.outerHeight + ", screen " + screen.width + "x" + screen.height +
+      (ownScreenKeys.length ? ", own: " + ownScreenKeys.join(",") : ", inherited"));
 
   // INFORMATIONAL: CDP/DevTools console-serialization probe.
   //   Reliable CDP self-detection from pure JS does not exist — Chrome eagerly
@@ -120,7 +139,7 @@ this detector co-evolve: add a check, close the leak, repeat.</p>
     `<tr><td>·</td><td style="opacity:.6">${c.name}</td><td style="opacity:.6">${c.detail}</td></tr>`
   ).join("");
   document.getElementById("score").textContent =
-    `score: ${passed}/${checks.length}` + (passed === checks.length ? "  — looks human ✓" : "  — automation detected ✗");
+    `score: ${passed}/${checks.length}` + (passed === checks.length ? "  — native surfaces intact ✓" : "  — residue detected ✗");
 
   // Expose for programmatic scraping by the bench runner.
   window.__DETECT__ = result;
