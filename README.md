@@ -59,7 +59,7 @@ browser-rs --help
 To pin this release instead of following `latest`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.3.0 sh
+curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | AB_VERSION=v0.3.1 sh
 ```
 
 **2. Run** — use stdio for a client that launches the server:
@@ -90,7 +90,42 @@ cargo install --git https://github.com/maestrojeong/browser-rs-mcp ab-mcp
 Set `AB_CHROME` if Chrome is not in a standard location.
 
 <details>
-<summary><strong>What's new (v0.1.14 - v0.3.0)</strong></summary>
+<summary><strong>What's new (v0.1.14 - v0.3.1)</strong></summary>
+
+**v0.3.1 — native modal safety and non-Latin type-ahead.** On macOS, a left
+`mousePressed` landing on a collapsed, enabled, single-option `<select>`
+(native `NSPopUpButton`) or an enabled `<input type="file">` (native
+`NSOpenPanel`) hands off to a Cocoa modal run loop that blocks the browser
+process's main thread until it's dismissed by native input CDP cannot
+send — every subsequent CDP call then hangs until its own timeout fires,
+which previously read to callers as a multi-minute stall or a dead
+connection. Every left-button press this crate issues (by ref, by raw
+coordinates, as a drag origin, or against an out-of-process iframe
+session) now hit-tests its target via `DOM.getNodeForLocation`
+immediately before the press and rejects with a clear error pointing at
+`browser_select_option` / `browser_file_upload` if it resolves to either
+of those elements; `multiple` selects, `size>1` listboxes, and `disabled`
+elements don't open a native modal and are left alone. The same
+activation keys a real select popup responds to (Space, Enter, arrows,
+Home/End/PageUp/PageDown) are checked the same way against
+`document.activeElement` before `browser_press_key` sends them, and a
+space character typed into a focused select via
+`browser_type`/`browser_fill_form` gets the same check mid-string. All of
+these checks fail closed — a hit-test/inspection error refuses the action
+rather than risking the hang. Known gap: the keyboard-side checks only
+look at the top-level page's focus, so `browser_press_key`/`browser_type`
+into an out-of-process iframe's own CDP session aren't covered yet — only
+the mouse-side check (`browser_iframe_click`) is. Separately,
+`browser_select_option`'s trusted
+type-ahead search failed silently on non-Latin option labels (Korean,
+Japanese, Chinese, ...) because the US-QWERTY key table maps them to
+`windowsVirtualKeyCode: 0`, which Blink treats as a non-character key and
+never turns into the `keypress` type-ahead search reads; those characters
+now carry `VK_PROCESSKEY` (229), the same code real browsers send for
+IME-composed input, so Blink synthesizes the keypress and the search
+matches. A left-open JS dialog now gets one retry (with a logged error if
+that also fails) instead of a silently swallowed
+`Page.handleJavaScriptDialog` failure.
 
 **v0.3.0 — native page APIs and grounded input models.** browser-rs no longer
 injects a pre-document JavaScript stealth script. A real Chrome now exposes its

@@ -1459,6 +1459,15 @@ impl Page {
                 }
                 return Err(BrowserError::TypingCancelled);
             }
+            // A space keystroke is also the native "open the dropdown"
+            // activation key for a focused <select> on macOS — see
+            // `reject_if_key_would_open_focused_select_popup`. Typed text
+            // containing a space (e.g. filling "Productivity Apps" into a
+            // select-labeled form field) can hit this mid-string.
+            if ch == ' ' {
+                self.reject_if_key_would_open_focused_select_popup(" ")
+                    .await?;
+            }
             let s = ch.to_string();
             let (code, vk) = us_qwerty_key(ch);
             let need_shift = needs_shift(ch);
@@ -2462,6 +2471,7 @@ impl Page {
         if let Some(combo) = parse_key_combo(key)? {
             return self.dispatch_key_combo(session_id, combo).await;
         }
+        self.reject_if_key_would_open_focused_select_popup(key).await?;
 
         let (event_key, code, vk) = key_definition(key);
         self.client
@@ -2498,6 +2508,79 @@ impl Page {
             82.0, 0.32, 25, 240,
         )))
         .await;
+        Ok(())
+    }
+
+    /// On macOS, Space/Enter and the arrow/paging/Home/End keys are native
+    /// "open the dropdown" activation keys for a focused, popup-capable
+    /// `<select>` — the same `NSPopUpButton` hang risk as a mouse click (see
+    /// `pointer::reject_if_native_select_popup`), just reached through the
+    /// keyboard. Keyboard events don't carry a target coordinate to
+    /// hit-test, so this reads `document.activeElement` in an isolated
+    /// world instead (no `main_world`/`Runtime.enable` needed).
+    ///
+    /// Only checks the top-level page's focus (`self.session_id`); a
+    /// same-session `browser_press_key`/`browser_type` call into an
+    /// out-of-process iframe still bypasses this — see the v0.3.1 changelog
+    /// note.
+    async fn reject_if_key_would_open_focused_select_popup(&self, key: &str) -> Result<()> {
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        const ACTIVATION_KEYS: &[&str] = &[
+            " ",
+            "Space",
+            "Enter",
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "PageUp",
+            "PageDown",
+            "Home",
+            "End",
+        ];
+        if !ACTIVATION_KEYS.contains(&key) {
+            return Ok(());
+        }
+        let focused = self
+            .evaluate(
+                "(() => { const el = document.activeElement; if (!el) return null; \
+                 return { tag: el.tagName, multiple: !!el.multiple, \
+                 size: el.size || 1, disabled: !!el.disabled }; })()",
+            )
+            .await
+            .map_err(|error| {
+                BrowserError::Protocol(format!(
+                    "cannot verify the focused element is safe on macOS before \
+                     sending {key:?}; refusing rather than risking a \
+                     native-popup hang: {error}"
+                ))
+            })?;
+        let is_select = focused
+            .get("tag")
+            .and_then(Value::as_str)
+            .is_some_and(|tag| tag.eq_ignore_ascii_case("select"));
+        if !is_select {
+            return Ok(());
+        }
+        let is_multiple = focused
+            .get("multiple")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let size = focused.get("size").and_then(Value::as_i64).unwrap_or(1);
+        let is_disabled = focused
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if pointer::select_is_popup_capable(is_multiple, size, is_disabled) {
+            return Err(BrowserError::Protocol(format!(
+                "sending {key:?} to a focused native single-option <select> \
+                 on macOS can open an OS-level popup menu that blocks CDP \
+                 for minutes; use browser_select_option (trusted \
+                 type-ahead) instead"
+            )));
+        }
         Ok(())
     }
 
@@ -2584,7 +2667,7 @@ impl Page {
     async fn type_select_search_on(&self, session_id: &str, label: &str) -> Result<()> {
         for ch in label.to_lowercase().chars() {
             let key = ch.to_string();
-            let (code, vk) = us_qwerty_key(ch);
+            let (code, vk) = type_ahead_key(ch);
             let modifiers = if needs_shift(ch) { 8 } else { 0 };
             self.client
                 .send_on(
@@ -3197,9 +3280,28 @@ impl Page {
                     if let Some(t) = text {
                         params["promptText"] = json!(t);
                     }
-                    let _ = client
-                        .send_on(&sid, "Page.handleJavaScriptDialog", params)
-                        .await;
+                    // A left-open dialog blocks every later CDP call on this
+                    // session until it's dismissed (same failure class as
+                    // the macOS native-popup hangs elsewhere in this crate),
+                    // so retry once instead of silently leaving it open.
+                    if let Err(error) = client
+                        .send_on(&sid, "Page.handleJavaScriptDialog", params.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            "Page.handleJavaScriptDialog failed; retrying once"
+                        );
+                        if let Err(error) =
+                            client.send_on(&sid, "Page.handleJavaScriptDialog", params).await
+                        {
+                            tracing::error!(
+                                %error,
+                                "Page.handleJavaScriptDialog failed twice; a JS dialog \
+                                 may be left open, blocking further CDP calls on this page"
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -3671,6 +3773,17 @@ fn us_qwerty_key(ch: char) -> (&'static str, u32) {
     }
 }
 
+/// `<select>` type-ahead needs a nonzero `windowsVirtualKeyCode`, or Blink
+/// treats the keyDown as non-character and never emits the keypress the
+/// search reads. `us_qwerty_key` only covers ASCII, so non-Latin characters
+/// (Hangul, CJK, ...) get the same VK_PROCESSKEY (229) real browsers send
+/// for IME-composed input.
+fn type_ahead_key(ch: char) -> (&'static str, u32) {
+    const VK_PROCESSKEY: u32 = 229;
+    let (code, vk) = us_qwerty_key(ch);
+    (code, if vk == 0 { VK_PROCESSKEY } else { vk })
+}
+
 /// Binary random-utility choice: direct typing cost grows with length while
 /// paste cost is approximately constant, yielding a logistic choice curve.
 fn paste_probability(text_len: usize, midpoint_chars: f64, slope: f64) -> f64 {
@@ -3795,7 +3908,7 @@ mod tests {
         collect_piercing_query_roots, drag_step_probability, fitts_duration_ms, minimum_jerk,
         movement_step_count, parse_key_combo, paste_probability, require_frame_chain,
         resolve_frame_id, shortcut_command, should_paste_text_for_draw, split_frame_chain,
-        us_qwerty_key, FrameAction, KeyCombo, KeyModifier, ReadMode,
+        type_ahead_key, us_qwerty_key, FrameAction, KeyCombo, KeyModifier, ReadMode,
     };
     use serde_json::json;
 
@@ -3853,6 +3966,16 @@ mod tests {
         assert_eq!(us_qwerty_key('!'), ("Digit1", 49));
         assert_eq!(us_qwerty_key('?'), ("Slash", 191));
         assert_eq!(us_qwerty_key('한'), ("", 0));
+    }
+
+    #[test]
+    fn type_ahead_key_gives_non_ascii_a_nonzero_vk_but_leaves_ascii_untouched() {
+        // ASCII: passes through us_qwerty_key's real VK unchanged.
+        assert_eq!(type_ahead_key('a'), ("KeyA", 65));
+        // Non-Latin (Hangul, e.g. "생산성"'s first syllable): vk 0 -> VK_PROCESSKEY,
+        // code stays "" (real IME-composed keys don't carry a physical code either).
+        assert_eq!(type_ahead_key('생'), ("", 229));
+        assert_eq!(type_ahead_key('한'), ("", 229));
     }
 
     #[test]

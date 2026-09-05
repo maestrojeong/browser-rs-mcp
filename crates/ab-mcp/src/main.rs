@@ -217,9 +217,7 @@ fn configured_max_output_limit() -> usize {
     })
 }
 
-/// Clamp a caller-supplied output limit to the configured ceiling so no
-/// request can force an unbounded allocation/response, no matter what value
-/// is sent.
+/// Clamp a caller-supplied output limit to `configured_max_output_limit()`.
 fn clamp_output_limit(requested: usize) -> usize {
     requested.min(configured_max_output_limit())
 }
