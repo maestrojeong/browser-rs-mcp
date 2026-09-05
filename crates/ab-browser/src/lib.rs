@@ -2471,7 +2471,8 @@ impl Page {
         if let Some(combo) = parse_key_combo(key)? {
             return self.dispatch_key_combo(session_id, combo).await;
         }
-        self.reject_if_key_would_open_focused_select_popup(key).await?;
+        self.reject_if_key_would_open_focused_select_popup(key)
+            .await?;
 
         let (event_key, code, vk) = key_definition(key);
         self.client
@@ -3292,8 +3293,9 @@ impl Page {
                             %error,
                             "Page.handleJavaScriptDialog failed; retrying once"
                         );
-                        if let Err(error) =
-                            client.send_on(&sid, "Page.handleJavaScriptDialog", params).await
+                        if let Err(error) = client
+                            .send_on(&sid, "Page.handleJavaScriptDialog", params)
+                            .await
                         {
                             tracing::error!(
                                 %error,
