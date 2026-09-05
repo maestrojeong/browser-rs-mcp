@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{sample_lognormal_ms, BrowserError, ElementRef, Page, Result};
 
@@ -288,6 +288,14 @@ impl Page {
         button: &str,
         state: (u8, u8),
     ) -> Result<()> {
+        // Single choke point for every left-button press this crate issues —
+        // by ref, by raw coordinates, as a drag origin, or against an
+        // out-of-process iframe session. Checking here (instead of in each
+        // caller) is what makes the macOS native-<select> guard below apply
+        // uniformly instead of only to the ref-based click path.
+        if kind == "mousePressed" && button == "left" {
+            self.reject_if_native_modal_target(session_id, x, y).await?;
+        }
         let (buttons, click_count) = state;
         self.client
             .send_on(
@@ -299,6 +307,102 @@ impl Page {
                 }),
             )
             .await?;
+        Ok(())
+    }
+
+    /// On macOS, a left `mousePressed` landing on a collapsed single-option
+    /// `<select>` (native `NSPopUpButton`) or an enabled `<input
+    /// type="file">` (native `NSOpenPanel`) hands off to a Cocoa modal
+    /// run loop that blocks the browser process's main thread until it's
+    /// dismissed by *native* input CDP cannot send — every later CDP call
+    /// (mouseReleased, hit-test/settle checks) then hangs until its own
+    /// timeout fires, which reads to callers as a multi-minute stall or a
+    /// dead connection. `multiple` selects, `size>1` listboxes, and
+    /// `disabled` elements don't open either native modal and are left
+    /// alone, so this doesn't dead-end into the trusted alternatives
+    /// (`browser_select_option`, `browser_file_upload`), which only cover
+    /// that same non-modal-triggering case anyway.
+    ///
+    /// Fails *closed*: if the hit-test or node inspection itself errors, the
+    /// coordinates are treated as unsafe rather than silently proceeding
+    /// into a possible hang.
+    async fn reject_if_native_modal_target(&self, session_id: &str, x: f64, y: f64) -> Result<()> {
+        if !cfg!(target_os = "macos") {
+            return Ok(());
+        }
+        fn unsafe_to_verify(error: impl std::fmt::Display) -> BrowserError {
+            BrowserError::Protocol(format!(
+                "cannot verify this click target is safe on macOS before \
+                 mousePressed; refusing rather than risking a native-popup \
+                 hang: {error}"
+            ))
+        }
+        let metrics = self
+            .client
+            .send_on(session_id, "Page.getLayoutMetrics", json!({}))
+            .await
+            .map_err(unsafe_to_verify)?;
+        let viewport = metrics
+            .get("cssVisualViewport")
+            .or_else(|| metrics.get("visualViewport"));
+        let page_x = viewport
+            .and_then(|v| v.get("pageX"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let page_y = viewport
+            .and_then(|v| v.get("pageY"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let hit = self
+            .client
+            .send_on(
+                session_id,
+                "DOM.getNodeForLocation",
+                json!({
+                    "x": (x + page_x).round() as i64,
+                    "y": (y + page_y).round() as i64,
+                }),
+            )
+            .await
+            .map_err(unsafe_to_verify)?;
+        let Some(backend) = hit.get("backendNodeId").and_then(Value::as_i64) else {
+            // Nothing hit-testable at this point (e.g. blank canvas) — safe.
+            return Ok(());
+        };
+        let described = self
+            .client
+            .send_on(
+                session_id,
+                "DOM.describeNode",
+                json!({ "backendNodeId": backend }),
+            )
+            .await
+            .map_err(unsafe_to_verify)?;
+        let Some(node) = described.get("node") else {
+            return Err(BrowserError::Protocol(
+                "cannot verify this click target is safe on macOS before \
+                 mousePressed; refusing rather than risking a native-popup hang"
+                    .into(),
+            ));
+        };
+        if is_popup_capable_select(node) {
+            return Err(BrowserError::Protocol(
+                "clicking a native single-option <select> on macOS opens an \
+                 OS-level popup menu that blocks CDP for minutes; use \
+                 browser_select_option (trusted type-ahead) instead of \
+                 browser_click/browser_pointer for this element"
+                    .into(),
+            ));
+        }
+        if is_native_file_picker_input(node) {
+            return Err(BrowserError::Protocol(
+                "clicking a native <input type=\"file\"> on macOS opens an \
+                 OS-level file picker that blocks CDP for minutes; use \
+                 browser_file_upload (trusted DOM.setFileInputFiles) \
+                 instead of browser_click/browser_pointer for this element"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -381,6 +485,65 @@ impl Page {
 
 fn same_document(origin: &ElementRef, destination: &ElementRef) -> bool {
     origin.document.is_some() && origin.document == destination.document
+}
+
+/// A `DOM.describeNode` `node`'s tag name, uppercased.
+fn node_tag(node: &Value) -> String {
+    node.get("nodeName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
+
+/// An attribute value from a `DOM.describeNode` `node`'s flat
+/// `[name, value, name, value, ...]` attributes array.
+fn node_attr<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
+    node.get("attributes")?
+        .as_array()?
+        .chunks(2)
+        .find(|pair| pair.first().and_then(Value::as_str) == Some(name))
+        .and_then(|pair| pair.get(1))
+        .and_then(Value::as_str)
+}
+
+/// Whether a `DOM.describeNode` `node` payload is a `<select>` that Chrome
+/// renders as a real popup menu on macOS (see `reject_if_native_modal_target`
+/// for why that matters). `multiple`, `size > 1`, and `disabled` selects
+/// don't open a native popup, so they're excluded here.
+fn is_popup_capable_select(node: &Value) -> bool {
+    if node_tag(node) != "SELECT" {
+        return false;
+    }
+    let is_multiple = node_attr(node, "multiple").is_some();
+    let size: i64 = node_attr(node, "size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let is_disabled = node_attr(node, "disabled").is_some();
+    select_is_popup_capable(is_multiple, size, is_disabled)
+}
+
+/// Whether a `DOM.describeNode` `node` payload is an enabled
+/// `<input type="file">`, which opens a native OS file picker
+/// (`NSOpenPanel` on macOS) on click — the same modal-run-loop hang risk as
+/// [`is_popup_capable_select`]. A `disabled` file input opens nothing.
+fn is_native_file_picker_input(node: &Value) -> bool {
+    if node_tag(node) != "INPUT" {
+        return false;
+    }
+    let type_attr = node_attr(node, "type").unwrap_or("text");
+    if !type_attr.eq_ignore_ascii_case("file") {
+        return false;
+    }
+    node_attr(node, "disabled").is_none()
+}
+
+/// Shared predicate behind [`is_popup_capable_select`] (mouse path, reads
+/// `DOM.describeNode` attributes) and the keyboard-focus check in
+/// `Page::reject_if_key_would_open_focused_select_popup` (reads
+/// `document.activeElement` fields), so the two paths can't drift apart on
+/// what counts as "the collapsed, enabled, single-option case".
+pub(crate) fn select_is_popup_capable(is_multiple: bool, size: i64, is_disabled: bool) -> bool {
+    !is_multiple && size <= 1 && !is_disabled
 }
 
 fn validate_request(request: &PointerRequest) -> Result<()> {
@@ -483,5 +646,89 @@ mod tests {
         let mut unproven = element("loader-a");
         unproven.document = None;
         assert!(!same_document(&unproven, &unproven));
+    }
+
+    fn describe_node(tag: &str, attrs: &[(&str, &str)]) -> Value {
+        let flat: Vec<Value> = attrs
+            .iter()
+            .flat_map(|(k, v)| [json!(k), json!(v)])
+            .collect();
+        json!({ "nodeName": tag, "attributes": flat })
+    }
+
+    #[test]
+    fn collapsed_single_select_is_popup_capable() {
+        assert!(is_popup_capable_select(&describe_node("select", &[])));
+        assert!(is_popup_capable_select(&describe_node(
+            "SELECT",
+            &[("id", "primaryCategory")]
+        )));
+    }
+
+    #[test]
+    fn non_select_tag_is_never_popup_capable() {
+        assert!(!is_popup_capable_select(&describe_node("div", &[])));
+        assert!(!is_popup_capable_select(&describe_node("input", &[])));
+    }
+
+    #[test]
+    fn multiple_select_is_not_popup_capable() {
+        assert!(!is_popup_capable_select(&describe_node(
+            "select",
+            &[("multiple", "")]
+        )));
+    }
+
+    #[test]
+    fn listbox_sized_select_is_not_popup_capable() {
+        assert!(!is_popup_capable_select(&describe_node(
+            "select",
+            &[("size", "4")]
+        )));
+        // size="1" is explicitly still the collapsed popup form.
+        assert!(is_popup_capable_select(&describe_node(
+            "select",
+            &[("size", "1")]
+        )));
+    }
+
+    #[test]
+    fn disabled_select_is_not_popup_capable() {
+        assert!(!is_popup_capable_select(&describe_node(
+            "select",
+            &[("disabled", "")]
+        )));
+    }
+
+    #[test]
+    fn enabled_file_input_is_a_native_picker() {
+        assert!(is_native_file_picker_input(&describe_node(
+            "input",
+            &[("type", "file")]
+        )));
+        // Case-insensitive, matches HTML attribute matching.
+        assert!(is_native_file_picker_input(&describe_node(
+            "INPUT",
+            &[("type", "FILE")]
+        )));
+    }
+
+    #[test]
+    fn disabled_file_input_is_not_a_native_picker() {
+        assert!(!is_native_file_picker_input(&describe_node(
+            "input",
+            &[("type", "file"), ("disabled", "")]
+        )));
+    }
+
+    #[test]
+    fn non_file_input_is_not_a_native_picker() {
+        assert!(!is_native_file_picker_input(&describe_node(
+            "input",
+            &[("type", "text")]
+        )));
+        // No `type` attribute defaults to "text" per the HTML spec.
+        assert!(!is_native_file_picker_input(&describe_node("input", &[])));
+        assert!(!is_native_file_picker_input(&describe_node("select", &[])));
     }
 }
