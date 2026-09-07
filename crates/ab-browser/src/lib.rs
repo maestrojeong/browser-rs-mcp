@@ -172,6 +172,15 @@ impl Browser {
         &self.client
     }
 
+    /// Whether the CDP transport to Chrome is still usable.
+    ///
+    /// A launched `Browser` whose Chrome has died keeps looking like a valid
+    /// handle — there is no reconnect path, so every later call fails. Callers
+    /// that supervise this process should treat `false` as "replace me".
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
     /// Launch Chrome and connect over CDP.
     ///
     /// Default mode is headful with a persistent profile. Browser-visible

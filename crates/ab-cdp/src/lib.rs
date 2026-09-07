@@ -6,7 +6,7 @@
 //! `Runtime.enable` fingerprint that anti-bot systems watch for.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,11 @@ type Pending = oneshot::Sender<Result<Value>>;
 
 struct Inner {
     next_id: AtomicU64,
+    /// Liveness of the underlying WebSocket. Set to `false` the moment the
+    /// reader task observes a close/error, or a write fails. Read with a
+    /// relaxed atomic load so health probes never contend on `sink`/`pending`
+    /// — a probe must not block behind an in-flight CDP request.
+    connected: AtomicBool,
     pending: Mutex<HashMap<u64, Pending>>,
     sink: Mutex<
         Option<
@@ -76,6 +81,7 @@ impl CdpClient {
 
         let inner = Arc::new(Inner {
             next_id: AtomicU64::new(1),
+            connected: AtomicBool::new(true),
             pending: Mutex::new(HashMap::new()),
             sink: Mutex::new(Some(sink)),
             events: events_tx,
@@ -96,6 +102,10 @@ impl CdpClient {
                     }
                 }
             }
+            // Chrome is gone (close frame, transport error, or EOF). Publish
+            // that fact before waking the waiters so anything that races the
+            // drain below already sees a disconnected client.
+            r.connected.store(false, Ordering::SeqCst);
             // Fail all outstanding requests on disconnect.
             let mut pending = r.pending.lock().await;
             for (_, tx) in pending.drain() {
@@ -104,6 +114,16 @@ impl CdpClient {
         });
 
         Ok(Self { inner })
+    }
+
+    /// Whether the CDP transport is still usable.
+    ///
+    /// Lock-free by design: health endpoints call this while a tool request
+    /// may be holding `sink`/`pending`, so it must never block. A `false`
+    /// here means Chrome is gone and every later request will fail — the
+    /// process needs a new browser, not a retry.
+    pub fn is_connected(&self) -> bool {
+        self.inner.connected.load(Ordering::SeqCst)
     }
 
     /// Subscribe to the raw CDP event stream.
@@ -138,6 +158,13 @@ impl CdpClient {
         params: Value,
         session_id: Option<&str>,
     ) -> Result<Value> {
+        // Fail fast once the reader task has seen the socket go away. Without
+        // this the write below reaches a dead tungstenite sink and surfaces as
+        // an opaque `Protocol("Trying to work with closed connection")`, which
+        // reads like a transient protocol hiccup instead of "Chrome is gone".
+        if !self.is_connected() {
+            return Err(CdpError::Closed);
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(sid) = session_id {
@@ -152,9 +179,15 @@ impl CdpClient {
             let sink = guard.as_mut().ok_or(CdpError::Closed)?;
             let text = serde_json::to_string(&msg)?;
             trace!("-> {text}");
-            sink.send(Message::Text(text))
-                .await
-                .map_err(|e| CdpError::Protocol(e.to_string()))?;
+            if let Err(e) = sink.send(Message::Text(text)).await {
+                // A write failure means the socket is unusable even if the
+                // reader task has not observed the close yet. Latch it so the
+                // next caller (and any health probe) sees the truth.
+                self.inner.connected.store(false, Ordering::SeqCst);
+                self.inner.pending.lock().await.remove(&id);
+                debug!("cdp write failed, marking transport closed: {e}");
+                return Err(CdpError::Closed);
+            }
         }
 
         match tokio::time::timeout(self.inner.request_timeout, rx).await {
@@ -199,5 +232,22 @@ async fn dispatch(inner: &Arc<Inner>, txt: &str) {
         };
         debug!("event {} (session={:?})", ev.method, ev.session_id);
         let _ = inner.events.send(ev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Supervisors (clawgram, negotium) pattern-match this string to tell
+    /// "Chrome is gone, replace the process" apart from a retryable hiccup.
+    /// Renaming it silently breaks their crash detection, so pin it here.
+    #[test]
+    fn closed_transport_error_is_stable_and_distinct() {
+        assert_eq!(CdpError::Closed.to_string(), "transport closed");
+        assert_ne!(
+            CdpError::Closed.to_string(),
+            CdpError::Protocol("Trying to work with closed connection".into()).to_string(),
+        );
     }
 }

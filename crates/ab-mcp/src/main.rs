@@ -23,7 +23,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 mod http_security;
 mod secret_broker;
@@ -246,6 +246,11 @@ struct State {
     /// Durable ownership for every page; one owner may have multiple tabs.
     page_owners: HashMap<String, String>,
     next: u64,
+    /// Set when a dead browser was reaped, cleared when a fresh one launches.
+    /// Sticky on purpose: the reap nulls out `browser`, so without this the
+    /// very next call could no longer tell "Chrome died and took your pages"
+    /// apart from "you passed a bad page id".
+    browser_lost: bool,
 }
 
 #[derive(Clone)]
@@ -803,6 +808,53 @@ impl BrowserServer {
         Ok(())
     }
 
+    /// Discard a browser whose CDP transport has died, along with every page
+    /// handle that belonged to it.
+    ///
+    /// Chrome can exit under us (crash, OOM kill, user quit) while this
+    /// process keeps running. There is no CDP reconnect: the old `Browser` is
+    /// permanently unusable, and so is every `Page` cloned from it. Leaving
+    /// them in `State` is what made this state unrecoverable — callers kept
+    /// getting `transport closed` from handles that could never work again,
+    /// and nothing ever replaced the browser.
+    ///
+    /// Returns whether a dead browser was reaped, so callers can tell a
+    /// cold start apart from a recovery.
+    fn reap_dead_browser(st: &mut State) -> bool {
+        if st
+            .browser
+            .as_ref()
+            .is_none_or(ab_browser::Browser::is_connected)
+        {
+            return false;
+        }
+        let lost_pages = st.pages.len();
+        st.pages.clear();
+        st.owners.clear();
+        st.page_owners.clear();
+        // Drop without `close()`: Chrome is already gone, so the shutdown
+        // handshake would just block on the dead socket.
+        st.browser = None;
+        st.browser_lost = true;
+        warn!("cdp transport lost; discarded dead browser and {lost_pages} page handle(s)");
+        true
+    }
+
+    /// Error for a page id that cannot be resolved.
+    ///
+    /// Distinguishes "you passed a bad id" from "the browser died and took
+    /// every page with it" — the second one is actionable (re-navigate) and
+    /// used to surface as an opaque transport error.
+    fn unresolved_page_error(st: &State, id: &str) -> McpError {
+        if st.browser_lost || st.browser.as_ref().is_some_and(|b| !b.is_connected()) {
+            return fail(format!(
+                "browser was lost (chrome exited); page '{id}' and every other \
+                 page handle are gone. Call browser_navigate to start a fresh browser."
+            ));
+        }
+        fail(format!("unknown page or owner '{id}'"))
+    }
+
     fn resolve_page_id(st: &State, id_or_owner: &str) -> Option<String> {
         if let Some(owner) = request_owner() {
             if id_or_owner == owner {
@@ -822,16 +874,18 @@ impl BrowserServer {
 
     /// Resolve either a concrete page id or a claimed owner alias.
     async fn canonical_page_id(&self, id_or_owner: &str) -> Result<String, McpError> {
-        let st = self.state.lock().await;
+        let mut st = self.state.lock().await;
+        Self::reap_dead_browser(&mut st);
         Self::resolve_page_id(&st, id_or_owner)
-            .ok_or_else(|| fail(format!("unknown page or owner '{id_or_owner}'")))
+            .ok_or_else(|| Self::unresolved_page_error(&st, id_or_owner))
     }
 
     /// Clone the Page for a given id/owner (does not hold the lock across ops).
     async fn page_of(&self, id: &str) -> Result<Page, McpError> {
-        let st = self.state.lock().await;
-        let page_id = Self::resolve_page_id(&st, id)
-            .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
+        let mut st = self.state.lock().await;
+        Self::reap_dead_browser(&mut st);
+        let page_id =
+            Self::resolve_page_id(&st, id).ok_or_else(|| Self::unresolved_page_error(&st, id))?;
         st.pages
             .get(&page_id)
             .map(|e| e.page.clone())
@@ -843,8 +897,9 @@ impl BrowserServer {
         id: &str,
     ) -> Result<(String, Page, Arc<CancellationToken>), McpError> {
         let mut st = self.state.lock().await;
-        let page_id = Self::resolve_page_id(&st, id)
-            .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
+        Self::reap_dead_browser(&mut st);
+        let page_id =
+            Self::resolve_page_id(&st, id).ok_or_else(|| Self::unresolved_page_error(&st, id))?;
         let entry = st
             .pages
             .get_mut(&page_id)
@@ -873,9 +928,10 @@ impl BrowserServer {
     }
 
     async fn element_ref_of(&self, id: &str, ref_: &str) -> Result<ElementRef, McpError> {
-        let st = self.state.lock().await;
-        let page_id = Self::resolve_page_id(&st, id)
-            .ok_or_else(|| fail(format!("unknown page or owner '{id}'")))?;
+        let mut st = self.state.lock().await;
+        Self::reap_dead_browser(&mut st);
+        let page_id =
+            Self::resolve_page_id(&st, id).ok_or_else(|| Self::unresolved_page_error(&st, id))?;
         let entry = st
             .pages
             .get(&page_id)
@@ -1040,7 +1096,9 @@ impl BrowserServer {
     /// Import tabs created by page JavaScript or target=_blank into the MCP page map.
     async fn sync_external_pages(&self) -> Result<Vec<String>, McpError> {
         let mut st = self.state.lock().await;
-        let Some(browser) = st.browser.as_ref() else {
+        let Some(browser) = st.browser.as_ref().filter(|b| b.is_connected()) else {
+            // No browser, or one whose transport is gone. Either way there are
+            // no external tabs to import; `open_page` owns the recovery.
             return Ok(Vec::new());
         };
         let targets = browser.page_targets().await.map_err(fail)?;
@@ -1150,8 +1208,17 @@ impl BrowserServer {
     /// register it. Returns (page_id, snapshot_text).
     async fn open_page(&self, url: &str) -> Result<(String, String), McpError> {
         let mut st = self.state.lock().await;
+        // Recover from a Chrome that exited under us. `browser_navigate` is the
+        // one tool that does not need a pre-existing page, which makes it the
+        // natural re-entry point: an agent that hits `transport closed` can get
+        // a working browser back by navigating, with no supervisor involvement.
+        let recovered = Self::reap_dead_browser(&mut st);
         if st.browser.is_none() {
             st.browser = Some(make_browser().await.map_err(fail)?);
+            st.browser_lost = false;
+            if recovered {
+                warn!("relaunched chrome after transport loss");
+            }
         }
         // Blank page first so the network log captures the navigation itself.
         let page = st
@@ -2166,7 +2233,10 @@ impl BrowserServer {
     #[tool(description = "Browser status: running, mode, open pages")]
     async fn browser_status(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().await;
-        let running = st.browser.is_some();
+        let running = st
+            .browser
+            .as_ref()
+            .is_some_and(ab_browser::Browser::is_connected);
         let open_pages = request_owner().map_or_else(
             || st.pages.len(),
             |owner| {
@@ -2976,6 +3046,37 @@ mod tests {
             .await;
     }
 
+    /// A Chrome that exits mid-session used to leave every page handle in
+    /// place, so the next call failed with a raw `transport closed`. The reap
+    /// must clear those handles and latch a marker that survives nulling out
+    /// `browser`, otherwise the follow-up error cannot explain itself.
+    #[test]
+    fn reaping_is_a_no_op_without_a_browser() {
+        let mut state = State::default();
+        state.pages.clear();
+        assert!(!BrowserServer::reap_dead_browser(&mut state));
+        assert!(!state.browser_lost);
+    }
+
+    #[test]
+    fn lost_browser_marker_explains_stale_page_ids() {
+        let mut state = State::default();
+        // Plain bad id while the browser is fine.
+        let normal = BrowserServer::unresolved_page_error(&state, "p1").to_string();
+        assert!(
+            normal.contains("unknown page or owner"),
+            "expected the generic message, got: {normal}"
+        );
+
+        // Same id after Chrome died: actionable, and names the recovery call.
+        state.browser_lost = true;
+        let lost = BrowserServer::unresolved_page_error(&state, "p1").to_string();
+        assert!(
+            lost.contains("browser was lost") && lost.contains("browser_navigate"),
+            "expected the recovery hint, got: {lost}"
+        );
+    }
+
     #[tokio::test]
     async fn scoped_page_resolution_blocks_other_owners_for_activation_and_wheel() {
         let mut state = State::default();
@@ -3496,10 +3597,53 @@ async fn sse_post(
     StatusCode::ACCEPTED
 }
 
+/// Liveness for supervisors.
+///
+/// `ok` intentionally reports only that this HTTP server is up — existing
+/// consumers (clawgram, negotium) gate spawn readiness on it and must not
+/// start seeing `false` for a browser-level fault. The browser's real state
+/// is additive under `browser`, so a supervisor can distinguish the two
+/// failure classes that used to look identical:
+///
+///   * process dead        -> the request itself fails
+///   * process up, Chrome gone -> `ok:true` + `browser.connected:false`
+///
+/// The second case is the one that used to be unrecoverable: MCP `initialize`
+/// still succeeds, so a transport-level probe reports healthy while every
+/// browser tool fails against a closed CDP socket.
+///
+/// `try_lock` is deliberate. The browser mutex is held for the duration of an
+/// in-flight tool call (navigations can run for tens of seconds), and a health
+/// endpoint that blocks behind it would report a timeout — causing exactly the
+/// spurious restarts this is meant to prevent. A contended lock means a tool
+/// call is actively running, which is itself evidence the browser is alive.
 async fn health(
     axum::extract::State(state): axum::extract::State<SseState>,
 ) -> axum::Json<serde_json::Value> {
-    axum::Json(state.security.health())
+    let mut payload = state.security.health();
+    let browser = match state.browser.try_lock() {
+        Ok(st) => match st.browser.as_ref() {
+            Some(browser) => serde_json::json!({
+                "launched": true,
+                "connected": browser.is_connected(),
+                "pages": st.pages.len(),
+            }),
+            None => serde_json::json!({
+                "launched": false,
+                "connected": false,
+                "pages": 0,
+            }),
+        },
+        Err(_) => serde_json::json!({
+            "launched": true,
+            "connected": true,
+            "busy": true,
+        }),
+    };
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("browser".to_string(), browser);
+    }
+    axum::Json(payload)
 }
 
 async fn close_owner_pages(
