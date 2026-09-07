@@ -840,6 +840,13 @@ impl BrowserServer {
         true
     }
 
+    /// Whether the last page resolution failed because Chrome went away, as
+    /// opposed to the caller naming a page that never existed. Cleared when a
+    /// fresh browser launches, so it only ever reports the current loss.
+    async fn browser_was_lost(&self) -> bool {
+        self.state.lock().await.browser_lost
+    }
+
     /// Error for a page id that cannot be resolved.
     ///
     /// Distinguishes "you passed a bad id" from "the browser died and took
@@ -1280,12 +1287,28 @@ impl BrowserServer {
         Parameters(a): Parameters<NavigateArgs>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(pid) = &a.page {
-            let page = self.page_of(pid).await?;
-            page.navigate(&a.url).await.map_err(fail)?;
-            let snap = page.snapshot().await.map_err(fail)?;
-            self.store_snapshot(pid, snap.refs.clone(), snap.text.clone())
-                .await;
-            return Ok(ok(format!("page {pid}\nurl {}\n\n{}", a.url, snap.text)));
+            // A named page that no longer exists is usually a caller mistake,
+            // but it is also what every handle looks like after Chrome exits.
+            // In that second case the intent — "put this URL on screen" — is
+            // still satisfiable, and telling the caller to invoke
+            // `browser_navigate` when they just did is a wasted round trip.
+            // Fall through to opening a fresh tab; a genuinely unknown page id
+            // (no browser loss) still errors.
+            match self.page_of(pid).await {
+                Ok(page) => {
+                    page.navigate(&a.url).await.map_err(fail)?;
+                    let snap = page.snapshot().await.map_err(fail)?;
+                    self.store_snapshot(pid, snap.refs.clone(), snap.text.clone())
+                        .await;
+                    return Ok(ok(format!("page {pid}\nurl {}\n\n{}", a.url, snap.text)));
+                }
+                Err(err) => {
+                    if !self.browser_was_lost().await {
+                        return Err(err);
+                    }
+                    warn!("page '{pid}' was lost with the browser; opening a fresh tab");
+                }
+            }
         }
         let (id, text) = self.open_page(&a.url).await?;
         Ok(ok(format!("page {id}\nurl {}\n\n{}", a.url, text)))
@@ -3003,6 +3026,8 @@ mod tests {
         DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn capability_comparison_requires_an_exact_match() {
@@ -3044,6 +3069,23 @@ mod tests {
                 assert!(enforce_scoped_owner("other-owner", "release").is_err());
             })
             .await;
+    }
+
+    /// `browser_navigate` recovers a lost page by opening a fresh tab, but only
+    /// when the browser is what went missing. A merely wrong page id must keep
+    /// erroring, or a typo would silently discard the caller's tab.
+    #[tokio::test]
+    async fn lost_browser_is_distinguishable_from_a_bad_page_id() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let server = BrowserServer::with_state_and_broker(state.clone(), None, None);
+
+        assert!(
+            !server.browser_was_lost().await,
+            "a healthy server must not claim the browser was lost"
+        );
+
+        state.lock().await.browser_lost = true;
+        assert!(server.browser_was_lost().await);
     }
 
     /// A Chrome that exits mid-session used to leave every page handle in
