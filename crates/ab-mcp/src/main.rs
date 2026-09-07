@@ -246,11 +246,30 @@ struct State {
     /// Durable ownership for every page; one owner may have multiple tabs.
     page_owners: HashMap<String, String>,
     next: u64,
-    /// Set when a dead browser was reaped, cleared when a fresh one launches.
-    /// Sticky on purpose: the reap nulls out `browser`, so without this the
-    /// very next call could no longer tell "Chrome died and took your pages"
-    /// apart from "you passed a bad page id".
-    browser_lost: bool,
+    /// Owners whose pages vanished with a dead browser and have not yet
+    /// reopened one.
+    ///
+    /// Per owner rather than a single flag: a shared Chrome can hold pages for
+    /// several owners at once, and one global bool is consumed by whichever
+    /// owner recovers first. Every other owner then looks like it passed a bad
+    /// page id, which is the opposite of the truth — they lost their pages too.
+    /// An owner clears only its own entry, when it successfully opens a page.
+    lost_owners: HashSet<String>,
+}
+
+/// Key used for pages opened outside any owner scope (`request_owner() == None`).
+/// A real owner cannot collide with it: owners are caller-supplied identifiers
+/// and this one is not a legal MCP owner string.
+const UNSCOPED_OWNER: &str = "\u{0}unscoped";
+
+/// Outcome of resolving a caller-supplied page id, decided in one critical
+/// section so the answer cannot be invalidated before it is acted on.
+enum PageLookup {
+    Found(Page),
+    /// The page is gone because the browser died. Recoverable by reopening.
+    Lost,
+    /// No such page for this caller, on a browser that is working fine.
+    Unknown,
 }
 
 #[derive(Clone)]
@@ -829,22 +848,52 @@ impl BrowserServer {
             return false;
         }
         let lost_pages = st.pages.len();
+        // Remember who lost something before the maps go away. Recording this
+        // per owner is what lets the second owner to come back still be told
+        // "the browser died" instead of "unknown page".
+        for owner in st.page_owners.values() {
+            st.lost_owners.insert(owner.clone());
+        }
+        if st.pages.len() > st.page_owners.len() {
+            st.lost_owners.insert(UNSCOPED_OWNER.to_string());
+        }
         st.pages.clear();
         st.owners.clear();
         st.page_owners.clear();
         // Drop without `close()`: Chrome is already gone, so the shutdown
         // handshake would just block on the dead socket.
         st.browser = None;
-        st.browser_lost = true;
         warn!("cdp transport lost; discarded dead browser and {lost_pages} page handle(s)");
         true
     }
 
-    /// Whether the last page resolution failed because Chrome went away, as
-    /// opposed to the caller naming a page that never existed. Cleared when a
-    /// fresh browser launches, so it only ever reports the current loss.
-    async fn browser_was_lost(&self) -> bool {
-        self.state.lock().await.browser_lost
+    /// Identity used to scope loss bookkeeping for the current request.
+    fn loss_key() -> String {
+        request_owner().unwrap_or_else(|| UNSCOPED_OWNER.to_string())
+    }
+
+    /// Whether *this caller* is still waiting to recover from a browser death.
+    fn caller_lost_pages(st: &State) -> bool {
+        st.lost_owners.contains(&Self::loss_key())
+            || st.browser.as_ref().is_some_and(|b| !b.is_connected())
+    }
+
+    /// Resolve a page id and classify the outcome without releasing the lock.
+    ///
+    /// Deciding "found / lost / unknown" in one critical section is the point:
+    /// re-reading loss state after a failed lookup let a genuine typo be
+    /// reclassified as a browser loss whenever another owner reaped in
+    /// between, which silently discarded the caller's tab.
+    async fn lookup_page(&self, id: &str) -> PageLookup {
+        let mut st = self.state.lock().await;
+        Self::reap_dead_browser(&mut st);
+        let page = Self::resolve_page_id(&st, id)
+            .and_then(|page_id| st.pages.get(&page_id).map(|entry| entry.page.clone()));
+        match page {
+            Some(page) => PageLookup::Found(page),
+            None if Self::caller_lost_pages(&st) => PageLookup::Lost,
+            None => PageLookup::Unknown,
+        }
     }
 
     /// Error for a page id that cannot be resolved.
@@ -853,7 +902,7 @@ impl BrowserServer {
     /// every page with it" — the second one is actionable (re-navigate) and
     /// used to surface as an opaque transport error.
     fn unresolved_page_error(st: &State, id: &str) -> McpError {
-        if st.browser_lost || st.browser.as_ref().is_some_and(|b| !b.is_connected()) {
+        if Self::caller_lost_pages(st) {
             return fail(format!(
                 "browser was lost (chrome exited); page '{id}' and every other \
                  page handle are gone. Call browser_navigate to start a fresh browser."
@@ -889,14 +938,13 @@ impl BrowserServer {
 
     /// Clone the Page for a given id/owner (does not hold the lock across ops).
     async fn page_of(&self, id: &str) -> Result<Page, McpError> {
-        let mut st = self.state.lock().await;
-        Self::reap_dead_browser(&mut st);
-        let page_id =
-            Self::resolve_page_id(&st, id).ok_or_else(|| Self::unresolved_page_error(&st, id))?;
-        st.pages
-            .get(&page_id)
-            .map(|e| e.page.clone())
-            .ok_or_else(|| fail(format!("unknown page '{page_id}'")))
+        match self.lookup_page(id).await {
+            PageLookup::Found(page) => Ok(page),
+            PageLookup::Lost | PageLookup::Unknown => {
+                let st = self.state.lock().await;
+                Err(Self::unresolved_page_error(&st, id))
+            }
+        }
     }
 
     async fn begin_typing(
@@ -1103,9 +1151,12 @@ impl BrowserServer {
     /// Import tabs created by page JavaScript or target=_blank into the MCP page map.
     async fn sync_external_pages(&self) -> Result<Vec<String>, McpError> {
         let mut st = self.state.lock().await;
-        let Some(browser) = st.browser.as_ref().filter(|b| b.is_connected()) else {
-            // No browser, or one whose transport is gone. Either way there are
-            // no external tabs to import; `open_page` owns the recovery.
+        // Reap rather than skip. Merely ignoring a dead browser left the page
+        // maps intact, so `browser_tabs` (which calls this first) and
+        // `browser_status` kept advertising pages that no longer existed until
+        // some unrelated call happened to reap.
+        Self::reap_dead_browser(&mut st);
+        let Some(browser) = st.browser.as_ref() else {
             return Ok(Vec::new());
         };
         let targets = browser.page_targets().await.map_err(fail)?;
@@ -1222,11 +1273,14 @@ impl BrowserServer {
         let recovered = Self::reap_dead_browser(&mut st);
         if st.browser.is_none() {
             st.browser = Some(make_browser().await.map_err(fail)?);
-            st.browser_lost = false;
             if recovered {
                 warn!("relaunched chrome after transport loss");
             }
         }
+        // Clear only this caller's loss. A relaunch fixes the process for
+        // everyone, but the other owners still have no pages and must keep
+        // being told that, instead of being handed "unknown page".
+        st.lost_owners.remove(&Self::loss_key());
         // Blank page first so the network log captures the navigation itself.
         let page = st
             .browser
@@ -1294,18 +1348,19 @@ impl BrowserServer {
             // `browser_navigate` when they just did is a wasted round trip.
             // Fall through to opening a fresh tab; a genuinely unknown page id
             // (no browser loss) still errors.
-            match self.page_of(pid).await {
-                Ok(page) => {
+            match self.lookup_page(pid).await {
+                PageLookup::Found(page) => {
                     page.navigate(&a.url).await.map_err(fail)?;
                     let snap = page.snapshot().await.map_err(fail)?;
                     self.store_snapshot(pid, snap.refs.clone(), snap.text.clone())
                         .await;
                     return Ok(ok(format!("page {pid}\nurl {}\n\n{}", a.url, snap.text)));
                 }
-                Err(err) => {
-                    if !self.browser_was_lost().await {
-                        return Err(err);
-                    }
+                PageLookup::Unknown => {
+                    let st = self.state.lock().await;
+                    return Err(Self::unresolved_page_error(&st, pid));
+                }
+                PageLookup::Lost => {
                     warn!("page '{pid}' was lost with the browser; opening a fresh tab");
                 }
             }
@@ -2255,11 +2310,9 @@ impl BrowserServer {
     /// Report browser status: running, mode, open page count.
     #[tool(description = "Browser status: running, mode, open pages")]
     async fn browser_status(&self) -> Result<CallToolResult, McpError> {
-        let st = self.state.lock().await;
-        let running = st
-            .browser
-            .as_ref()
-            .is_some_and(ab_browser::Browser::is_connected);
+        let mut st = self.state.lock().await;
+        Self::reap_dead_browser(&mut st);
+        let running = st.browser.is_some();
         let open_pages = request_owner().map_or_else(
             || st.pages.len(),
             |owner| {
@@ -2608,6 +2661,10 @@ impl BrowserServer {
         }
         let mut st = self.state.lock().await;
         enforce_scoped_owner(owner, "claim")?;
+        // Claiming a page from a browser that already exited would hand the
+        // caller a handle that can only fail. Reap first so the check below
+        // sees the real page set.
+        Self::reap_dead_browser(&mut st);
         if !st.pages.contains_key(&a.page) {
             return Err(fail(format!("unknown page '{}'", a.page)));
         }
@@ -3026,8 +3083,6 @@ mod tests {
         DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     #[test]
     fn capability_comparison_requires_an_exact_match() {
@@ -3071,52 +3126,76 @@ mod tests {
             .await;
     }
 
-    /// `browser_navigate` recovers a lost page by opening a fresh tab, but only
-    /// when the browser is what went missing. A merely wrong page id must keep
-    /// erroring, or a typo would silently discard the caller's tab.
+    /// Loss is tracked per owner because a shared Chrome holds pages for
+    /// several owners at once. A single global flag is consumed by whichever
+    /// owner recovers first, after which every other owner is told it passed
+    /// a bad page id — the opposite of what happened to it.
     #[tokio::test]
-    async fn lost_browser_is_distinguishable_from_a_bad_page_id() {
-        let state = Arc::new(Mutex::new(State::default()));
-        let server = BrowserServer::with_state_and_broker(state.clone(), None, None);
+    async fn each_owner_recovers_its_own_loss() {
+        let mut state = State::default();
+        state.page_owners.insert("p1".into(), "owner-a".into());
+        state.page_owners.insert("p2".into(), "owner-b".into());
+        state.lost_owners.insert("owner-a".into());
+        state.lost_owners.insert("owner-b".into());
 
-        assert!(
-            !server.browser_was_lost().await,
-            "a healthy server must not claim the browser was lost"
-        );
+        // A recovers: only A's tombstone is consumed.
+        state.lost_owners.remove("owner-a");
 
-        state.lock().await.browser_lost = true;
-        assert!(server.browser_was_lost().await);
+        REQUEST_OWNER
+            .scope(Some("owner-a".to_string()), async {
+                assert!(
+                    !BrowserServer::caller_lost_pages(&state),
+                    "owner-a already reopened a page"
+                );
+            })
+            .await;
+        REQUEST_OWNER
+            .scope(Some("owner-b".to_string()), async {
+                assert!(
+                    BrowserServer::caller_lost_pages(&state),
+                    "owner-b still lost its pages and must be told so"
+                );
+                let msg = BrowserServer::unresolved_page_error(&state, "p2").to_string();
+                assert!(
+                    msg.contains("browser was lost"),
+                    "owner-b deserves the recovery hint, got: {msg}"
+                );
+            })
+            .await;
     }
 
-    /// A Chrome that exits mid-session used to leave every page handle in
-    /// place, so the next call failed with a raw `transport closed`. The reap
-    /// must clear those handles and latch a marker that survives nulling out
-    /// `browser`, otherwise the follow-up error cannot explain itself.
+    /// The reap must record who lost something before it clears the maps,
+    /// otherwise the owners are unknowable a moment later.
     #[test]
     fn reaping_is_a_no_op_without_a_browser() {
         let mut state = State::default();
-        state.pages.clear();
         assert!(!BrowserServer::reap_dead_browser(&mut state));
-        assert!(!state.browser_lost);
+        assert!(state.lost_owners.is_empty());
     }
 
-    #[test]
-    fn lost_browser_marker_explains_stale_page_ids() {
+    #[tokio::test]
+    async fn lost_marker_explains_stale_page_ids() {
         let mut state = State::default();
-        // Plain bad id while the browser is fine.
-        let normal = BrowserServer::unresolved_page_error(&state, "p1").to_string();
-        assert!(
-            normal.contains("unknown page or owner"),
-            "expected the generic message, got: {normal}"
-        );
+        REQUEST_OWNER
+            .scope(Some("owner-a".to_string()), async {
+                let normal = BrowserServer::unresolved_page_error(&state, "p1").to_string();
+                assert!(
+                    normal.contains("unknown page or owner"),
+                    "expected the generic message, got: {normal}"
+                );
+            })
+            .await;
 
-        // Same id after Chrome died: actionable, and names the recovery call.
-        state.browser_lost = true;
-        let lost = BrowserServer::unresolved_page_error(&state, "p1").to_string();
-        assert!(
-            lost.contains("browser was lost") && lost.contains("browser_navigate"),
-            "expected the recovery hint, got: {lost}"
-        );
+        state.lost_owners.insert("owner-a".into());
+        REQUEST_OWNER
+            .scope(Some("owner-a".to_string()), async {
+                let lost = BrowserServer::unresolved_page_error(&state, "p1").to_string();
+                assert!(
+                    lost.contains("browser was lost") && lost.contains("browser_navigate"),
+                    "expected the recovery hint, got: {lost}"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -3657,8 +3736,10 @@ async fn sse_post(
 /// `try_lock` is deliberate. The browser mutex is held for the duration of an
 /// in-flight tool call (navigations can run for tens of seconds), and a health
 /// endpoint that blocks behind it would report a timeout — causing exactly the
-/// spurious restarts this is meant to prevent. A contended lock means a tool
-/// call is actively running, which is itself evidence the browser is alive.
+/// spurious restarts this is meant to prevent. A contended lock is reported as
+/// an unknown verdict rather than a healthy one: the lock is also held during
+/// a cold start and during a call stuck on a dead socket, so "busy" says
+/// nothing about whether Chrome is attached.
 async fn health(
     axum::extract::State(state): axum::extract::State<SseState>,
 ) -> axum::Json<serde_json::Value> {
@@ -3676,9 +3757,17 @@ async fn health(
                 "pages": 0,
             }),
         },
+        // Contended: a tool call holds the browser mutex. That is *not*
+        // evidence the browser is alive — `open_page` holds this lock across
+        // `make_browser()` and across CDP calls, so the contended window
+        // covers both a cold start with no browser yet and a request blocked
+        // on a socket whose Chrome already exited. Reporting `connected:true`
+        // here manufactured health for up to the 30s CDP timeout and hid the
+        // exact fault this endpoint exists to expose. Say "unknown" instead;
+        // supervisors treat a missing verdict as "do not act".
         Err(_) => serde_json::json!({
-            "launched": true,
-            "connected": true,
+            "launched": serde_json::Value::Null,
+            "connected": serde_json::Value::Null,
             "busy": true,
         }),
     };
