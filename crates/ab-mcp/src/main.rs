@@ -5,13 +5,15 @@
 //!
 //! Core loop the tools encode: **snapshot -> act -> verify**.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use ab_browser::{
     Browser, ConsoleLog, ElementRef, LaunchOptions, NetworkLog, Page, PointerAction,
     PointerLocation, PointerRequest,
 };
+use arc_swap::ArcSwap;
 use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ContentBlock, ListToolsResult,
@@ -144,6 +146,8 @@ struct WebAuthnConfig {
 }
 
 struct PageEntry {
+    generation: u64,
+    stalled_at_ms: Option<u64>,
     page: Page,
     refs: HashMap<String, ElementRef>,
     last_text: String,
@@ -236,9 +240,18 @@ fn truncate_text(mut value: String, limit: usize) -> String {
     value
 }
 
-#[derive(Default)]
 struct State {
-    browser: Option<Browser>,
+    browser: Option<Arc<Browser>>,
+    retired_browser: Option<Arc<Browser>>,
+    browser_generation: u64,
+    draining: bool,
+    browser_lifecycle: Arc<Mutex<()>>,
+    external_page_sync: Arc<Mutex<()>>,
+    launching: bool,
+    health: Arc<HealthState>,
+    recovery_attempts: VecDeque<std::time::Instant>,
+    recovery_cooldown_until: Option<std::time::Instant>,
+    recovery_required: bool,
     pages: HashMap<String, PageEntry>,
     /// Stable caller-selected aliases for pages. This lets an agent claim pN
     /// once and use its owner name in every later `page` argument.
@@ -257,6 +270,122 @@ struct State {
     lost_owners: HashSet<String>,
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            browser: None,
+            retired_browser: None,
+            browser_generation: 0,
+            draining: false,
+            browser_lifecycle: Arc::new(Mutex::new(())),
+            external_page_sync: Arc::new(Mutex::new(())),
+            launching: false,
+            health: Arc::new(HealthState::new()),
+            recovery_attempts: VecDeque::new(),
+            recovery_cooldown_until: None,
+            recovery_required: false,
+            pages: HashMap::new(),
+            owners: HashMap::new(),
+            page_owners: HashMap::new(),
+            next: 0,
+            lost_owners: HashSet::new(),
+        }
+    }
+}
+
+const HEALTH_ABSENT: u8 = 0;
+const HEALTH_LAUNCHING: u8 = 1;
+const HEALTH_READY: u8 = 2;
+const HEALTH_DEAD: u8 = 3;
+const HEALTH_DRAINING: u8 = 4;
+
+struct HealthState {
+    snapshot: ArcSwap<HealthSnapshot>,
+    inflight_tools: AtomicU64,
+    spawn_nonce: String,
+    started_at: std::time::Instant,
+}
+
+struct HealthSnapshot {
+    browser: Option<Arc<Browser>>,
+    generation: u64,
+    state: u8,
+    pages: u64,
+    stalled_pages: u64,
+    draining: bool,
+    recovery_attempts: Vec<std::time::Instant>,
+    cooldown_until: Option<std::time::Instant>,
+}
+
+impl HealthState {
+    fn new() -> Self {
+        Self {
+            snapshot: ArcSwap::from_pointee(HealthSnapshot {
+                browser: None,
+                generation: 0,
+                state: HEALTH_ABSENT,
+                pages: 0,
+                stalled_pages: 0,
+                draining: false,
+                recovery_attempts: Vec::new(),
+                cooldown_until: None,
+            }),
+            inflight_tools: AtomicU64::new(0),
+            spawn_nonce: random_token(),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    fn publish(&self, state: &State) {
+        let browser = state
+            .browser
+            .clone()
+            .or_else(|| state.retired_browser.clone());
+        let lifecycle_state = if state.draining {
+            HEALTH_DRAINING
+        } else if state.launching {
+            HEALTH_LAUNCHING
+        } else if state
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.is_connected())
+        {
+            HEALTH_READY
+        } else if state.browser.is_some() || state.retired_browser.is_some() {
+            HEALTH_DEAD
+        } else {
+            HEALTH_ABSENT
+        };
+        self.snapshot.store(Arc::new(HealthSnapshot {
+            browser,
+            generation: state.browser_generation,
+            state: lifecycle_state,
+            pages: state.pages.len() as u64,
+            stalled_pages: state
+                .pages
+                .values()
+                .filter(|entry| entry.stalled_at_ms.is_some())
+                .count() as u64,
+            draining: state.draining,
+            recovery_attempts: state.recovery_attempts.iter().copied().collect(),
+            cooldown_until: state.recovery_cooldown_until,
+        }));
+    }
+
+    fn begin_tool(self: &Arc<Self>) -> InflightToolGuard {
+        self.inflight_tools.fetch_add(1, Ordering::AcqRel);
+        InflightToolGuard(self.clone())
+    }
+}
+
+struct InflightToolGuard(Arc<HealthState>);
+
+impl Drop for InflightToolGuard {
+    fn drop(&mut self) {
+        self.0.inflight_tools.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Key used for pages opened outside any owner scope (`request_owner() == None`).
 /// A real owner cannot collide with it: owners are caller-supplied identifiers
 /// and this one is not a legal MCP owner string.
@@ -265,11 +394,18 @@ const UNSCOPED_OWNER: &str = "\u{0}unscoped";
 /// Outcome of resolving a caller-supplied page id, decided in one critical
 /// section so the answer cannot be invalidated before it is acted on.
 enum PageLookup {
-    Found(Page),
+    Found(PageLease),
     /// The page is gone because the browser died. Recoverable by reopening.
     Lost,
     /// No such page for this caller, on a browser that is working fine.
     Unknown,
+}
+
+#[derive(Clone)]
+struct PageLease {
+    page_id: String,
+    generation: u64,
+    page: Page,
 }
 
 #[derive(Clone)]
@@ -390,6 +526,11 @@ struct ClaimPageArgs {
 struct OwnerArg {
     /// Owner alias previously registered with browser_claim_page.
     owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelaunchQuery {
+    expected_generation: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -761,7 +902,48 @@ fn ok(s: impl Into<String>) -> CallToolResult {
 }
 
 fn fail<E: std::fmt::Display>(e: E) -> McpError {
-    McpError::internal_error(e.to_string(), None)
+    let message = e.to_string();
+    let class = if message.contains("session command stalled") {
+        Some("page_stalled")
+    } else if message.contains("transport closed") || message.contains("browser was lost") {
+        Some("transport_lost")
+    } else if message.contains("browser generation changed") {
+        Some("stale_generation")
+    } else if message.contains("browser profile is already in use") {
+        Some("profile_busy")
+    } else if message.contains("recovery circuit") {
+        Some("recovery_circuit_open")
+    } else if message.contains("request timed out") {
+        Some("browser_suspect")
+    } else {
+        None
+    };
+    McpError::internal_error(
+        message,
+        class.map(|class| serde_json::json!({ "class": class })),
+    )
+}
+
+fn enrich_browser_error(mut error: McpError, health: &HealthState) -> McpError {
+    let snapshot = health.snapshot.load_full();
+    let connected = snapshot
+        .browser
+        .as_ref()
+        .is_some_and(|browser| browser.is_connected());
+    let generation = snapshot.generation;
+    if let Some(data) = error
+        .data
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if data.get("class").and_then(serde_json::Value::as_str) == Some("browser_suspect")
+            && !connected
+        {
+            data.insert("class".into(), serde_json::json!("transport_lost"));
+        }
+        data.insert("generation".into(), serde_json::json!(generation));
+    }
+    error
 }
 
 fn validate_wheel_input(delta_y: f64, x: f64, y: f64) -> Result<(), &'static str> {
@@ -843,7 +1025,7 @@ impl BrowserServer {
         if st
             .browser
             .as_ref()
-            .is_none_or(ab_browser::Browser::is_connected)
+            .is_none_or(|browser| browser.is_connected())
         {
             return false;
         }
@@ -862,9 +1044,117 @@ impl BrowserServer {
         st.page_owners.clear();
         // Drop without `close()`: Chrome is already gone, so the shutdown
         // handshake would just block on the dead socket.
-        st.browser = None;
+        st.retired_browser = st.browser.take();
+        st.recovery_required = true;
+        st.health.publish(st);
         warn!("cdp transport lost; discarded dead browser and {lost_pages} page handle(s)");
         true
+    }
+
+    fn admit_recovery(st: &mut State) -> Result<(), McpError> {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        const MAX_ATTEMPTS: usize = 3;
+
+        let now = std::time::Instant::now();
+        while st
+            .recovery_attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= WINDOW)
+        {
+            st.recovery_attempts.pop_front();
+        }
+        if let Some(until) = st.recovery_cooldown_until {
+            if until > now {
+                st.health.publish(st);
+                return Err(fail("browser recovery circuit is open"));
+            }
+            // One half-open attempt starts a fresh observation window.
+            st.recovery_attempts.clear();
+            st.recovery_cooldown_until = None;
+        }
+        if st.recovery_attempts.len() >= MAX_ATTEMPTS {
+            st.recovery_cooldown_until = Some(now + COOLDOWN);
+            st.health.publish(st);
+            return Err(fail("browser recovery circuit opened for 5 minutes"));
+        }
+        st.recovery_attempts.push_back(now);
+        st.health.publish(st);
+        Ok(())
+    }
+
+    /// Return one live browser generation, launching at most once. The
+    /// lifecycle mutex serializes only launch/reap; no State guard crosses
+    /// process or CDP I/O.
+    async fn ensure_browser(&self) -> Result<(Arc<Browser>, u64, bool), McpError> {
+        let lifecycle = { self.state.lock().await.browser_lifecycle.clone() };
+        let _lifecycle = lifecycle.lock().await;
+        let (existing, generation, retired, recovered, recovery_required, draining) = {
+            let mut st = self.state.lock().await;
+            let recovered = Self::reap_dead_browser(&mut st);
+            if st.browser.is_none() && !st.draining {
+                st.launching = true;
+            }
+            st.health.publish(&st);
+            (
+                st.browser.clone(),
+                st.browser_generation,
+                st.retired_browser.take(),
+                recovered,
+                st.recovery_required,
+                st.draining,
+            )
+        };
+
+        if draining {
+            return Err(fail("browser process is draining"));
+        }
+        if let Some(browser) = existing {
+            return Ok((browser, generation, recovered));
+        }
+        if recovery_required {
+            let mut st = self.state.lock().await;
+            if let Err(error) = Self::admit_recovery(&mut st) {
+                st.launching = false;
+                st.health.publish(&st);
+                return Err(error);
+            }
+        }
+        if let Some(browser) = retired {
+            browser.close().await;
+        }
+
+        let browser = match make_browser().await {
+            Ok(browser) => Arc::new(browser),
+            Err(error) => {
+                let mut st = self.state.lock().await;
+                st.launching = false;
+                st.health.publish(&st);
+                return Err(fail(error));
+            }
+        };
+        let mut st = self.state.lock().await;
+        st.launching = false;
+        if st.draining {
+            st.health.publish(&st);
+            drop(st);
+            browser.close().await;
+            return Err(fail("browser process is draining"));
+        }
+        if let Some(existing) = st.browser.as_ref() {
+            let existing = existing.clone();
+            let generation = st.browser_generation;
+            st.health.publish(&st);
+            drop(st);
+            browser.close().await;
+            return Ok((existing, generation, recovered));
+        }
+        st.browser_generation = st.browser_generation.wrapping_add(1).max(1);
+        let generation = st.browser_generation;
+        st.browser = Some(browser.clone());
+        st.recovery_required = false;
+        st.health.publish(&st);
+        Ok((browser, generation, recovered || recovery_required))
     }
 
     /// Identity used to scope loss bookkeeping for the current request.
@@ -887,10 +1177,27 @@ impl BrowserServer {
     async fn lookup_page(&self, id: &str) -> PageLookup {
         let mut st = self.state.lock().await;
         Self::reap_dead_browser(&mut st);
-        let page = Self::resolve_page_id(&st, id)
-            .and_then(|page_id| st.pages.get(&page_id).map(|entry| entry.page.clone()));
+        let resolved_page_id = Self::resolve_page_id(&st, id);
+        let (page, stale_generation) = resolved_page_id
+            .as_ref()
+            .and_then(|page_id| st.pages.get(page_id))
+            .map_or((None, false), |entry| {
+                if entry.generation == st.browser_generation {
+                    (
+                        Some(PageLease {
+                            page_id: resolved_page_id.clone().unwrap_or_default(),
+                            generation: entry.generation,
+                            page: entry.page.clone(),
+                        }),
+                        false,
+                    )
+                } else {
+                    (None, true)
+                }
+            });
         match page {
             Some(page) => PageLookup::Found(page),
+            None if stale_generation => PageLookup::Lost,
             None if Self::caller_lost_pages(&st) => PageLookup::Lost,
             None => PageLookup::Unknown,
         }
@@ -938,13 +1245,25 @@ impl BrowserServer {
 
     /// Clone the Page for a given id/owner (does not hold the lock across ops).
     async fn page_of(&self, id: &str) -> Result<Page, McpError> {
+        Ok(self.page_lease_of(id).await?.page)
+    }
+
+    async fn page_lease_of(&self, id: &str) -> Result<PageLease, McpError> {
         match self.lookup_page(id).await {
-            PageLookup::Found(page) => Ok(page),
+            PageLookup::Found(lease) => Ok(lease),
             PageLookup::Lost | PageLookup::Unknown => {
                 let st = self.state.lock().await;
                 Err(Self::unresolved_page_error(&st, id))
             }
         }
+    }
+
+    async fn matching_page_lease(&self, id: &str, page: &Page) -> Result<PageLease, McpError> {
+        let lease = self.page_lease_of(id).await?;
+        if !lease.page.same_identity(page) {
+            return Err(fail("browser generation changed during page operation"));
+        }
+        Ok(lease)
     }
 
     async fn begin_typing(
@@ -1083,24 +1402,36 @@ impl BrowserServer {
     }
 
     /// Persist a fresh snapshot (refs + text) for a page.
-    async fn store_snapshot(&self, id: &str, refs: HashMap<String, ElementRef>, text: String) {
+    async fn store_snapshot(
+        &self,
+        lease: &PageLease,
+        refs: HashMap<String, ElementRef>,
+        text: String,
+    ) -> Result<(), McpError> {
         let mut st = self.state.lock().await;
-        let Some(page_id) = Self::resolve_page_id(&st, id) else {
-            return;
-        };
-        if let Some(e) = st.pages.get_mut(&page_id) {
-            e.refs = refs;
-            e.last_text = text;
+        if st.browser_generation != lease.generation {
+            return Err(fail("browser generation changed before snapshot commit"));
         }
+        let Some(entry) = st.pages.get_mut(&lease.page_id).filter(|entry| {
+            entry.generation == lease.generation && entry.page.same_identity(&lease.page)
+        }) else {
+            return Err(fail("browser generation changed before snapshot commit"));
+        };
+        entry.refs = refs;
+        entry.last_text = text;
+        Ok(())
     }
 
-    async fn last_text(&self, id: &str) -> String {
+    async fn last_text(&self, lease: &PageLease) -> String {
         let st = self.state.lock().await;
-        let Some(page_id) = Self::resolve_page_id(&st, id) else {
+        if st.browser_generation != lease.generation {
             return String::new();
-        };
+        }
         st.pages
-            .get(&page_id)
+            .get(&lease.page_id)
+            .filter(|entry| {
+                entry.generation == lease.generation && entry.page.same_identity(&lease.page)
+            })
             .map(|e| e.last_text.clone())
             .unwrap_or_default()
     }
@@ -1150,26 +1481,29 @@ impl BrowserServer {
 
     /// Import tabs created by page JavaScript or target=_blank into the MCP page map.
     async fn sync_external_pages(&self) -> Result<Vec<String>, McpError> {
-        let mut st = self.state.lock().await;
-        // Reap rather than skip. Merely ignoring a dead browser left the page
-        // maps intact, so `browser_tabs` (which calls this first) and
-        // `browser_status` kept advertising pages that no longer existed until
-        // some unrelated call happened to reap.
-        Self::reap_dead_browser(&mut st);
-        let Some(browser) = st.browser.as_ref() else {
-            return Ok(Vec::new());
+        let sync = { self.state.lock().await.external_page_sync.clone() };
+        let _sync = sync.lock().await;
+        let (browser, generation, known, target_to_page, page_owners) = {
+            let mut st = self.state.lock().await;
+            Self::reap_dead_browser(&mut st);
+            let Some(browser) = st.browser.clone() else {
+                return Ok(Vec::new());
+            };
+            (
+                browser,
+                st.browser_generation,
+                st.pages
+                    .values()
+                    .map(|entry| entry.page.target_id().to_string())
+                    .collect::<std::collections::HashSet<_>>(),
+                st.pages
+                    .iter()
+                    .map(|(page_id, entry)| (entry.page.target_id().to_string(), page_id.clone()))
+                    .collect::<HashMap<_, _>>(),
+                st.page_owners.clone(),
+            )
         };
         let targets = browser.page_targets().await.map_err(fail)?;
-        let known: std::collections::HashSet<String> = st
-            .pages
-            .values()
-            .map(|entry| entry.page.target_id().to_string())
-            .collect();
-        let target_to_page: HashMap<String, String> = st
-            .pages
-            .iter()
-            .map(|(page_id, entry)| (entry.page.target_id().to_string(), page_id.clone()))
-            .collect();
         let new_targets: Vec<(String, String, Option<String>)> = targets
             .into_iter()
             .filter(|(target_id, url, _)| !known.contains(target_id) && url != "about:blank")
@@ -1180,22 +1514,36 @@ impl BrowserServer {
             let inherited_owner = opener_id
                 .as_ref()
                 .and_then(|target_id| target_to_page.get(target_id))
-                .and_then(|page_id| st.page_owners.get(page_id))
+                .and_then(|page_id| page_owners.get(page_id))
                 .cloned();
-            let page = st
-                .browser
-                .as_ref()
-                .unwrap()
-                .attach_page(&target_id)
-                .await
-                .map_err(fail)?;
+            let page = browser.attach_page(&target_id).await.map_err(fail)?;
             let netlog = page.enable_network_log().await.ok();
             let snap = page.snapshot().await.map_err(fail)?;
+            let mut st = self.state.lock().await;
+            if st.browser_generation != generation
+                || st
+                    .browser
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &browser))
+            {
+                drop(st);
+                let _ = page.close().await;
+                return Err(fail("browser generation changed while importing a page"));
+            }
+            if st
+                .pages
+                .values()
+                .any(|entry| entry.page.target_id() == target_id)
+            {
+                continue;
+            }
             st.next += 1;
             let id = format!("p{}", st.next);
             st.pages.insert(
                 id.clone(),
                 PageEntry {
+                    generation,
+                    stalled_at_ms: None,
                     page,
                     refs: snap.refs,
                     last_text: snap.text,
@@ -1210,6 +1558,7 @@ impl BrowserServer {
                 st.page_owners.insert(id.clone(), owner);
             }
             added.push(id);
+            st.health.publish(&st);
         }
         Ok(added)
     }
@@ -1265,40 +1614,37 @@ impl BrowserServer {
     /// Open a fresh tab (launching the browser if needed), navigate it, and
     /// register it. Returns (page_id, snapshot_text).
     async fn open_page(&self, url: &str) -> Result<(String, String), McpError> {
-        let mut st = self.state.lock().await;
-        // Recover from a Chrome that exited under us. `browser_navigate` is the
-        // one tool that does not need a pre-existing page, which makes it the
-        // natural re-entry point: an agent that hits `transport closed` can get
-        // a working browser back by navigating, with no supervisor involvement.
-        let recovered = Self::reap_dead_browser(&mut st);
-        if st.browser.is_none() {
-            st.browser = Some(make_browser().await.map_err(fail)?);
-            if recovered {
-                warn!("relaunched chrome after transport loss");
-            }
+        let (browser, generation, recovered) = self.ensure_browser().await?;
+        if recovered {
+            warn!(generation, "relaunched chrome after transport loss");
         }
-        // Clear only this caller's loss. A relaunch fixes the process for
-        // everyone, but the other owners still have no pages and must keep
-        // being told that, instead of being handed "unknown page".
-        st.lost_owners.remove(&Self::loss_key());
         // Blank page first so the network log captures the navigation itself.
-        let page = st
-            .browser
-            .as_ref()
-            .unwrap()
-            .new_page("about:blank")
-            .await
-            .map_err(fail)?;
+        let page = browser.new_page("about:blank").await.map_err(fail)?;
         let netlog = page.enable_network_log().await.ok();
         if !url.is_empty() && url != "about:blank" {
             page.navigate(url).await.map_err(fail)?;
         }
         let snap = page.snapshot().await.map_err(fail)?;
+        let mut st = self.state.lock().await;
+        if st.browser_generation != generation
+            || st
+                .browser
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, &browser))
+        {
+            drop(st);
+            let _ = page.close().await;
+            return Err(fail("browser generation changed while opening a page"));
+        }
+        // Clear only this caller's loss after a page is successfully committed.
+        st.lost_owners.remove(&Self::loss_key());
         st.next += 1;
         let id = format!("p{}", st.next);
         st.pages.insert(
             id.clone(),
             PageEntry {
+                generation,
+                stalled_at_ms: None,
                 page,
                 refs: snap.refs.clone(),
                 last_text: snap.text.clone(),
@@ -1312,17 +1658,19 @@ impl BrowserServer {
             st.owners.insert(owner.clone(), id.clone());
             st.page_owners.insert(id.clone(), owner);
         }
+        st.health.publish(&st);
         Ok((id, snap.text))
     }
 
     /// After an action: wait for settle, re-snapshot, diff vs the previous
     /// snapshot, persist the new one, and return the diff for the agent.
     async fn settle_diff(&self, id: &str, page: &Page) -> Result<String, McpError> {
-        let before = self.last_text(id).await;
+        let lease = self.matching_page_lease(id, page).await?;
+        let before = self.last_text(&lease).await;
         page.settle().await;
         let snap = page.snapshot().await.map_err(fail)?;
         let diff = snapshot_diff(&before, &snap.text);
-        self.store_snapshot(id, snap.refs, snap.text).await;
+        self.store_snapshot(&lease, snap.refs, snap.text).await?;
         let new_pages = self.sync_external_pages().await?;
         if new_pages.is_empty() {
             Ok(diff)
@@ -1349,11 +1697,11 @@ impl BrowserServer {
             // Fall through to opening a fresh tab; a genuinely unknown page id
             // (no browser loss) still errors.
             match self.lookup_page(pid).await {
-                PageLookup::Found(page) => {
-                    page.navigate(&a.url).await.map_err(fail)?;
-                    let snap = page.snapshot().await.map_err(fail)?;
-                    self.store_snapshot(pid, snap.refs.clone(), snap.text.clone())
-                        .await;
+                PageLookup::Found(lease) => {
+                    lease.page.navigate(&a.url).await.map_err(fail)?;
+                    let snap = lease.page.snapshot().await.map_err(fail)?;
+                    self.store_snapshot(&lease, snap.refs.clone(), snap.text.clone())
+                        .await?;
                     return Ok(ok(format!("page {pid}\nurl {}\n\n{}", a.url, snap.text)));
                 }
                 PageLookup::Unknown => {
@@ -1386,10 +1734,10 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<BoundedPageArg>,
     ) -> Result<CallToolResult, McpError> {
-        let page = self.page_of(&a.page).await?;
-        let snap = page.snapshot().await.map_err(fail)?;
-        self.store_snapshot(&a.page, snap.refs.clone(), snap.text.clone())
-            .await;
+        let lease = self.page_lease_of(&a.page).await?;
+        let snap = lease.page.snapshot().await.map_err(fail)?;
+        self.store_snapshot(&lease, snap.refs.clone(), snap.text.clone())
+            .await?;
         let output = format!("page {}\n\n{}", a.page, snap.text);
         Ok(ok(match a.max_length {
             Some(limit) => truncate_text(output, limit),
@@ -2313,6 +2661,7 @@ impl BrowserServer {
         let mut st = self.state.lock().await;
         Self::reap_dead_browser(&mut st);
         let running = st.browser.is_some();
+        let generation = st.browser_generation;
         let open_pages = request_owner().map_or_else(
             || st.pages.len(),
             |owner| {
@@ -2373,7 +2722,7 @@ impl BrowserServer {
             "blocked (strict default)"
         };
         Ok(ok(format!(
-            "running: {running}\nmode: {mode}\ndetectable diagnostics: {detectable_diagnostics}\nopen pages: {open_pages}\nvirtual authenticators: {virtual_authenticators}\ndialog handlers: {dialog_handlers}"
+            "running: {running}\ngeneration: {generation}\nmode: {mode}\ndetectable diagnostics: {detectable_diagnostics}\nopen pages: {open_pages}\nvirtual authenticators: {virtual_authenticators}\ndialog handlers: {dialog_handlers}"
         )))
     }
 
@@ -2401,6 +2750,7 @@ impl BrowserServer {
                 if let Some(e) = st.pages.get_mut(&page_id) {
                     e.consolelog = Some(l.clone());
                 }
+                drop(st);
                 // Give a brief moment for buffered messages after enabling.
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 l
@@ -2546,10 +2896,10 @@ impl BrowserServer {
         &self,
         Parameters(a): Parameters<PageArg>,
     ) -> Result<CallToolResult, McpError> {
-        let page = self.page_of(&a.page).await?;
-        let snap = page.snapshot().await.map_err(fail)?;
-        self.store_snapshot(&a.page, snap.refs.clone(), snap.text.clone())
-            .await;
+        let lease = self.page_lease_of(&a.page).await?;
+        let snap = lease.page.snapshot().await.map_err(fail)?;
+        self.store_snapshot(&lease, snap.refs.clone(), snap.text.clone())
+            .await?;
         Ok(ok(format!("page {}\n\n{}", a.page, snap.text)))
     }
 
@@ -2581,15 +2931,21 @@ impl BrowserServer {
                 st.page_owners.remove(page_id);
             }
             st.owners.remove(&owner);
+            st.health.publish(&st);
             return Ok(ok(format!("closed {} owner page(s)", closed.len())));
         }
 
+        let lifecycle = { self.state.lock().await.browser_lifecycle.clone() };
+        let _lifecycle = lifecycle.lock().await;
         let browser = {
             let mut st = self.state.lock().await;
             st.pages.clear();
             st.owners.clear();
             st.page_owners.clear();
-            st.browser.take()
+            let browser = st.browser.take().or_else(|| st.retired_browser.take());
+            st.recovery_required = false;
+            st.health.publish(&st);
+            browser
         };
         if let Some(b) = browser {
             b.close().await;
@@ -2740,6 +3096,7 @@ impl BrowserServer {
         if st.pages.remove(&page_id).is_some() {
             st.owners.retain(|_, claimed| claimed != &page_id);
             st.page_owners.remove(&page_id);
+            st.health.publish(&st);
             Ok(ok(format!("closed {page_id}")))
         } else {
             Err(fail(format!("unknown page '{page_id}'")))
@@ -2911,6 +3268,8 @@ impl rmcp::ServerHandler for BrowserServer {
                 None,
             ));
         }
+        let health = { self.state.lock().await.health.clone() };
+        let _inflight = health.begin_tool();
         let owner = context
             .extensions
             .get::<http::request::Parts>()
@@ -2957,21 +3316,81 @@ impl rmcp::ServerHandler for BrowserServer {
         } else {
             None
         };
+        let requested_page = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("page"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let page_marker = if let Some(requested_page) = requested_page.as_deref() {
+            let state = self.state.lock().await;
+            let page_id = if let Some(owner) = owner.as_ref() {
+                if requested_page == owner {
+                    state.owners.get(owner).cloned()
+                } else if state.page_owners.get(requested_page) == Some(owner) {
+                    Some(requested_page.to_string())
+                } else {
+                    None
+                }
+            } else if state.pages.contains_key(requested_page) {
+                Some(requested_page.to_string())
+            } else {
+                state.owners.get(requested_page).cloned()
+            };
+            page_id.and_then(|page_id| {
+                state.pages.get(&page_id).map(|entry| PageLease {
+                    page_id,
+                    generation: entry.generation,
+                    page: entry.page.clone(),
+                })
+            })
+        } else {
+            None
+        };
         let result = REQUEST_OWNER
             .scope(owner, async {
                 self.tool_router
                     .call(ToolCallContext::new(self, request, context))
                     .await
             })
-            .await;
+            .await
+            .map_err(|error| enrich_browser_error(error, &health));
+        if let Some(marker) = page_marker {
+            let stalled = result.as_ref().err().is_some_and(|error| {
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("class"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("page_stalled")
+            });
+            if stalled || result.is_ok() {
+                let mut state = self.state.lock().await;
+                let generation = state.browser_generation;
+                if let Some(entry) = state.pages.get_mut(&marker.page_id).filter(|entry| {
+                    generation == marker.generation
+                        && entry.generation == marker.generation
+                        && entry.page.same_identity(&marker.page)
+                }) {
+                    entry.stalled_at_ms = stalled.then(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                    });
+                }
+                state.health.publish(&state);
+            }
+        }
         let Some((broker, lease, boundary)) = broker_context else {
             return result;
         };
-        let unredacted = match result {
-            Ok(value) => value,
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
-        };
-        let value = serde_json::to_value(unredacted).map_err(|_| {
+        let is_error = result.is_err();
+        let value = match result {
+            Ok(value) => serde_json::to_value(value),
+            Err(error) => serde_json::to_value(error),
+        }
+        .map_err(|_| {
             McpError::internal_error("browser output was blocked before secure redaction", None)
         })?;
         let secured = broker
@@ -2980,9 +3399,15 @@ impl rmcp::ServerHandler for BrowserServer {
             .map_err(|_| {
                 McpError::internal_error("browser output was blocked by secure redaction", None)
             })?;
-        serde_json::from_value(secured).map_err(|_| {
-            McpError::internal_error("secure broker returned invalid browser output", None)
-        })
+        if is_error {
+            Err(serde_json::from_value(secured).map_err(|_| {
+                McpError::internal_error("secure broker returned invalid browser error", None)
+            })?)
+        } else {
+            serde_json::from_value(secured).map_err(|_| {
+                McpError::internal_error("secure broker returned invalid browser output", None)
+            })
+        }
     }
 
     async fn list_tools(
@@ -3077,10 +3502,11 @@ Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_NO_STE
 mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
-        force_scoped_owner_argument, parse_allowed_tools, parse_cli_from, parse_connect_port,
-        release_owner_claim, snapshot_diff, truncate_text, validate_wheel_input,
-        webdriver_value_is_human, BrowserServer, IframeTypeArgs, State, TypeArgs, WebAuthnConfig,
-        DEFAULT_MAX_OUTPUT_LIMIT, REQUEST_OWNER,
+        enrich_browser_error, fail, force_scoped_owner_argument, parse_allowed_tools,
+        parse_cli_from, parse_connect_port, release_owner_claim, snapshot_diff, truncate_text,
+        validate_wheel_input, webdriver_value_is_human, BrowserServer, IframeTypeArgs, State,
+        TypeArgs, WebAuthnConfig, DEFAULT_MAX_OUTPUT_LIMIT, HEALTH_DRAINING, HEALTH_LAUNCHING,
+        REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
 
@@ -3442,6 +3868,74 @@ mod tests {
         assert!(webdriver_value_is_human(&serde_json::json!("false")));
         assert!(!webdriver_value_is_human(&serde_json::json!("true")));
     }
+
+    #[test]
+    fn health_snapshot_tracks_launching_and_draining_without_state_lock() {
+        let mut state = State {
+            launching: true,
+            ..Default::default()
+        };
+        let health = state.health.clone();
+        health.publish(&state);
+        assert_eq!(health.snapshot.load().state, HEALTH_LAUNCHING);
+
+        state.launching = false;
+        state.draining = true;
+        health.publish(&state);
+        let snapshot = health.snapshot.load();
+        assert_eq!(snapshot.state, HEALTH_DRAINING);
+        assert!(snapshot.draining);
+    }
+
+    #[test]
+    fn browser_errors_include_a_machine_readable_class_and_generation() {
+        let state = State {
+            browser_generation: 7,
+            ..Default::default()
+        };
+        state.health.publish(&state);
+        let error = enrich_browser_error(fail("session command stalled after 30s"), &state.health);
+        let data = error.data.unwrap();
+        assert_eq!(data["class"], "page_stalled");
+        assert_eq!(data["generation"], 7);
+    }
+
+    #[tokio::test]
+    async fn draining_state_rejects_launch_without_starting_chrome() {
+        let server = BrowserServer::new();
+        {
+            let mut state = server.state.lock().await;
+            state.draining = true;
+            state.health.publish(&state);
+        }
+        let error = match server.ensure_browser().await {
+            Ok(_) => panic!("draining state unexpectedly launched Chrome"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("draining"));
+    }
+
+    #[test]
+    fn recovery_circuit_opens_after_three_attempts_in_ten_minutes() {
+        let mut state = State::default();
+        assert!(BrowserServer::admit_recovery(&mut state).is_ok());
+        assert!(BrowserServer::admit_recovery(&mut state).is_ok());
+        assert!(BrowserServer::admit_recovery(&mut state).is_ok());
+        let error = BrowserServer::admit_recovery(&mut state).unwrap_err();
+        assert!(error.message.contains("circuit opened"));
+        assert!(state.recovery_cooldown_until.is_some());
+        let snapshot = state.health.snapshot.load();
+        assert_eq!(snapshot.recovery_attempts.len(), 3);
+        assert!(snapshot.cooldown_until.is_some());
+
+        state.recovery_cooldown_until = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(BrowserServer::admit_recovery(&mut state).is_ok());
+        assert_eq!(state.recovery_attempts.len(), 1);
+    }
 }
 
 struct Cli {
@@ -3562,6 +4056,7 @@ struct SseState {
     /// Process-wide browser state shared across all SSE sessions, so Chrome
     /// stays resident between turns (each turn opens a fresh SSE connection).
     browser: Arc<Mutex<State>>,
+    health: Arc<HealthState>,
     security: http_security::HttpSecurity,
     secret_broker: Option<secret_broker::SecretBroker>,
 }
@@ -3733,48 +4228,227 @@ async fn sse_post(
 /// still succeeds, so a transport-level probe reports healthy while every
 /// browser tool fails against a closed CDP socket.
 ///
-/// `try_lock` is deliberate. The browser mutex is held for the duration of an
-/// in-flight tool call (navigations can run for tens of seconds), and a health
-/// endpoint that blocks behind it would report a timeout — causing exactly the
-/// spurious restarts this is meant to prevent. A contended lock is reported as
-/// an unknown verdict rather than a healthy one: the lock is also held during
-/// a cold start and during a call stuck on a dead socket, so "busy" says
-/// nothing about whether Chrome is attached.
+/// Health reads only atomics and an ArcSwap browser handle. It never waits for
+/// the State mutex or CDP, so a supervisor can distinguish a busy profile from
+/// a dead transport without creating another queue behind the failed command.
 async fn health(
     axum::extract::State(state): axum::extract::State<SseState>,
 ) -> axum::Json<serde_json::Value> {
     let mut payload = state.security.health();
-    let browser = match state.browser.try_lock() {
-        Ok(st) => match st.browser.as_ref() {
-            Some(browser) => serde_json::json!({
-                "launched": true,
-                "connected": browser.is_connected(),
-                "pages": st.pages.len(),
-            }),
-            None => serde_json::json!({
-                "launched": false,
-                "connected": false,
-                "pages": 0,
-            }),
-        },
-        // Contended: a tool call holds the browser mutex. That is *not*
-        // evidence the browser is alive — `open_page` holds this lock across
-        // `make_browser()` and across CDP calls, so the contended window
-        // covers both a cold start with no browser yet and a request blocked
-        // on a socket whose Chrome already exited. Reporting `connected:true`
-        // here manufactured health for up to the 30s CDP timeout and hid the
-        // exact fault this endpoint exists to expose. Say "unknown" instead;
-        // supervisors treat a missing verdict as "do not act".
-        Err(_) => serde_json::json!({
-            "launched": serde_json::Value::Null,
-            "connected": serde_json::Value::Null,
-            "busy": true,
-        }),
+    let health = &state.health;
+    let snapshot = health.snapshot.load_full();
+    let browser_handle = snapshot.browser.clone();
+    let mut state_name = match snapshot.state {
+        HEALTH_LAUNCHING => "launching",
+        HEALTH_READY => "ready",
+        HEALTH_DEAD => "dead",
+        HEALTH_DRAINING => "draining",
+        _ => "absent",
     };
+    let connected = browser_handle
+        .as_ref()
+        .map(|browser| browser.is_connected());
+    if state_name == "ready" {
+        if connected == Some(false) {
+            state_name = "dead";
+        } else if browser_handle
+            .as_ref()
+            .is_some_and(|browser| browser.is_suspect())
+        {
+            state_name = "suspect";
+        }
+    }
+    let chrome_pid = browser_handle.as_ref().and_then(|browser| browser.pid());
+    let profile_dir = browser_handle
+        .as_ref()
+        .and_then(|browser| browser.profile_dir())
+        .map(|path| path.display().to_string());
+    let last_transport_error = browser_handle
+        .as_ref()
+        .and_then(|browser| browser.last_transport_error());
+    let browser = serde_json::json!({
+        "state": state_name,
+        "generation": snapshot.generation,
+        "launched": browser_handle.is_some(),
+        "connected": connected,
+        "chromePid": chrome_pid,
+        "profileDir": profile_dir,
+        "pages": snapshot.pages,
+        "lastTransportError": last_transport_error,
+    });
     if let Some(map) = payload.as_object_mut() {
+        map.insert("schema".to_string(), serde_json::json!(2));
+        map.insert(
+            "version".to_string(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        );
+        map.entry("spawnNonce".to_string())
+            .or_insert_with(|| serde_json::json!(health.spawn_nonce));
+        map.insert(
+            "process".to_string(),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "uptimeMs": health.started_at.elapsed().as_millis() as u64,
+                "draining": snapshot.draining,
+            }),
+        );
+        map.insert(
+            "inflight".to_string(),
+            serde_json::json!({ "tools": health.inflight_tools.load(Ordering::Acquire) }),
+        );
+        map.insert(
+            "pages".to_string(),
+            serde_json::json!({
+                "total": snapshot.pages,
+                "stalled": snapshot.stalled_pages,
+            }),
+        );
+        let now = std::time::Instant::now();
+        let attempts_in_window = snapshot
+            .recovery_attempts
+            .iter()
+            .filter(|attempt| now.duration_since(**attempt) < std::time::Duration::from_secs(600))
+            .count();
+        let cooldown_until_ms = snapshot
+            .cooldown_until
+            .and_then(|until| until.checked_duration_since(now))
+            .map(|remaining| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .saturating_add(remaining)
+                    .as_millis() as u64
+            });
+        map.insert(
+            "recovery".to_string(),
+            serde_json::json!({
+                "inProgress": state_name == "launching",
+                "attemptsInWindow": attempts_in_window,
+                "cooldownUntilMs": cooldown_until_ms,
+            }),
+        );
         map.insert("browser".to_string(), browser);
     }
     axum::Json(payload)
+}
+
+async fn admin_drain(
+    axum::extract::State(state): axum::extract::State<SseState>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    let lifecycle = { state.browser.lock().await.browser_lifecycle.clone() };
+    let _lifecycle = lifecycle.lock().await;
+    let browsers = {
+        let mut st = state.browser.lock().await;
+        st.draining = true;
+        st.launching = false;
+        st.pages.clear();
+        st.owners.clear();
+        st.page_owners.clear();
+        st.recovery_required = false;
+        let browsers = [st.browser.take(), st.retired_browser.take()];
+        st.health.publish(&st);
+        browsers
+    };
+    for browser in browsers.into_iter().flatten() {
+        browser.close().await;
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "ok": true, "state": "draining" })),
+    )
+}
+
+async fn admin_relaunch(
+    axum::extract::State(state): axum::extract::State<SseState>,
+    axum::extract::Query(query): axum::extract::Query<RelaunchQuery>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    let lifecycle = { state.browser.lock().await.browser_lifecycle.clone() };
+    let _lifecycle = lifecycle.lock().await;
+    let old_browser = {
+        let mut st = state.browser.lock().await;
+        if st.draining {
+            return (
+                StatusCode::LOCKED,
+                axum::Json(serde_json::json!({ "ok": false, "error": "draining" })),
+            );
+        }
+        if st.browser_generation != query.expected_generation {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "error": "generation_mismatch",
+                    "expectedGeneration": query.expected_generation,
+                    "generation": st.browser_generation,
+                })),
+            );
+        }
+        if let Err(error) = BrowserServer::admit_recovery(&mut st) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({
+                    "ok": false,
+                    "error": error.message,
+                    "class": "recovery_circuit_open",
+                    "generation": st.browser_generation,
+                })),
+            );
+        }
+        for owner in st.page_owners.values().cloned().collect::<Vec<_>>() {
+            st.lost_owners.insert(owner);
+        }
+        st.pages.clear();
+        st.owners.clear();
+        st.page_owners.clear();
+        st.launching = true;
+        st.recovery_required = true;
+        let browser = st.browser.take().or_else(|| st.retired_browser.take());
+        st.health.publish(&st);
+        browser
+    };
+    if let Some(browser) = old_browser {
+        browser.close().await;
+    }
+
+    let browser = match make_browser().await {
+        Ok(browser) => Arc::new(browser),
+        Err(error) => {
+            let mut st = state.browser.lock().await;
+            st.launching = false;
+            st.health.publish(&st);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
+            );
+        }
+    };
+    let generation = {
+        let mut st = state.browser.lock().await;
+        if st.draining {
+            st.launching = false;
+            st.health.publish(&st);
+            drop(st);
+            browser.close().await;
+            return (
+                StatusCode::LOCKED,
+                axum::Json(serde_json::json!({ "ok": false, "error": "draining" })),
+            );
+        }
+        st.browser_generation = st.browser_generation.wrapping_add(1).max(1);
+        st.launching = false;
+        st.browser = Some(browser);
+        st.recovery_required = false;
+        st.health.publish(&st);
+        st.browser_generation
+    };
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "ok": true, "generation": generation })),
+    )
 }
 
 async fn close_owner_pages(
@@ -3820,6 +4494,7 @@ async fn close_owner_pages(
         st.page_owners.remove(page_id);
     }
     st.owners.remove(owner);
+    st.health.publish(&st);
 
     (
         StatusCode::OK,
@@ -3869,6 +4544,7 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
     // the SSE state for the whole process lifetime, so the browser is never
     // dropped between sessions — only when the server process exits.
     let shared_state: Arc<Mutex<State>> = Arc::new(Mutex::new(State::default()));
+    let shared_health = shared_state.lock().await.health.clone();
     let secret_broker = secret_broker::SecretBroker::from_env()?;
 
     let mcp_state = shared_state.clone();
@@ -3892,6 +4568,7 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
     let sse_state = SseState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         browser: shared_state,
+        health: shared_health,
         security: security.clone(),
         secret_broker: secret_broker.clone(),
     };
@@ -3907,6 +4584,8 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
         .route("/sse", axum::routing::get(sse_get))
         .route("/message", axum::routing::post(sse_post))
         .route("/owners", axum::routing::delete(close_owner_pages))
+        .route("/admin/drain", axum::routing::post(admin_drain))
+        .route("/admin/relaunch", axum::routing::post(admin_relaunch))
         .nest_service("/mcp", service)
         .with_state(sse_state.clone())
         .layer(auth_layer);
@@ -3914,8 +4593,13 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("browser-rs MCP server on http://{bind}/mcp (streamable HTTP) + http://{bind}/sse (legacy SSE)");
     let shutdown_sessions = sse_state.sessions.clone();
+    let shutdown_browser = sse_state.browser.clone();
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown_sessions, cancellation_token))
+        .with_graceful_shutdown(shutdown_signal(
+            shutdown_sessions,
+            shutdown_browser,
+            cancellation_token,
+        ))
         .await?;
 
     let browser = {
@@ -3923,7 +4607,12 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
         state.pages.clear();
         state.page_owners.clear();
         state.owners.clear();
-        state.browser.take()
+        let browser = state
+            .browser
+            .take()
+            .or_else(|| state.retired_browser.take());
+        state.health.publish(&state);
+        browser
     };
     if let Some(browser) = browser {
         browser.close().await;
@@ -3933,6 +4622,7 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
 
 async fn shutdown_signal(
     sessions: SseSessions,
+    browser: Arc<Mutex<State>>,
     cancellation_token: tokio_util::sync::CancellationToken,
 ) {
     #[cfg(unix)]
@@ -3958,6 +4648,11 @@ async fn shutdown_signal(
             }
         }
         _ = terminate => {}
+    }
+    {
+        let mut state = browser.lock().await;
+        state.draining = true;
+        state.health.publish(&state);
     }
     cancellation_token.cancel();
     sessions.lock().await.clear();

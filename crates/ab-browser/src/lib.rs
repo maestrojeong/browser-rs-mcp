@@ -5,6 +5,7 @@
 //! can run the loop: `snapshot -> act -> verify`.
 
 pub mod pointer;
+mod profile_lock;
 pub mod snapshot;
 pub mod stealth;
 
@@ -15,14 +16,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ab_cdp::CdpClient;
+use ab_cdp::{CdpClient, CdpEvent};
 use rand::thread_rng;
 use rand_distr::{Binomial, Distribution, LogNormal, Normal};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use profile_lock::ProfileLock;
 
 pub use pointer::{PointerAction, PointerLocation, PointerOutcome, PointerRequest};
 pub use snapshot::{DocumentIdentity, ElementRef, Snapshot};
@@ -81,6 +84,28 @@ impl NetworkLog {
     }
 }
 
+async fn next_event(
+    rx: &mut tokio::sync::broadcast::Receiver<CdpEvent>,
+    cancel: &CancellationToken,
+) -> Option<CdpEvent> {
+    loop {
+        let received = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            received = rx.recv() => received,
+        };
+        match received {
+            Ok(event) => return Some(event),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "CDP event listener lagged; continuing with newest event"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
     #[error("chrome executable not found; set AB_CHROME to its path")]
@@ -89,6 +114,8 @@ pub enum BrowserError {
     Launch(String),
     #[error("failed to discover devtools endpoint: {0}")]
     Discovery(String),
+    #[error("browser profile is already in use: {0}")]
+    ProfileBusy(String),
     #[error("cdp: {0}")]
     Cdp(#[from] ab_cdp::CdpError),
     #[error("unexpected protocol response: {0}")]
@@ -142,12 +169,17 @@ impl Default for LaunchOptions {
 /// The browser process + CDP client.
 pub struct Browser {
     client: CdpClient,
-    child: Option<Child>,
+    child: tokio::sync::Mutex<Option<Child>>,
+    child_pid: Option<u32>,
+    profile_dir: Option<PathBuf>,
     /// UA override applied to new pages (only set in headless+stealth mode).
     user_agent: String,
     /// Whether to normalize the user agent for headless pages.
     inject_stealth: bool,
     input_profile: InputProfile,
+    /// Held for the complete lifetime of a Chrome process launched by us.
+    /// Closing the descriptor releases the OS-enforced profile ownership.
+    profile_lock: tokio::sync::Mutex<Option<ProfileLock>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +213,22 @@ impl Browser {
         self.client.is_connected()
     }
 
+    pub fn is_suspect(&self) -> bool {
+        self.client.is_suspect()
+    }
+
+    pub fn last_transport_error(&self) -> Option<ab_cdp::CdpTransportError> {
+        self.client.last_transport_error()
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.child_pid
+    }
+
+    pub fn profile_dir(&self) -> Option<&std::path::Path> {
+        self.profile_dir.as_deref()
+    }
+
     /// Launch Chrome and connect over CDP.
     ///
     /// Default mode is headful with a persistent profile. Browser-visible
@@ -199,18 +247,9 @@ impl Browser {
             None => default_profile_dir()?,
         };
 
-        // A persistent profile keeps a stale `DevToolsActivePort` from the
-        // previous run; if we read it before the new Chrome rewrites it we get
-        // the wrong port ("no webSocketDebuggerUrl"). Remove it first. Also drop
-        // Singleton* lock files left by an unclean (SIGKILL) exit.
-        for f in [
-            "DevToolsActivePort",
-            "SingletonLock",
-            "SingletonSocket",
-            "SingletonCookie",
-        ] {
-            let _ = std::fs::remove_file(data_dir.join(f));
-        }
+        let profile_lock = ProfileLock::acquire(&data_dir)?;
+
+        profile_lock::prepare_chrome_profile(&data_dir)?;
 
         let mut args: Vec<String> = vec![
             format!("--remote-debugging-port={}", opts.port),
@@ -266,12 +305,16 @@ impl Browser {
             String::new()
         };
 
+        let child_pid = child.id();
         Ok(Self {
             client,
-            child: Some(child),
+            child: tokio::sync::Mutex::new(Some(child)),
+            child_pid,
+            profile_dir: Some(data_dir),
             user_agent,
             inject_stealth,
             input_profile: InputProfile::sample(),
+            profile_lock: tokio::sync::Mutex::new(Some(profile_lock)),
         })
     }
 
@@ -288,10 +331,13 @@ impl Browser {
             .await?;
         Ok(Self {
             client,
-            child: None,
+            child: tokio::sync::Mutex::new(None),
+            child_pid: None,
+            profile_dir: None,
             user_agent: String::new(),
             inject_stealth: false,
             input_profile: InputProfile::sample(),
+            profile_lock: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -365,21 +411,50 @@ impl Browser {
             target_id: target_id.to_string(),
             frame_sessions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(target_os = "macos")]
-            browser_pid: self.child.as_ref().and_then(Child::id),
+            browser_pid: self.child_pid,
             pointer: Arc::new(Mutex::new(None)),
             pointer_mutation: Arc::new(tokio::sync::Mutex::new(())),
             dialog: Arc::new(Mutex::new((true, None))),
             dialog_handler_started: Arc::new(AtomicBool::new(false)),
             routes: Arc::new(Mutex::new(RouteState::default())),
             input_profile: self.input_profile,
+            lifecycle: Arc::new(PageLifecycle::default()),
         })
     }
 
     /// Terminate the browser process (only if we launched it; connect() no-op).
-    pub async fn close(mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = self.client.send("Browser.close", json!({})).await;
-            let _ = child.kill().await;
+    pub async fn close(&self) {
+        let child = self.child.lock().await.take();
+        if let Some(mut child) = child {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.client.send("Browser.close", json!({})),
+            )
+            .await;
+            let mut exited = matches!(
+                tokio::time::timeout(Duration::from_secs(3), child.wait()).await,
+                Ok(Ok(_))
+            );
+            if !exited {
+                if let Err(error) = child.start_kill() {
+                    warn!(%error, "failed to kill Chrome after graceful shutdown timeout");
+                }
+                exited = matches!(
+                    tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+                    Ok(Ok(_))
+                );
+            }
+            let profile_lock = self.profile_lock.lock().await.take();
+            if exited {
+                drop(profile_lock);
+            } else if let Some(profile_lock) = profile_lock {
+                // Fail closed. Releasing ownership without proving process exit
+                // can start two Chromes against one persistent profile.
+                warn!(
+                    "Chrome exit could not be confirmed; retaining profile lock until process exit"
+                );
+                std::mem::forget(profile_lock);
+            }
         }
     }
 }
@@ -648,6 +723,18 @@ pub struct Page {
     routes: Arc<Mutex<RouteState>>,
     /// Stable latent input characteristics shared by all actions on this page.
     input_profile: InputProfile,
+    lifecycle: Arc<PageLifecycle>,
+}
+
+#[derive(Default)]
+struct PageLifecycle {
+    cancel: CancellationToken,
+}
+
+impl Drop for PageLifecycle {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -668,8 +755,15 @@ impl Page {
         &self.target_id
     }
 
+    /// Whether two handles refer to the exact attached-page lifetime. Target
+    /// ids and owner aliases may be reused after a browser generation change.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lifecycle, &other.lifecycle)
+    }
+
     /// Close this tab at the browser target level.
     pub async fn close(&self) -> Result<()> {
+        self.lifecycle.cancel.cancel();
         self.client
             .send("Target.closeTarget", json!({ "targetId": self.target_id }))
             .await?;
@@ -2405,8 +2499,9 @@ impl Page {
         let mut rx = self.client.events();
         let sid = self.session_id.clone();
         let l = log.clone();
+        let cancel = self.lifecycle.cancel.clone();
         tokio::spawn(async move {
-            while let Ok(ev) = rx.recv().await {
+            while let Some(ev) = next_event(&mut rx, &cancel).await {
                 if ev.session_id.as_deref() != Some(&sid) {
                     continue;
                 }
@@ -2924,8 +3019,9 @@ impl Page {
         let mut rx = self.client.events();
         let sid = self.session_id.clone();
         let l = log.clone();
+        let cancel = self.lifecycle.cancel.clone();
         tokio::spawn(async move {
-            while let Ok(ev) = rx.recv().await {
+            while let Some(ev) = next_event(&mut rx, &cancel).await {
                 if ev.session_id.as_deref() != Some(&sid) {
                     continue;
                 }
@@ -3276,8 +3372,9 @@ impl Page {
         let sid = self.session_id.clone();
         let client = self.client.clone();
         let policy = self.dialog.clone();
+        let cancel = self.lifecycle.cancel.clone();
         tokio::spawn(async move {
-            while let Ok(ev) = rx.recv().await {
+            while let Some(ev) = next_event(&mut rx, &cancel).await {
                 if ev.session_id.as_deref() == Some(&sid)
                     && ev.method == "Page.javascriptDialogOpening"
                 {
@@ -3408,9 +3505,10 @@ impl Page {
             let sid = self.session_id.clone();
             let client = self.client.clone();
             let routes = self.routes.clone();
+            let cancel = self.lifecycle.cancel.clone();
             tokio::spawn(async move {
                 use base64::Engine;
-                while let Ok(ev) = rx.recv().await {
+                while let Some(ev) = next_event(&mut rx, &cancel).await {
                     if ev.session_id.as_deref() != Some(&sid) || ev.method != "Fetch.requestPaused"
                     {
                         continue;
@@ -3919,9 +4017,10 @@ mod tests {
         collect_piercing_query_roots, drag_step_probability, fitts_duration_ms, minimum_jerk,
         movement_step_count, parse_key_combo, paste_probability, require_frame_chain,
         resolve_frame_id, shortcut_command, should_paste_text_for_draw, split_frame_chain,
-        type_ahead_key, us_qwerty_key, FrameAction, KeyCombo, KeyModifier, ReadMode,
+        type_ahead_key, us_qwerty_key, FrameAction, KeyCombo, KeyModifier, PageLifecycle, ReadMode,
     };
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn logistic_paste_choice_is_centered_on_equal_cost() {
@@ -3941,6 +4040,17 @@ mod tests {
             0.18,
             0.5
         ));
+    }
+
+    #[test]
+    fn dropping_the_last_page_lifecycle_cancels_listeners() {
+        let lifecycle = Arc::new(PageLifecycle::default());
+        let cancel = lifecycle.cancel.clone();
+        let second_page_handle = lifecycle.clone();
+        drop(lifecycle);
+        assert!(!cancel.is_cancelled());
+        drop(second_page_handle);
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

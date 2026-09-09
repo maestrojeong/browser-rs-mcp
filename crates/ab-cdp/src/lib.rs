@@ -7,15 +7,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use futures_util::{SinkExt, StreamExt};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tokio::time::{timeout_at, Instant};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +28,8 @@ pub enum CdpError {
     Closed,
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
+    #[error("session command stalled after {0:?}")]
+    Stalled(Duration),
     #[error("cdp protocol error: {0}")]
     Protocol(String),
     #[error("json: {0}")]
@@ -42,6 +46,15 @@ pub struct CdpEvent {
     pub params: Value,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdpTransportError {
+    pub kind: String,
+    pub phase: String,
+    pub method: Option<String>,
+    pub at_ms: u64,
+}
+
 type Pending = oneshot::Sender<Result<Value>>;
 type CdpSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -51,14 +64,26 @@ type CdpSink = futures_util::stream::SplitSink<
 struct Inner {
     next_id: AtomicU64,
     /// Liveness of the underlying WebSocket. Set to `false` the moment the
-    /// reader task observes a close/error, a write fails, or a request times
-    /// out. Read atomically so health probes never contend on `sink`/`pending`
-    /// -- a probe must not block behind an in-flight CDP request.
+    /// reader observes a close/error, a write fails, a writer stalls, or the
+    /// diagnostic probe confirms an unanswered command reflects transport
+    /// loss. Read atomically so health never contends on `sink`/`pending`.
     connected: AtomicBool,
-    pending: Mutex<HashMap<u64, Pending>>,
+    suspect: AtomicBool,
+    pending: StdMutex<HashMap<u64, Pending>>,
     sink: Mutex<Option<CdpSink>>,
     events: broadcast::Sender<CdpEvent>,
     request_timeout: Duration,
+    transport_timeout: Duration,
+    probe_timeout: Duration,
+    probe_inflight: AtomicBool,
+    reader_cancel: CancellationToken,
+    last_error: ArcSwapOption<CdpTransportError>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.reader_cancel.cancel();
+    }
 }
 
 impl Inner {
@@ -69,12 +94,14 @@ impl Inner {
     /// must never become a new unbounded wait behind a stalled writer.
     async fn invalidate(self: &Arc<Self>, held_sink: Option<&mut Option<CdpSink>>) {
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             self.connected.store(false, Ordering::SeqCst);
+            self.suspect.store(false, Ordering::Release);
             for (_, tx) in pending.drain() {
                 let _ = tx.send(Err(CdpError::Closed));
             }
         }
+        self.reader_cancel.cancel();
 
         match held_sink {
             Some(sink) => {
@@ -95,6 +122,42 @@ impl Inner {
             }
         }
     }
+
+    fn record_error(&self, kind: &str, phase: &str, method: Option<&str>) {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_error.store(Some(Arc::new(CdpTransportError {
+            kind: kind.to_string(),
+            phase: phase.to_string(),
+            method: method.map(str::to_string),
+            at_ms,
+        })));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResponseTimeoutPolicy {
+    Probe { session_scoped: bool },
+    Invalidate,
+}
+
+struct PendingRegistration {
+    inner: Weak<Inner>,
+    id: u64,
+}
+
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -105,37 +168,63 @@ pub struct CdpClient {
 impl CdpClient {
     /// Connect to a CDP WebSocket debugger URL (ws://host:port/devtools/browser/<id>).
     pub async fn connect(ws_url: &str) -> Result<Self> {
-        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url)
-            .await
-            .map_err(|e| CdpError::Connect(e.to_string()))?;
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+        let (ws, _resp) =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
+                .await
+                .map_err(|_| CdpError::Connect(format!("timed out after {CONNECT_TIMEOUT:?}")))?
+                .map_err(|e| CdpError::Connect(e.to_string()))?;
         let (sink, mut stream) = ws.split();
         let (events_tx, _) = broadcast::channel(4096);
 
         let inner = Arc::new(Inner {
             next_id: AtomicU64::new(1),
             connected: AtomicBool::new(true),
-            pending: Mutex::new(HashMap::new()),
+            suspect: AtomicBool::new(false),
+            pending: StdMutex::new(HashMap::new()),
             sink: Mutex::new(Some(sink)),
             events: events_tx,
             request_timeout: Duration::from_secs(30),
+            transport_timeout: Duration::from_secs(10),
+            probe_timeout: Duration::from_secs(5),
+            probe_inflight: AtomicBool::new(false),
+            reader_cancel: CancellationToken::new(),
+            last_error: ArcSwapOption::empty(),
         });
 
         // Reader task: routes responses to waiters and events to the broadcast.
-        let r = inner.clone();
+        let reader = Arc::downgrade(&inner);
+        let cancel = inner.reader_cancel.clone();
         tokio::spawn(async move {
-            while let Some(msg) = stream.next().await {
+            loop {
+                let msg = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    msg = stream.next() => msg,
+                };
+                let Some(msg) = msg else { break };
                 match msg {
-                    Ok(Message::Text(txt)) => dispatch(&r, &txt).await,
+                    Ok(Message::Text(txt)) => {
+                        let Some(inner) = reader.upgrade() else {
+                            return;
+                        };
+                        dispatch(&inner, &txt).await;
+                    }
                     Ok(Message::Close(_)) => break,
                     Ok(_) => {}
                     Err(e) => {
+                        if let Some(inner) = reader.upgrade() {
+                            inner.record_error("closed", "reader", None);
+                        }
                         warn!("cdp reader error: {e}");
                         break;
                     }
                 }
             }
             // Chrome is gone (close frame, transport error, or EOF).
-            r.invalidate(None).await;
+            if let Some(inner) = reader.upgrade() {
+                inner.record_error("closed", "reader", None);
+                inner.invalidate(None).await;
+            }
         });
 
         Ok(Self { inner })
@@ -154,6 +243,17 @@ impl CdpClient {
         self.inner.connected.load(Ordering::SeqCst)
     }
 
+    pub fn is_suspect(&self) -> bool {
+        self.inner.suspect.load(Ordering::Acquire)
+    }
+
+    pub fn last_transport_error(&self) -> Option<CdpTransportError> {
+        self.inner
+            .last_error
+            .load_full()
+            .map(|error| error.as_ref().clone())
+    }
+
     /// Subscribe to the raw CDP event stream.
     pub fn events(&self) -> broadcast::Receiver<CdpEvent> {
         self.inner.events.subscribe()
@@ -161,12 +261,30 @@ impl CdpClient {
 
     /// Send a browser-scoped CDP command.
     pub async fn send(&self, method: &str, params: Value) -> Result<Value> {
-        self.send_inner(method, params, None).await
+        self.send_inner(
+            method,
+            params,
+            None,
+            self.inner.request_timeout,
+            ResponseTimeoutPolicy::Probe {
+                session_scoped: false,
+            },
+        )
+        .await
     }
 
     /// Send a command scoped to a page/target session (flatten mode).
     pub async fn send_on(&self, session_id: &str, method: &str, params: Value) -> Result<Value> {
-        self.send_inner(method, params, Some(session_id)).await
+        self.send_inner(
+            method,
+            params,
+            Some(session_id),
+            self.inner.request_timeout,
+            ResponseTimeoutPolicy::Probe {
+                session_scoped: true,
+            },
+        )
+        .await
     }
 
     /// Typed convenience wrapper.
@@ -176,7 +294,18 @@ impl CdpClient {
         method: &str,
         params: Value,
     ) -> Result<T> {
-        let v = self.send_inner(method, params, session_id).await?;
+        let policy = ResponseTimeoutPolicy::Probe {
+            session_scoped: session_id.is_some(),
+        };
+        let v = self
+            .send_inner(
+                method,
+                params,
+                session_id,
+                self.inner.request_timeout,
+                policy,
+            )
+            .await?;
         Ok(serde_json::from_value(v)?)
     }
 
@@ -185,11 +314,15 @@ impl CdpClient {
         method: &str,
         params: Value,
         session_id: Option<&str>,
+        request_timeout: Duration,
+        response_policy: ResponseTimeoutPolicy,
     ) -> Result<Value> {
         // One deadline covers queueing for the shared writer, writing the
         // command, and waiting for Chrome's response. Starting a fresh timeout
         // only after `sink.send()` allowed a blocked writer to hang forever.
-        let deadline = Instant::now() + self.inner.request_timeout;
+        let started_at = Instant::now();
+        let deadline = started_at + request_timeout;
+        let transport_deadline = (started_at + self.inner.transport_timeout).min(deadline);
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let mut msg = json!({ "id": id, "method": method, "params": params });
         if let Some(sid) = session_id {
@@ -202,27 +335,33 @@ impl CdpClient {
         // window: the reader could close and drain in between.
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.inner.pending.lock().await;
+            let mut pending = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner());
             if !self.inner.connected.load(Ordering::SeqCst) {
                 return Err(CdpError::Closed);
             }
             pending.insert(id, tx);
         }
+        let _registration = PendingRegistration {
+            inner: Arc::downgrade(&self.inner),
+            id,
+        };
 
         {
-            let mut guard = match timeout_at(deadline, self.inner.sink.lock()).await {
+            let mut guard = match timeout_at(transport_deadline, self.inner.sink.lock()).await {
                 Ok(guard) => guard,
                 Err(_) => {
+                    self.inner
+                        .record_error("timeout", "writer-lock", Some(method));
                     warn!(
                         request_id = id,
                         method,
                         session_id,
-                        timeout_ms = self.inner.request_timeout.as_millis() as u64,
+                        timeout_ms = self.inner.transport_timeout.as_millis() as u64,
                         phase = "writer-lock",
                         "cdp request timed out; invalidating transport"
                     );
                     self.inner.invalidate(None).await;
-                    return Err(CdpError::Timeout(self.inner.request_timeout));
+                    return Err(CdpError::Timeout(self.inner.transport_timeout));
                 }
             };
             if !self.inner.connected.load(Ordering::SeqCst) {
@@ -234,9 +373,10 @@ impl CdpClient {
             };
             let text = serde_json::to_string(&msg)?;
             trace!("-> {text}");
-            match timeout_at(deadline, sink.send(Message::Text(text))).await {
+            match timeout_at(transport_deadline, sink.send(Message::Text(text))).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    self.inner.record_error("write", "write", Some(method));
                     // A write failure means the socket is unusable even if the
                     // reader task has not observed the close yet.
                     self.inner.invalidate(Some(&mut *guard)).await;
@@ -244,16 +384,17 @@ impl CdpClient {
                     return Err(CdpError::Closed);
                 }
                 Err(_) => {
+                    self.inner.record_error("timeout", "write", Some(method));
                     warn!(
                         request_id = id,
                         method,
                         session_id,
-                        timeout_ms = self.inner.request_timeout.as_millis() as u64,
+                        timeout_ms = self.inner.transport_timeout.as_millis() as u64,
                         phase = "write",
                         "cdp request timed out; invalidating transport"
                     );
                     self.inner.invalidate(Some(&mut *guard)).await;
-                    return Err(CdpError::Timeout(self.inner.request_timeout));
+                    return Err(CdpError::Timeout(self.inner.transport_timeout));
                 }
             }
         }
@@ -262,21 +403,68 @@ impl CdpClient {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => Err(CdpError::Closed),
             Err(_) => {
-                // An unanswered command means this transport can no longer be
-                // trusted. Invalidate every shared client instead of leaving
-                // them attached to a half-open socket.
+                self.inner.record_error("timeout", "response", Some(method));
                 warn!(
                     request_id = id,
                     method,
                     session_id,
-                    timeout_ms = self.inner.request_timeout.as_millis() as u64,
+                    timeout_ms = request_timeout.as_millis() as u64,
                     phase = "response",
-                    "cdp request timed out; invalidating transport"
+                    "cdp response timed out"
                 );
-                self.inner.invalidate(None).await;
-                Err(CdpError::Timeout(self.inner.request_timeout))
+                match response_policy {
+                    ResponseTimeoutPolicy::Probe { session_scoped } => {
+                        self.inner.suspect.store(true, Ordering::Release);
+                        self.spawn_probe_if_idle();
+                        if session_scoped {
+                            Err(CdpError::Stalled(request_timeout))
+                        } else {
+                            Err(CdpError::Timeout(request_timeout))
+                        }
+                    }
+                    ResponseTimeoutPolicy::Invalidate => {
+                        self.inner.invalidate(None).await;
+                        Err(CdpError::Timeout(request_timeout))
+                    }
+                }
             }
         }
+    }
+
+    fn spawn_probe_if_idle(&self) {
+        if self
+            .inner
+            .probe_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let client = self.clone();
+        tokio::spawn(async move {
+            let timeout = client.inner.probe_timeout;
+            let result = client
+                .send_inner(
+                    "Browser.getVersion",
+                    json!({}),
+                    None,
+                    timeout,
+                    ResponseTimeoutPolicy::Invalidate,
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    client.inner.suspect.store(false, Ordering::Release);
+                    debug!("transport probe succeeded after response timeout");
+                }
+                Err(error) => {
+                    warn!(%error, "transport probe failed after response timeout");
+                    client.inner.invalidate(None).await;
+                }
+            }
+            client.inner.probe_inflight.store(false, Ordering::Release);
+        });
     }
 }
 
@@ -292,7 +480,12 @@ async fn dispatch(inner: &Arc<Inner>, txt: &str) {
 
     // Response to a command (has "id").
     if let Some(id) = v.get("id").and_then(Value::as_u64) {
-        if let Some(tx) = inner.pending.lock().await.remove(&id) {
+        if let Some(tx) = inner
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
             if let Some(err) = v.get("error") {
                 let _ = tx.send(Err(CdpError::Protocol(err.to_string())));
             } else {
@@ -333,7 +526,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn request_timeout_invalidates_transport_and_releases_all_waiters() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -352,7 +545,11 @@ mod tests {
         let (waiter_one_tx, waiter_one_rx) = oneshot::channel();
         let (waiter_two_tx, waiter_two_rx) = oneshot::channel();
         {
-            let mut pending = client.inner.pending.lock().await;
+            let mut pending = client
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             pending.insert(10_001, waiter_one_tx);
             pending.insert(10_002, waiter_two_tx);
         }
@@ -361,6 +558,7 @@ mod tests {
         let first = tokio::spawn(async move { first_client.send("Test.first", json!({})).await });
         requests.recv().await.unwrap();
         drop(client.inner.sink.lock().await);
+        tokio::time::pause();
 
         tokio::time::advance(Duration::from_secs(30)).await;
         tokio::task::yield_now().await;
@@ -369,6 +567,14 @@ mod tests {
             first.await.unwrap(),
             Err(CdpError::Timeout(duration)) if duration == Duration::from_secs(30)
         ));
+
+        // A browser-scoped response timeout is only suspicion. The dedicated
+        // five-second probe must fail before the shared transport is closed.
+        requests.recv().await.unwrap();
+        drop(client.inner.sink.lock().await);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
         assert!(matches!(
             waiter_one_rx.await.unwrap(),
             Err(CdpError::Closed)
@@ -378,7 +584,13 @@ mod tests {
             Err(CdpError::Closed)
         ));
         assert!(!client.is_connected());
-        assert!(client.inner.pending.lock().await.is_empty());
+        assert!(client.inner.reader_cancel.is_cancelled());
+        assert!(client
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
         assert!(client.inner.sink.lock().await.is_none());
         assert!(matches!(
             client.send("Test.later", json!({})).await,
@@ -388,7 +600,7 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn writer_lock_timeout_returns_without_waiting_for_the_lock_holder() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -400,6 +612,7 @@ mod tests {
 
         let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
         let sink_guard = client.inner.sink.lock().await;
+        tokio::time::pause();
         let blocked_client = client.clone();
         let blocked =
             tokio::spawn(async move { blocked_client.send("Test.blocked", json!({})).await });
@@ -407,20 +620,31 @@ mod tests {
         // Wait until the request is registered and blocked on the held writer
         // lock before advancing its single end-to-end deadline.
         loop {
-            if !client.inner.pending.lock().await.is_empty() {
+            if !client
+                .inner
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
         tokio::task::yield_now().await;
 
         assert!(matches!(
             blocked.await.unwrap(),
-            Err(CdpError::Timeout(duration)) if duration == Duration::from_secs(30)
+            Err(CdpError::Timeout(duration)) if duration == Duration::from_secs(10)
         ));
         assert!(!client.is_connected());
-        assert!(client.inner.pending.lock().await.is_empty());
+        assert!(client
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
 
         // Invalidation returns before this guard is released. Its detached
         // cleanup then removes the sink as soon as the holder exits.
@@ -432,6 +656,108 @@ mod tests {
             Err(CdpError::Closed)
         ));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_stall_keeps_other_owners_connected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (method_tx, mut methods) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = websocket.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let method = request["method"].as_str().unwrap().to_string();
+                if method != "Test.stalledPage" {
+                    websocket
+                        .send(Message::Text(
+                            json!({ "id": request["id"], "result": {} }).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                method_tx.send(method).unwrap();
+            }
+        });
+
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let stalled_client = client.clone();
+        let stalled = tokio::spawn(async move {
+            stalled_client
+                .send_on("owner-a", "Test.stalledPage", json!({}))
+                .await
+        });
+        assert_eq!(methods.recv().await.as_deref(), Some("Test.stalledPage"));
+        drop(client.inner.sink.lock().await);
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            stalled.await.unwrap(),
+            Err(CdpError::Stalled(duration)) if duration == Duration::from_secs(30)
+        ));
+        assert!(client.is_connected());
+
+        tokio::time::resume();
+        assert_eq!(methods.recv().await.as_deref(), Some("Browser.getVersion"));
+        while client.inner.probe_inflight.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(client.is_connected());
+
+        let healthy_client = client.clone();
+        let healthy = tokio::spawn(async move {
+            healthy_client
+                .send_on("owner-b", "Test.followup", json!({}))
+                .await
+        });
+        assert_eq!(methods.recv().await.as_deref(), Some("Test.followup"));
+        assert_eq!(healthy.await.unwrap().unwrap(), json!({}));
+        assert!(client.is_connected());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_request_removes_its_pending_entry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut requests) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            while let Some(message) = websocket.next().await {
+                if message.unwrap().is_text() {
+                    request_tx.send(()).unwrap();
+                }
+            }
+        });
+
+        let client = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let pending_client = client.clone();
+        let request = tokio::spawn(async move {
+            pending_client
+                .send_on("owner-a", "Test.cancelled", json!({}))
+                .await
+        });
+        requests.recv().await.unwrap();
+        request.abort();
+        let _ = request.await;
+
+        let pending_ids: Vec<u64> = client
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        assert!(pending_ids.is_empty(), "pending ids: {pending_ids:?}");
+        assert!(client.is_connected());
         server.abort();
     }
 }
