@@ -112,6 +112,23 @@ impl HttpSecurity {
             return Ok(None);
         }
 
+        if is_admin_path(&path) {
+            let Some(root) = self.root_capability.as_deref() else {
+                return Err(Box::new(unauthorized(
+                    "browser administrative capability is unavailable",
+                )));
+            };
+            if !provided
+                .as_deref()
+                .is_some_and(|value| constant_time_eq(value, root))
+            {
+                return Err(Box::new(unauthorized(
+                    "invalid browser administrative capability",
+                )));
+            }
+            return Ok(None);
+        }
+
         if !self.managed {
             if let Some(expected) = self.root_capability.as_deref() {
                 if !provided
@@ -127,18 +144,6 @@ impl HttpSecurity {
         let Some(root) = self.root_capability.as_deref() else {
             return Err(Box::new(unauthorized("browser capability is unavailable")));
         };
-        if path == "/owners" {
-            if !provided
-                .as_deref()
-                .is_some_and(|value| constant_time_eq(value, root))
-            {
-                return Err(Box::new(unauthorized(
-                    "invalid browser administrative capability",
-                )));
-            }
-            return Ok(None);
-        }
-
         let Some(owner) = owner else {
             return Err(Box::new(
                 (StatusCode::BAD_REQUEST, "browser owner is required").into_response(),
@@ -176,6 +181,10 @@ impl HttpSecurity {
             Entry::Occupied(entry) => entry.get() == &owner,
         }
     }
+}
+
+fn is_admin_path(path: &str) -> bool {
+    path == "/owners" || path == "/admin/drain" || path == "/admin/relaunch"
 }
 
 pub fn owner_capability(root: &str, owner: &str) -> String {
@@ -338,32 +347,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owners_endpoint_accepts_only_the_root_capability() {
+    async fn administrative_endpoints_accept_only_the_root_capability() {
         let security = managed_security();
         let owner_token = owner_capability("root-secret", "owner-a");
-        let owner_request = Request::builder()
-            .uri("/owners?owner=owner-a")
-            .header(CAPABILITY_HEADER, owner_token)
+        for path in [
+            "/owners?owner=owner-a",
+            "/admin/drain",
+            "/admin/relaunch?expected_generation=1",
+        ] {
+            let owner_request = Request::builder()
+                .uri(path)
+                .header(CAPABILITY_HEADER, &owner_token)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                security
+                    .authorize_request(request_auth(&owner_request))
+                    .await
+                    .unwrap_err()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+
+            let root_request = Request::builder()
+                .uri(path)
+                .header(CAPABILITY_HEADER, "root-secret")
+                .body(Body::empty())
+                .unwrap();
+            assert!(security
+                .authorize_request(request_auth(&root_request))
+                .await
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_admin_is_disabled_without_a_root_capability() {
+        let security = HttpSecurity {
+            managed: false,
+            root_capability: None,
+            spawn_nonce: None,
+            session_owners: Default::default(),
+        };
+        let request = Request::builder()
+            .uri("/admin/drain")
             .body(Body::empty())
             .unwrap();
         assert_eq!(
             security
-                .authorize_request(request_auth(&owner_request))
+                .authorize_request(request_auth(&request))
                 .await
                 .unwrap_err()
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-
-        let root_request = Request::builder()
-            .uri("/owners?owner=owner-a")
-            .header(CAPABILITY_HEADER, "root-secret")
-            .body(Body::empty())
-            .unwrap();
-        assert!(security
-            .authorize_request(request_auth(&root_request))
-            .await
-            .is_ok());
     }
 
     #[tokio::test]

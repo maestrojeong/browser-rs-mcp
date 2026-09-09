@@ -527,6 +527,53 @@ browsers are always left untouched.
 `AB_HTTP_CAPABILITY` protects HTTP/SSE requests with `X-Browser-Capability`
 and is required for non-loopback binds.
 
+## Browser lifecycle and health
+
+Version 0.4 keeps an OS-level exclusive lock at `<profile>/.browser-rs.lock`
+for every Chrome it launches. A second process receives `profile_busy`; it
+never deletes Chrome `Singleton*` ownership files. Chrome itself performs stale
+singleton recovery after browser-rs verifies that no recorded process is live.
+
+`GET /health` is lock-free and returns schema 2 lifecycle data. Browser states
+are `absent`, `launching`, `ready`, `suspect`, `dead`, and `draining`.
+`generation` increases after each successful Chrome launch, while `spawnNonce`
+identifies the browser-rs process itself. Supervisors must compare both values
+before acting on an old probe result.
+
+```json
+{
+  "ok": true,
+  "schema": 2,
+  "spawnNonce": "...",
+  "process": { "pid": 4242, "draining": false },
+  "browser": {
+    "state": "ready",
+    "generation": 3,
+    "launched": true,
+    "connected": true,
+    "chromePid": 4300,
+    "pages": 4,
+    "lastTransportError": null
+  },
+  "pages": { "total": 4, "stalled": 0 },
+  "inflight": { "tools": 2 },
+  "recovery": { "inProgress": false, "attemptsInWindow": 0, "cooldownUntilMs": null }
+}
+```
+
+Session-scoped response timeouts mark only the affected page as stalled and
+run a five-second browser probe. EOF, write failure, writer-lock timeout, or a
+failed probe marks the transport dead. Recovery is single-flight and limited
+to three attempts per ten minutes, followed by a five-minute circuit-open
+period.
+
+Administrative HTTP operations require the root `X-Browser-Capability`:
+
+- `POST /admin/relaunch?expected_generation=N` replaces Chrome only when the
+  supplied generation still matches; stale requests receive HTTP 409.
+- `POST /admin/drain` rejects future launches and closes the owned Chrome so a
+  process supervisor can replace browser-rs without a competing relaunch.
+
 Managed hosts (see [Managed mode](#managed-mode-secure-multi-tenant-hosting)
 above) can set:
 
