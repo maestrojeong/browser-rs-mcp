@@ -273,7 +273,7 @@ impl Browser {
         args.push("about:blank".to_string());
 
         debug!("launching chrome: {} {:?}", chrome.display(), args);
-        let child = Command::new(&chrome)
+        let mut child = Command::new(&chrome)
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -281,28 +281,49 @@ impl Browser {
             .spawn()
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
-        // Read the actual port Chrome bound (works even when port=0).
-        let port = read_active_port(&data_dir).await?;
-        let ws_url = discover_ws_url(port).await?;
-        info!("connecting to devtools: {ws_url}");
-        let client = CdpClient::connect(&ws_url).await?;
+        // kill_on_drop alone doesn't confirm exit; on error we must
+        // force-kill and confirm before deciding profile_lock's fate.
+        let setup: Result<(CdpClient, String)> = async {
+            let port = read_active_port(&data_dir).await?;
+            let ws_url = discover_ws_url(port).await?;
+            info!("connecting to devtools: {ws_url}");
+            let client = CdpClient::connect(&ws_url).await?;
 
-        client
-            .send("Target.setDiscoverTargets", json!({ "discover": true }))
-            .await?;
-
-        // A UA override is only needed to hide the "Headless" token, i.e. only
-        // when we're forced to run headless. Headful reports a real UA.
-        let user_agent = if inject_stealth && opts.headless {
             client
-                .send("Browser.getVersion", json!({}))
-                .await
-                .ok()
-                .and_then(|v| v.get("userAgent").and_then(Value::as_str).map(String::from))
-                .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
-                .unwrap_or_default()
-        } else {
-            String::new()
+                .send("Target.setDiscoverTargets", json!({ "discover": true }))
+                .await?;
+
+            let user_agent = if inject_stealth && opts.headless {
+                client
+                    .send("Browser.getVersion", json!({}))
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("userAgent").and_then(Value::as_str).map(String::from))
+                    .map(|ua| ua.replace("HeadlessChrome", "Chrome"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            Ok((client, user_agent))
+        }
+        .await;
+
+        let (client, user_agent) = match setup {
+            Ok(v) => v,
+            Err(e) => {
+                let exited = kill_and_confirm_exit(&mut child).await;
+                if exited {
+                    drop(profile_lock);
+                } else {
+                    warn!(
+                        "Chrome exit could not be confirmed after failed launch; \
+                         retaining profile lock until process exit"
+                    );
+                    std::mem::forget(profile_lock);
+                }
+                return Err(e);
+            }
         };
 
         let child_pid = child.id();
@@ -436,13 +457,7 @@ impl Browser {
                 Ok(Ok(_))
             );
             if !exited {
-                if let Err(error) = child.start_kill() {
-                    warn!(%error, "failed to kill Chrome after graceful shutdown timeout");
-                }
-                exited = matches!(
-                    tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
-                    Ok(Ok(_))
-                );
+                exited = kill_and_confirm_exit(&mut child).await;
             }
             let profile_lock = self.profile_lock.lock().await.take();
             if exited {
@@ -4026,6 +4041,17 @@ fn chrome_candidates() -> Vec<PathBuf> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Force-kill a Chrome child and wait (bounded) to confirm it exited.
+async fn kill_and_confirm_exit(child: &mut Child) -> bool {
+    if let Err(error) = child.start_kill() {
+        warn!(%error, "failed to send kill to chrome process");
+    }
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Chrome writes the chosen debugging port to `<user-data-dir>/DevToolsActivePort`.
