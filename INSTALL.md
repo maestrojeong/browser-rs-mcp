@@ -18,6 +18,20 @@ Verify:
 browser-rs --help
 ```
 
+## Quick install (Windows)
+
+```powershell
+irm https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.ps1 | iex
+```
+
+Downloads `browser-rs-windows-x64.exe` and installs it as `browser-rs.exe` in
+`%LOCALAPPDATA%\browser-rs\bin`. If that directory isn't already on `PATH`,
+the script prints the `setx` command to add it — open a new terminal
+afterward for it to take effect.
+
+A locally installed Google Chrome or Chromium is required, same as on
+macOS/Linux.
+
 ## Options
 
 ```bash
@@ -34,6 +48,14 @@ If `~/.local/bin` isn't on your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc
 ```
 
+Same options on Windows (PowerShell), via environment variables before the
+`irm | iex`:
+
+```powershell
+$env:AB_VERSION = "v0.3.1"; irm https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.ps1 | iex
+$env:AB_BIN_DIR = "C:\tools\browser-rs"; irm https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.ps1 | iex
+```
+
 ## Direct binary download (no script)
 
 ```bash
@@ -46,8 +68,14 @@ chmod +x browser-rs
 ./browser-rs --help
 ```
 
+```powershell
+# Windows (x64)
+Invoke-WebRequest -Uri https://github.com/maestrojeong/browser-rs-mcp/releases/latest/download/browser-rs-windows-x64.exe -OutFile browser-rs.exe
+.\browser-rs.exe --help
+```
+
 SHA-256 sums are published alongside each asset (e.g.
-`browser-rs-macos-arm64.sha256`).
+`browser-rs-macos-arm64.sha256`, `browser-rs-windows-x64.exe.sha256`).
 
 ## Build from source
 

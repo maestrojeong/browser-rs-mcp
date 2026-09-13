@@ -16,10 +16,23 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: browser-rs-macos-arm64
+            bin: browser-rs
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: browser-rs-linux-x64
+            bin: browser-rs
+          # Windows needs no source changes: `nix` is already a cfg(unix)
+          # dependency and every unix-only path has a cfg(not(unix)) arm.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: browser-rs-windows-x64.exe
+            bin: browser-rs.exe
     runs-on: ${{ matrix.os }}
+    # `shasum` and the POSIX test syntax below only exist in bash, which the
+    # Windows runner does not use by default.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -41,7 +54,7 @@ jobs:
 
       - name: Package
         run: |
-          cp "target/${{ matrix.target }}/release/browser-rs" "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
 
       - name: Upload to release

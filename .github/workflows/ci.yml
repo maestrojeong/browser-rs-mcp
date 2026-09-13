@@ -19,6 +19,21 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Windows ships a release asset but has no Chrome-backed bench here, so guard
+  # the part that actually regresses: the cfg(not(unix)) arms compiling at all.
+  # Without this, a new `nix::`/`UnixStream` call reaches a tag before anyone
+  # notices the Windows build is gone.
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc -p ab-mcp
+
   build-and-bench:
     runs-on: ubuntu-latest
     steps:

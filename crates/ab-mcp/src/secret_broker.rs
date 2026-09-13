@@ -90,10 +90,7 @@ impl SecretBroker {
         .context("secret broker omitted redacted output")
     }
 
-    #[cfg(unix)]
     async fn request(&self, mut request: Value) -> anyhow::Result<BrokerResponse> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixStream;
         use tokio::time::{timeout, Duration};
 
         let request_id = random_id();
@@ -101,14 +98,8 @@ impl SecretBroker {
         request["token"] = Value::String(self.token.to_string());
         let encoded = serde_json::to_vec(&request)?;
         let response = timeout(Duration::from_secs(3), async {
-            let mut stream = UnixStream::connect(self.socket_path.as_ref()).await?;
-            stream.write_all(&encoded).await?;
-            stream.write_all(b"\n").await?;
-            stream.flush().await?;
-            let mut line = String::new();
-            BufReader::new(stream).read_line(&mut line).await?;
-            anyhow::ensure!(!line.is_empty(), "secret broker closed without a response");
-            serde_json::from_str::<BrokerResponse>(&line).map_err(Into::into)
+            let stream = connect_broker(self.socket_path.as_ref()).await?;
+            exchange(stream, &encoded).await
         })
         .await
         .context("secret broker timed out")??;
@@ -124,10 +115,59 @@ impl SecretBroker {
         }
         Ok(response)
     }
+}
 
-    #[cfg(not(unix))]
-    async fn request(&self, _request: Value) -> anyhow::Result<BrokerResponse> {
-        anyhow::bail!("secret broker Unix sockets are unsupported on this platform")
+/// One newline-delimited JSON round trip, independent of the transport.
+///
+/// The framing is identical on every platform; only the connect differs, so
+/// keeping the protocol here means a Unix run and a Windows run exercise the
+/// same code.
+async fn exchange<S>(stream: S, encoded: &[u8]) -> anyhow::Result<BrokerResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut stream = stream;
+    stream.write_all(encoded).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    anyhow::ensure!(!line.is_empty(), "secret broker closed without a response");
+    serde_json::from_str::<BrokerResponse>(&line).map_err(Into::into)
+}
+
+#[cfg(unix)]
+async fn connect_broker(path: &str) -> anyhow::Result<tokio::net::UnixStream> {
+    Ok(tokio::net::UnixStream::connect(path).await?)
+}
+
+/// Windows has no Unix-domain socket in this position: the host listens on a
+/// named pipe (`\\.\pipe\...`) and hands its name over the same
+/// `AB_SECRET_BROKER_SOCKET` variable.
+///
+/// A pipe with every instance busy answers `ERROR_PIPE_BUSY` rather than
+/// queueing, which is a "try again", not a failure — the host frees an
+/// instance as soon as it finishes the request in flight. The enclosing 3s
+/// timeout still bounds the retry loop.
+#[cfg(windows)]
+async fn connect_broker(
+    path: &str,
+) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use tokio::time::{sleep, Duration};
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    loop {
+        match ClientOptions::new().open(path) {
+            Ok(client) => return Ok(client),
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 

@@ -3587,17 +3587,36 @@ fn activation_verified(visibility: &str, window_focused: bool) -> bool {
     visibility == "visible" && window_focused
 }
 
+/// The user's home directory.
+///
+/// `HOME` is the POSIX spelling and the only one that used to be consulted.
+/// Windows sets `USERPROFILE` instead and leaves `HOME` unset unless a
+/// POSIX-ish shell puts it there — so a browser-rs launched straight from a
+/// native Windows process (an MCP host, a service) failed to resolve a profile
+/// even though the home directory was perfectly well known. `HOME` still wins
+/// where it is set, leaving POSIX behaviour untouched.
+fn home_dir() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return Some(PathBuf::from(profile));
+        }
+    }
+    None
+}
+
 /// Persistent per-user profile directory (aged profiles look human). Override
 /// with `AB_PROFILE`. We deliberately avoid a throwaway temp dir.
 fn default_profile_dir() -> Result<PathBuf> {
     let base = std::env::var("AB_PROFILE")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".browser-rs").join("profile"))
-        })
+        .or_else(|| home_dir().map(|h| h.join(".browser-rs").join("profile")))
         .ok_or_else(|| BrowserError::Launch("cannot resolve profile dir; set AB_PROFILE".into()))?;
     std::fs::create_dir_all(&base).map_err(|e| BrowserError::Launch(e.to_string()))?;
     Ok(base)
@@ -3964,15 +3983,49 @@ fn detect_chrome() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("AB_CHROME") {
         return Some(PathBuf::from(p));
     }
-    let candidates = [
+    chrome_candidates().into_iter().find(|p| p.exists())
+}
+
+#[cfg(not(windows))]
+fn chrome_candidates() -> Vec<PathBuf> {
+    [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/Applications/BrowserOS.app/Contents/MacOS/BrowserOS",
         "/usr/bin/google-chrome",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+/// Windows installs Chrome under a per-machine or per-user program directory.
+///
+/// Those roots are read from the environment rather than hardcoded: the system
+/// drive is not always `C:`, and `Program Files` is localized on some installs,
+/// so a literal path would miss perfectly ordinary setups. Without this the
+/// POSIX-only candidate list matched nothing and every launch failed with
+/// "chrome executable not found" even with Chrome installed.
+#[cfg(windows)]
+fn chrome_candidates() -> Vec<PathBuf> {
+    const RELATIVE: [&str; 4] = [
+        r"Google\Chrome\Application\chrome.exe",
+        r"Google\Chrome Beta\Application\chrome.exe",
+        r"Google\Chrome SxS\Application\chrome.exe",
+        r"Chromium\Application\chrome.exe",
     ];
-    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+    ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .flat_map(|root| {
+            RELATIVE
+                .iter()
+                .map(|rel| PathBuf::from(&root).join(rel))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Chrome writes the chosen debugging port to `<user-data-dir>/DevToolsActivePort`.
