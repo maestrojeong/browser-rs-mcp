@@ -27,6 +27,10 @@ use tracing::{debug, info, warn};
 
 use profile_lock::ProfileLock;
 
+/// `CREATE_NO_WINDOW` — spawn a child without giving it a console of its own.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 pub use pointer::{PointerAction, PointerLocation, PointerOutcome, PointerRequest};
 pub use snapshot::{DocumentIdentity, ElementRef, Snapshot};
 
@@ -273,11 +277,22 @@ impl Browser {
         args.push("about:blank".to_string());
 
         debug!("launching chrome: {} {:?}", chrome.display(), args);
-        let mut child = Command::new(&chrome)
+        let mut command = Command::new(&chrome);
+        command
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            // Chrome is a GUI process and this server reads nothing from it, so
+            // it has no use for a console. A managed host launches this server
+            // with CREATE_NO_WINDOW, which leaves it without one to pass down —
+            // and Windows then hands the child a brand new console, blinking a
+            // window on screen every time a browser starts.
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
