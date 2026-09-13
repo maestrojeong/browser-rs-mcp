@@ -108,16 +108,44 @@ fn process_is_alive(pid: i32) -> bool {
     matches!(kill(Pid::from_raw(pid), None), Ok(()) | Err(Errno::EPERM))
 }
 
+// Windows Chrome doesn't use the symlink-based SingletonLock Unix does, so
+// there's no file to check liveness against. What we do see in the wild:
+// browser-rs.exe gets killed out-of-band (host process supervisor restart,
+// user force-kill, ...) without a Job Object tying Chrome's lifetime to it,
+// so Chrome survives as an orphan still holding this profile. Our own
+// ProfileLock already proves *we* aren't racing another owner (that's an
+// exclusive file lock, released the moment the old process dies), but the
+// orphan itself blocks a fresh Chrome from ever opening its own devtools
+// port against the same profile — it just silently activates the orphan's
+// window instead, so DevToolsActivePort never gets rewritten and every
+// launch attempt times out. Reclaim by killing any chrome.exe still
+// referencing this exact --user-data-dir before we spawn a new one.
 #[cfg(not(unix))]
 fn ensure_no_live_singleton(data_dir: &Path) -> Result<()> {
-    let path = data_dir.join("SingletonLock");
-    if path.exists() {
-        return Err(BrowserError::ProfileBusy(format!(
-            "cannot safely verify {} on this platform",
-            path.display()
-        )));
-    }
+    kill_orphaned_chrome(data_dir);
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn kill_orphaned_chrome(data_dir: &Path) {
+    let needle = data_dir.display().to_string().replace('\'', "''");
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | \
+         Where-Object {{ $_.CommandLine -like '*{needle}*' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    #[cfg(windows)]
+    {
+        // Reclamation is invisible bookkeeping that runs on the launch path, so
+        // it must not blink a console in front of the user. Same flag the
+        // Chrome launch itself uses.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = command.output();
 }
 
 #[cfg(test)]
