@@ -28,7 +28,7 @@ jobs:
             asset: browser-rs-windows-x64.exe
             bin: browser-rs.exe
     runs-on: ${{ matrix.os }}
-    # `shasum` and the POSIX test syntax below only exist in bash, which the
+    # `cp` and the POSIX test syntax below only exist in bash, which the
     # Windows runner does not use by default.
     defaults:
       run:
@@ -55,7 +55,15 @@ jobs:
       - name: Package
         run: |
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
-          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          # `shasum` is a Perl script and the Windows runner's Git Bash ships
+          # without Perl; `sha256sum` is a coreutils binary and is missing from
+          # a stock macOS. Both print the same "<hash>  <name>" line, so take
+          # whichever the runner has.
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
