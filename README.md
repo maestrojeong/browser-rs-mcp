@@ -48,11 +48,18 @@ release binary size can be checked with `du -h target/release/browser-rs`.
 
 ## Quick start
 
-**1. Install** — on macOS arm64 and Linux x64 the installer downloads a
-prebuilt binary. A locally installed Google Chrome or Chromium is also required.
+**1. Install** — on macOS arm64, Linux x64, and Windows x64 the installer
+downloads a prebuilt binary. A locally installed Google Chrome or Chromium is
+also required.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.sh | sh
+browser-rs --help
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/maestrojeong/browser-rs-mcp/main/install.ps1 | iex
 browser-rs --help
 ```
 
