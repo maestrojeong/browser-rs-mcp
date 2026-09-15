@@ -4500,7 +4500,7 @@ mod tests {
 
         // A request seen well before the last eviction must not resolve to
         // some other entry's slot.
-        assert!(st.index.get("req-0").is_none());
+        assert!(!st.index.contains_key("req-0"));
 
         // The most recently inserted request must resolve to the entry it
         // was actually inserted for.
