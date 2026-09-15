@@ -1076,15 +1076,19 @@ impl Page {
         {
             let mut retry_params = params;
             retry_params["expression"] = json!(format!("({expression})()"));
-            if let Ok(retry_res) = self
+            // The retry is a real re-execution of caller-provided code, not a
+            // side-effect-free formality: it can throw (`() => { throw ... }`)
+            // or the transport can fail. Both must surface like any other
+            // evaluate() failure — swallowing them previously turned a thrown
+            // error into a silently-wrong `null` result.
+            let retry_res = self
                 .client
                 .send_on(&self.session_id, "Runtime.evaluate", retry_params)
-                .await
-            {
-                if retry_res.get("exceptionDetails").is_none() {
-                    res = retry_res;
-                }
+                .await?;
+            if let Some(exc) = retry_res.get("exceptionDetails") {
+                return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
             }
+            res = retry_res;
         }
         Ok(res
             .get("result")

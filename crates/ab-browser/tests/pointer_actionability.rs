@@ -73,6 +73,8 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
       <button id="drag-source">Drag source</button>
       <button id="drag-target">Drag target</button>
       <div id="drag-status">drag pending</div>
+      <button id="drag-vanish">Drag vanish source</button>
+      <button id="drag-vanish-target">Drag vanish target</button>
       <iframe id="action-frame" style="width: 360px; height: 180px;"></iframe>
       <script>
         const nested = document.querySelector('#nested');
@@ -105,6 +107,9 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         menuOption.addEventListener('click', () => menuStatus.textContent = 'menu clicked');
 
         vanish.addEventListener('mouseenter', () => vanish.remove());
+
+        const dragVanish = document.querySelector('#drag-vanish');
+        dragVanish.addEventListener('mouseenter', () => dragVanish.remove());
         replace.addEventListener('click', () => {
           replaceStatus.textContent = 'first click dispatched';
           const replacement = document.createElement('button');
@@ -267,6 +272,27 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         (4..=12).contains(&drag_moves),
         "drag move count escaped bounded binomial range: {drag_status}"
     );
+
+    // Regression: Drag must recheck the origin right before mousedown, same
+    // as Click/RightClick/DoubleClick — the humanized travel to the origin
+    // gives a hover-triggered removal plenty of time to fire, and Drag used
+    // to press mousedown at the stale point unconditionally.
+    let snapshot = page.snapshot().await?;
+    let error = page
+        .dispatch_pointer(&PointerRequest {
+            action: PointerAction::Drag,
+            origin: PointerLocation::Element(element(&snapshot, "Drag vanish source")?),
+            destination: Some(PointerLocation::Element(element(
+                &snapshot,
+                "Drag vanish target",
+            )?)),
+            delta_x: 0.0,
+            delta_y: 0.0,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("before the click landed"), "{error}");
 
     page.iframe_click("#action-frame", "#shadow-direct").await?;
     assert_eq!(

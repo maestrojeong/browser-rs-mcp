@@ -79,3 +79,36 @@ async fn bare_arrow_function_is_invoked_instead_of_returned_as_a_value() -> anyh
     let _ = std::fs::remove_dir_all(&profile_dir);
     Ok(())
 }
+
+/// The auto-invoke retry re-executes caller-provided code, so it can throw
+/// just like any other evaluate() call. Regression test for a bug where the
+/// retry's `exceptionDetails` (and any transport failure) were silently
+/// swallowed, so `evaluate("() => { throw ... }")` returned `null` instead of
+/// propagating the error like every other failing evaluate() does.
+#[tokio::test]
+#[ignore = "requires a locally installed headful Chrome or Chromium"]
+async fn bare_arrow_function_exception_is_propagated_not_swallowed() -> anyhow::Result<()> {
+    let html = "<!doctype html><title>eval fn literal</title><body>hi</body>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let profile_dir = temporary_profile_dir();
+
+    let browser = Browser::launch(LaunchOptions {
+        headless: false,
+        user_data_dir: Some(profile_dir.clone()),
+        ..Default::default()
+    })
+    .await?;
+    let page = browser.new_page(&url).await?;
+
+    let err = page
+        .evaluate("() => { throw new Error('boom'); }")
+        .await
+        .expect_err("a thrown error inside the auto-invoked function must surface as an error");
+    assert!(
+        err.to_string().contains("boom"),
+        "expected the thrown error's message to propagate, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    Ok(())
+}

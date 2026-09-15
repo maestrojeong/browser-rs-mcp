@@ -198,6 +198,15 @@ impl Page {
             }
             PointerAction::Drag => {
                 let (to_x, to_y, to_width) = drag_destination.expect("validated drag point");
+                // Same freshness recheck as Click/RightClick/DoubleClick: the
+                // humanized travel to the drag origin can take hundreds of ms
+                // for long-distance drags, long enough for a hover-sensitive
+                // container to close or the origin element to move/be
+                // replaced. Without this, mousedown would silently land on
+                // whatever now happens to be under the stale point instead of
+                // failing closed like the other pointer actions do.
+                self.require_click_target_after_move(&request.origin, (x, y))
+                    .await?;
                 self.mouse_button("mousePressed", x, y, "left", 1, 1)
                     .await?;
                 self.move_pointer_path(x, y, to_x, to_y, to_width, 1)
