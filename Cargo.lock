@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ab-browser"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ab-cdp",
  "anyhow",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "ab-cdp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arc-swap",
  "futures-util",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "ab-mcp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ab-browser",
  "ab-cdp",
