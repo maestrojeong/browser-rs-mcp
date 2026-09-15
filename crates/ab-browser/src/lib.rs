@@ -50,6 +50,44 @@ struct NetState {
     index: HashMap<String, usize>,
 }
 
+/// Upper bound on how many `NetEntry`/console lines a single page's log will
+/// retain. Without this, a long-lived page (a multi-hour crawl session, a
+/// tab that never gets closed) accumulates CDP events forever — `recent()`
+/// only limits what a *caller* sees, not what's held in memory, so the
+/// backing `Vec` grew without bound and eventually pushed the whole process
+/// into swap. Capped at insertion time instead: oldest entries are dropped
+/// once the cap is hit, same as `recent()` already does for callers.
+const LOG_CAP: usize = 2000;
+
+/// Push `item` onto `vec`, evicting the oldest entries first if `vec` is
+/// already at `LOG_CAP`. Shared by `ConsoleLog`'s two event handlers.
+fn push_capped<T>(vec: &mut Vec<T>, item: T) {
+    if vec.len() >= LOG_CAP {
+        let drop_count = vec.len() - LOG_CAP + 1;
+        vec.drain(0..drop_count);
+    }
+    vec.push(item);
+}
+
+/// Record a new network request, evicting the oldest entries first if the
+/// log is already at `LOG_CAP`. Eviction also clears `index`: entries seen
+/// before the trim would otherwise resolve to indices that no longer match
+/// what they were inserted for. A request whose `requestWillBeSent` arrived
+/// just before an eviction simply won't get its later status/failed update
+/// (the `index.get` in the caller returns `None`) — a few borderline
+/// entries losing their status is a fine trade for not holding every
+/// request for the life of the page.
+fn push_net_entry(st: &mut NetState, id: &str, entry: NetEntry) {
+    if st.entries.len() >= LOG_CAP {
+        let drop_count = st.entries.len() - LOG_CAP + 1;
+        st.entries.drain(0..drop_count);
+        st.index.clear();
+    }
+    let idx = st.entries.len();
+    st.entries.push(entry);
+    st.index.insert(id.to_string(), idx);
+}
+
 /// A live, growing log of a page's network activity (from CDP Network events).
 #[derive(Clone, Default)]
 pub struct NetworkLog {
@@ -2561,10 +2599,10 @@ impl Page {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        l.lines
-                            .lock()
-                            .unwrap()
-                            .push(format!("[{kind}] {}", args.join(" ")));
+                        push_capped(
+                            &mut l.lines.lock().unwrap(),
+                            format!("[{kind}] {}", args.join(" ")),
+                        );
                     }
                     "Runtime.exceptionThrown" => {
                         let txt = ev
@@ -2574,7 +2612,7 @@ impl Page {
                             .and_then(|e| e.get("description").or_else(|| e.get("value")))
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "exception".into());
-                        l.lines.lock().unwrap().push(format!("[error] {txt}"));
+                        push_capped(&mut l.lines.lock().unwrap(), format!("[error] {txt}"));
                     }
                     _ => {}
                 }
@@ -3080,9 +3118,7 @@ impl Page {
                                 failed: false,
                             };
                             let mut st = l.state.lock().unwrap();
-                            let idx = st.entries.len();
-                            st.entries.push(entry);
-                            st.index.insert(id.to_string(), idx);
+                            push_net_entry(&mut st, id, entry);
                         }
                     }
                     "Network.responseReceived" => {
@@ -4109,9 +4145,10 @@ mod tests {
     use super::{
         activation_verified, ax_hit_has_backend_ancestor, build_descend_js, build_frame_element_js,
         collect_piercing_query_roots, drag_step_probability, fitts_duration_ms, minimum_jerk,
-        movement_step_count, parse_key_combo, paste_probability, require_frame_chain,
-        resolve_frame_id, shortcut_command, should_paste_text_for_draw, split_frame_chain,
-        type_ahead_key, us_qwerty_key, FrameAction, KeyCombo, KeyModifier, PageLifecycle, ReadMode,
+        movement_step_count, parse_key_combo, paste_probability, push_capped, push_net_entry,
+        require_frame_chain, resolve_frame_id, shortcut_command, should_paste_text_for_draw,
+        split_frame_chain, type_ahead_key, us_qwerty_key, FrameAction, KeyCombo, KeyModifier,
+        NetEntry, NetState, PageLifecycle, ReadMode, LOG_CAP,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -4419,5 +4456,62 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not found"), "unexpected error: {err}");
+    }
+
+    /// A page's console log must not grow without bound: a multi-hour crawl
+    /// session that never closes its page used to accumulate every line
+    /// forever (`recent()` only limited what callers saw, not what was
+    /// stored). Pushing past `LOG_CAP` must evict the oldest lines instead
+    /// of growing the backing `Vec` further.
+    #[test]
+    fn console_log_lines_are_capped_not_unbounded() {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..(LOG_CAP + 500) {
+            push_capped(&mut lines, format!("line-{i}"));
+        }
+        assert_eq!(lines.len(), LOG_CAP, "must not exceed the cap");
+        // Oldest lines were evicted; the most recent one is still present.
+        assert_eq!(lines.last().unwrap(), &format!("line-{}", LOG_CAP + 499));
+        assert!(
+            !lines.contains(&"line-0".to_string()),
+            "oldest line should have been evicted"
+        );
+    }
+
+    /// Same bound for the network log, plus: the `id -> index` map must
+    /// stay in sync with `entries` after an eviction, or later
+    /// `responseReceived`/`loadingFailed` events would silently corrupt an
+    /// unrelated entry at the stale index instead of being (harmlessly)
+    /// dropped.
+    #[test]
+    fn network_log_entries_are_capped_and_index_stays_consistent() {
+        let mut st = NetState::default();
+        for i in 0..(LOG_CAP + 500) {
+            let entry = NetEntry {
+                url: format!("https://example.test/{i}"),
+                method: "GET".into(),
+                resource_type: "fetch".into(),
+                status: None,
+                failed: false,
+            };
+            push_net_entry(&mut st, &format!("req-{i}"), entry);
+        }
+        assert_eq!(st.entries.len(), LOG_CAP, "must not exceed the cap");
+
+        // A request seen well before the last eviction must not resolve to
+        // some other entry's slot.
+        assert!(st.index.get("req-0").is_none());
+
+        // The most recently inserted request must resolve to the entry it
+        // was actually inserted for.
+        let last_id = format!("req-{}", LOG_CAP + 499);
+        let idx = *st
+            .index
+            .get(&last_id)
+            .expect("most recent id must be indexed");
+        assert_eq!(
+            st.entries[idx].url,
+            format!("https://example.test/{}", LOG_CAP + 499)
+        );
     }
 }
