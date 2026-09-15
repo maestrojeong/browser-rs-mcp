@@ -1018,11 +1018,12 @@ impl Page {
         // top-level script on its own, so wrapping it is unconditionally
         // safe. Arrow functions have no such restriction and are left as-is
         // here; they're handled below once we see the result is a Function.
-        let expression: std::borrow::Cow<'_, str> = if looks_like_anonymous_function_statement(expression) {
-            std::borrow::Cow::Owned(format!("({expression})"))
-        } else {
-            std::borrow::Cow::Borrowed(expression)
-        };
+        let expression: std::borrow::Cow<'_, str> =
+            if looks_like_anonymous_function_statement(expression) {
+                std::borrow::Cow::Owned(format!("({expression})"))
+            } else {
+                std::borrow::Cow::Borrowed(expression)
+            };
         let expression = expression.as_ref();
         let mut params = json!({
             "expression": expression,

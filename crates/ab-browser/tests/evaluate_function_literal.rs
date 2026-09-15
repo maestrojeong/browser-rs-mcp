@@ -38,10 +38,16 @@ async fn bare_arrow_function_is_invoked_instead_of_returned_as_a_value() -> anyh
 
     // Bare arrow function: must run and return its value, not `{}`.
     let v = page.evaluate("() => 1 + 1").await?;
-    assert_eq!(v, serde_json::json!(2), "bare arrow function was not invoked");
+    assert_eq!(
+        v,
+        serde_json::json!(2),
+        "bare arrow function was not invoked"
+    );
 
     // Bare `function` literal: same expectation.
-    let v = page.evaluate("function() { return document.title; }").await?;
+    let v = page
+        .evaluate("function() { return document.title; }")
+        .await?;
     assert_eq!(
         v,
         serde_json::json!("eval fn literal"),
