@@ -818,6 +818,20 @@ struct FramePointerTarget {
     frame_point: (f64, f64),
 }
 
+/// True when `expr` starts with an anonymous `function`/`async function`
+/// literal used as a bare top-level statement — e.g. `function() { ... }`.
+/// That exact shape is always a SyntaxError on its own (a function
+/// *declaration* requires a name), so callers of this helper can
+/// unconditionally parenthesize it into a valid function *expression*
+/// without changing the meaning of anything else.
+fn looks_like_anonymous_function_statement(expr: &str) -> bool {
+    let t = expr.trim_start();
+    let t = t.strip_prefix("async").map(str::trim_start).unwrap_or(t);
+    t.strip_prefix("function")
+        .map(str::trim_start)
+        .is_some_and(|rest| rest.starts_with('('))
+}
+
 impl Page {
     pub fn target_id(&self) -> &str {
         &self.target_id
@@ -995,6 +1009,22 @@ impl Page {
     }
 
     async fn eval_raw(&self, expression: &str, isolated: bool) -> Result<Value> {
+        // `function() {...}` at the start of a statement parses as a
+        // (named) function *declaration*, which requires a name — it's a
+        // SyntaxError as a bare anonymous literal. Parenthesizing turns it
+        // into a function *expression*, which anonymous functions are fine
+        // as. This exact shape (`function`/`async function` immediately
+        // followed by `(`, i.e. no name in between) is never valid
+        // top-level script on its own, so wrapping it is unconditionally
+        // safe. Arrow functions have no such restriction and are left as-is
+        // here; they're handled below once we see the result is a Function.
+        let expression: std::borrow::Cow<'_, str> =
+            if looks_like_anonymous_function_statement(expression) {
+                std::borrow::Cow::Owned(format!("({expression})"))
+            } else {
+                std::borrow::Cow::Borrowed(expression)
+            };
+        let expression = expression.as_ref();
         let mut params = json!({
             "expression": expression,
             "returnByValue": true,
@@ -1023,12 +1053,38 @@ impl Page {
                 }
             }
         }
-        let res = self
+        let mut res = self
             .client
-            .send_on(&self.session_id, "Runtime.evaluate", params)
+            .send_on(&self.session_id, "Runtime.evaluate", params.clone())
             .await?;
         if let Some(exc) = res.get("exceptionDetails") {
             return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
+        }
+        // Callers routinely pass a bare function literal (arrow or
+        // `function`), copying the Playwright `page.evaluate(() => ...)`
+        // idiom. `Runtime.evaluate` treats the string as a raw expression —
+        // it does NOT call it — so `() => foo` yields the Function value
+        // itself, which can't be serialized by `returnByValue` (comes back
+        // as `{}`), silently discarding the caller's intent. Defining a
+        // function literal has no side effects, so it's safe to notice the
+        // mismatch and re-run once, wrapped as an immediately-invoked call.
+        if res
+            .get("result")
+            .and_then(|r| r.get("type"))
+            .and_then(Value::as_str)
+            == Some("function")
+        {
+            let mut retry_params = params;
+            retry_params["expression"] = json!(format!("({expression})()"));
+            if let Ok(retry_res) = self
+                .client
+                .send_on(&self.session_id, "Runtime.evaluate", retry_params)
+                .await
+            {
+                if retry_res.get("exceptionDetails").is_none() {
+                    res = retry_res;
+                }
+            }
         }
         Ok(res
             .get("result")
@@ -1844,7 +1900,26 @@ impl Page {
         match detected {
             Ok(Some(true)) => {}                                         // already loaded
             Ok(Some(false)) => self.wait_for_load().await.unwrap_or(()), // nav in flight
-            _ => tokio::time::sleep(Duration::from_millis(350)).await,   // no nav: DOM grace
+            _ => {
+                // No navigation: a fixed sleep here was a guess, not a
+                // signal, and CSS-transition-driven popups (a Material
+                // Design menu opening after a click, say) can still be
+                // mid-animation — with an unpositioned/zero-size box —
+                // after 350ms, so the very next snapshot/click can target
+                // an element that isn't where it will end up. Give the DOM
+                // a brief grace period, then explicitly wait for two paint
+                // frames: the first schedules the pending style/layout
+                // work, the second only fires after it has been painted.
+                // Bounded so a page that never paints (rare) can't hang us.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    self.evaluate(
+                        "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))",
+                    ),
+                )
+                .await;
+            }
         }
     }
 
