@@ -142,3 +142,36 @@ async fn bare_arrow_function_exception_is_propagated_not_swallowed() -> anyhow::
     let _ = std::fs::remove_dir_all(&profile_dir);
     Ok(())
 }
+
+/// `NaN`/`Infinity`/`-0`/BigInt come back from CDP as `unserializableValue`,
+/// not `value`, since JSON can't represent them. Regression test for a bug
+/// where that was read as an absent `value` and silently returned as `null`.
+#[tokio::test]
+#[ignore = "requires a locally installed headful Chrome or Chromium"]
+async fn unserializable_results_error_instead_of_returning_null() -> anyhow::Result<()> {
+    let html = "<!doctype html><title>eval fn literal</title><body>hi</body>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let profile_dir = temporary_profile_dir();
+
+    let browser = Browser::launch(LaunchOptions {
+        headless: false,
+        user_data_dir: Some(profile_dir.clone()),
+        ..Default::default()
+    })
+    .await?;
+    let page = browser.new_page(&url).await?;
+
+    for expr in ["NaN", "1/0", "-0", "10n"] {
+        let err = page
+            .evaluate(expr)
+            .await
+            .expect_err(&format!("evaluate({expr:?}) must error, not return null"));
+        assert!(
+            err.to_string().contains("not JSON-serializable"),
+            "unexpected error for {expr:?}: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    Ok(())
+}

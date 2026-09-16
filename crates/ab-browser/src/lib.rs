@@ -816,6 +816,7 @@ struct FramePointerTarget {
     session_id: String,
     root_point: (f64, f64),
     frame_point: (f64, f64),
+    backend: i64,
 }
 
 /// True when `expr` starts with an anonymous `function`/`async function`
@@ -1118,8 +1119,21 @@ impl Page {
             }
             res = retry_res;
         }
-        Ok(res
-            .get("result")
+        let result = res.get("result");
+        // JSON can't represent NaN/Infinity/-0/BigInt, so `returnByValue`
+        // reports them via `unserializableValue` (a display string like
+        // "NaN" or "10n") instead of `value`, which used to be silently
+        // read as absent and returned as `null`. Fail loudly instead so
+        // callers know to convert the value themselves (e.g. `String(x)`).
+        if let Some(unserializable) = result
+            .and_then(|r| r.get("unserializableValue"))
+            .and_then(Value::as_str)
+        {
+            return Err(BrowserError::Protocol(format!(
+                "evaluate() result is not JSON-serializable ({unserializable}); convert it in the expression first (e.g. wrap in String(...))"
+            )));
+        }
+        Ok(result
             .and_then(|r| r.get("value"))
             .cloned()
             .unwrap_or(Value::Null))
@@ -1448,11 +1462,26 @@ impl Page {
     /// main-world Runtime execution that a page can observe. Returns true when
     /// the point lands on the target or its accessibility ancestor chain.
     async fn point_hits_node(&self, backend: i64, x: f64, y: f64) -> Result<bool> {
+        self.point_hits_node_on(&self.session_id, backend, x, y)
+            .await
+    }
+
+    /// Same as [`point_hits_node`](Self::point_hits_node), scoped to an
+    /// arbitrary CDP session (e.g. an OOPIF's own target session, where
+    /// coordinates are relative to that frame's own viewport rather than the
+    /// top-level page's).
+    async fn point_hits_node_on(
+        &self,
+        session_id: &str,
+        backend: i64,
+        x: f64,
+        y: f64,
+    ) -> Result<bool> {
         // Input events use viewport coordinates, while DOM.getNodeForLocation
         // expects document coordinates.
         let metrics = self
             .client
-            .send_on(&self.session_id, "Page.getLayoutMetrics", json!({}))
+            .send_on(session_id, "Page.getLayoutMetrics", json!({}))
             .await?;
         let viewport = metrics
             .get("cssVisualViewport")
@@ -1468,7 +1497,7 @@ impl Page {
         let hit = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "DOM.getNodeForLocation",
                 json!({
                     "x": (x + page_x).round() as i64,
@@ -1489,7 +1518,7 @@ impl Page {
         let relatives = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "Accessibility.getPartialAXTree",
                 json!({
                     "backendNodeId": hit_backend,
@@ -1968,11 +1997,16 @@ impl Page {
         let chain = require_frame_chain(frame_selector)?;
         let target = self.iframe_pointer_target(&chain, selector).await?;
         if target.session_id == self.session_id {
-            self.trusted_click_at(target.root_point.0, target.root_point.1)
+            self.trusted_click_at(target.backend, target.root_point.0, target.root_point.1)
                 .await
         } else {
-            self.trusted_frame_click_at(&target.session_id, target.root_point, target.frame_point)
-                .await
+            self.trusted_frame_click_at(
+                &target.session_id,
+                target.backend,
+                target.root_point,
+                target.frame_point,
+            )
+            .await
         }
     }
 
@@ -1996,7 +2030,8 @@ impl Page {
         let (context, _) = self.resolve_frame_chain_for_pointer(chain).await?;
         self.frame_selector_point(&context, selector).await?;
         let (context, root_offset) = self.resolve_frame_chain_for_pointer(chain).await?;
-        let (frame_point, half_size) = self.frame_selector_point(&context, selector).await?;
+        let (frame_point, half_size, backend) =
+            self.frame_selector_point(&context, selector).await?;
         let frame_point = (
             frame_point.0 + centered_offset(half_size.0),
             frame_point.1 + centered_offset(half_size.1),
@@ -2005,6 +2040,7 @@ impl Page {
             session_id: context.session_id,
             root_point: (root_offset.0 + frame_point.0, root_offset.1 + frame_point.1),
             frame_point,
+            backend,
         })
     }
 
@@ -2114,7 +2150,7 @@ impl Page {
         &self,
         context: &FrameExecutionContext,
         selector: &str,
-    ) -> Result<((f64, f64), (f64, f64))> {
+    ) -> Result<((f64, f64), (f64, f64), i64)> {
         let backend = self
             .backend_for_piercing_selector(context, selector)
             .await?
@@ -2186,6 +2222,7 @@ impl Page {
                 })?,
             ),
             (width, height),
+            backend,
         ))
     }
 

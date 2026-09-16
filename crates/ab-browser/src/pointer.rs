@@ -262,15 +262,32 @@ impl Page {
         point: (f64, f64),
     ) -> Result<()> {
         if let PointerLocation::Element(element) = location {
-            if !self
-                .point_hits_node(element.backend_node_id, point.0, point.1)
-                .await?
-            {
-                return Err(BrowserError::Protocol(
-                    "pointer target moved, closed, or became occluded before the click landed; retry with a fresh ref"
-                        .into(),
-                ));
-            }
+            self.require_backend_target_hit(
+                &self.session_id,
+                element.backend_node_id,
+                point.0,
+                point.1,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Same check as [`require_click_target_after_move`](Self::require_click_target_after_move),
+    /// for callers that already have a `backend` id rather than a
+    /// [`PointerLocation`] (e.g. the iframe pointer path).
+    async fn require_backend_target_hit(
+        &self,
+        session_id: &str,
+        backend: i64,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        if !self.point_hits_node_on(session_id, backend, x, y).await? {
+            return Err(BrowserError::Protocol(
+                "pointer target moved, closed, or became occluded before the click landed; retry with a fresh ref"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -434,7 +451,7 @@ impl Page {
             .await
     }
 
-    pub(crate) async fn trusted_click_at(&self, x: f64, y: f64) -> Result<()> {
+    pub(crate) async fn trusted_click_at(&self, backend: i64, x: f64, y: f64) -> Result<()> {
         if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
             return Err(BrowserError::Protocol(
                 "trusted click coordinates must be finite and non-negative".into(),
@@ -442,12 +459,15 @@ impl Page {
         }
         let _mutation = self.pointer_mutation.lock().await;
         self.human_move_to(x, y, 24.0).await?;
+        self.require_backend_target_hit(&self.session_id, backend, x, y)
+            .await?;
         self.left_click_at(x, y).await
     }
 
     pub(crate) async fn trusted_frame_click_at(
         &self,
         session_id: &str,
+        backend: i64,
         root_point: (f64, f64),
         frame_point: (f64, f64),
     ) -> Result<()> {
@@ -460,6 +480,12 @@ impl Page {
         }
         let _mutation = self.pointer_mutation.lock().await;
         self.human_move_to(root_point.0, root_point.1, 24.0).await?;
+        // Same freshness recheck as the top-level pointer path: the
+        // humanized travel to the iframe target can take long enough for a
+        // hover-sensitive container to close or the target to move, so this
+        // must fail closed instead of clicking whatever is now at that point.
+        self.require_backend_target_hit(session_id, backend, frame_point.0, frame_point.1)
+            .await?;
         self.left_click_at_on(session_id, frame_point.0, frame_point.1)
             .await
     }

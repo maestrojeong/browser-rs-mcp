@@ -141,10 +141,13 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
           <div id="status">iframe pending</div>
           <div class="spacer"></div>
           <button id="smooth-target">Iframe smooth-scroll target</button>
+          <button id="iframe-vanish">Iframe vanish on hover</button>
           <script>
             const status = document.querySelector('#status');
             document.querySelector('#smooth-target')
               .addEventListener('click', () => status.textContent = 'iframe smooth target clicked');
+            const iframeVanish = document.querySelector('#iframe-vanish');
+            iframeVanish.addEventListener('mouseenter', () => iframeVanish.remove());
             const root = document.querySelector('#shadow-host').attachShadow({mode: 'closed'});
             const direct = document.createElement('button');
             direct.id = 'shadow-direct';
@@ -327,6 +330,16 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
             .await?,
         "iframe smooth target clicked"
     );
+
+    // Regression: iframe_click used to press mousedown without rechecking
+    // that the target was still there after the humanized travel, unlike
+    // the top-level pointer path's require_click_target_after_move.
+    let error = page
+        .iframe_click("#action-frame", "#iframe-vanish")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("before the click landed"), "{error}");
 
     browser.close().await;
     Ok(())
