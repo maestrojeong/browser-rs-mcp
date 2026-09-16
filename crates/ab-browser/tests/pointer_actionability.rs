@@ -132,13 +132,19 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         const frame = document.querySelector('#action-frame');
         frame.srcdoc = `<!doctype html>
           <style>
+            html { scroll-behavior: smooth; }
             body { margin: 0; font: 16px sans-serif; }
             button { width: 220px; height: 48px; margin: 8px; }
+            .spacer { height: 900px; }
           </style>
           <div id="shadow-host"></div>
           <div id="status">iframe pending</div>
+          <div class="spacer"></div>
+          <button id="smooth-target">Iframe smooth-scroll target</button>
           <script>
             const status = document.querySelector('#status');
+            document.querySelector('#smooth-target')
+              .addEventListener('click', () => status.textContent = 'iframe smooth target clicked');
             const root = document.querySelector('#shadow-host').attachShadow({mode: 'closed'});
             const direct = document.createElement('button');
             direct.id = 'shadow-direct';
@@ -307,6 +313,19 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         page.iframe_read("#action-frame", "#status", ab_browser::ReadMode::Text)
             .await?,
         "iframe menu clicked"
+    );
+
+    // Regression: the iframe pointer path used to scroll via JS
+    // `Element.scrollIntoView()` (which honors `scroll-behavior: smooth`)
+    // and read the bounding rect in the same callback, so a click on a
+    // smooth-scrolling target could compute coordinates mid-animation and
+    // miss. `#smooth-target` sits below a 900px spacer under
+    // `html { scroll-behavior: smooth }`.
+    page.iframe_click("#action-frame", "#smooth-target").await?;
+    assert_eq!(
+        page.iframe_read("#action-frame", "#status", ab_browser::ReadMode::Text)
+            .await?,
+        "iframe smooth target clicked"
     );
 
     browser.close().await;

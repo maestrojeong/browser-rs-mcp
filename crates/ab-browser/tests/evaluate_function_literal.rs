@@ -54,6 +54,36 @@ async fn bare_arrow_function_is_invoked_instead_of_returned_as_a_value() -> anyh
         "bare function literal was not invoked"
     );
 
+    // Named function declaration: valid on its own (evaluates to
+    // `undefined`), so it must also be wrapped and invoked.
+    let v = page.evaluate("function named() { return 41 + 1; }").await?;
+    assert_eq!(
+        v,
+        serde_json::json!(42),
+        "named function literal was not invoked"
+    );
+
+    let v = page
+        .evaluate("async function named() { return 41 + 1; }")
+        .await?;
+    assert_eq!(
+        v,
+        serde_json::json!(42),
+        "named async function literal was not invoked"
+    );
+
+    // A named declaration followed by more statements is not just that one
+    // function — wrapping the whole thing would be a SyntaxError, so this
+    // must fall back to plain (unwrapped) evaluation, exactly as before.
+    let v = page
+        .evaluate("function named() { return 1; } named() + 1")
+        .await?;
+    assert_eq!(
+        v,
+        serde_json::json!(2),
+        "multi-statement input starting with a named function must fall back to raw evaluation"
+    );
+
     // Ordinary expressions must be completely unaffected.
     let v = page.evaluate("1 + 1").await?;
     assert_eq!(v, serde_json::json!(2));
