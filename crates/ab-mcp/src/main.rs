@@ -6,7 +6,7 @@
 //! Core loop the tools encode: **snapshot -> act -> verify**.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use ab_browser::{
@@ -244,7 +244,6 @@ struct State {
     browser: Option<Arc<Browser>>,
     retired_browser: Option<Arc<Browser>>,
     browser_generation: u64,
-    draining: bool,
     browser_lifecycle: Arc<Mutex<()>>,
     external_page_sync: Arc<Mutex<()>>,
     launching: bool,
@@ -276,7 +275,6 @@ impl Default for State {
             browser: None,
             retired_browser: None,
             browser_generation: 0,
-            draining: false,
             browser_lifecycle: Arc::new(Mutex::new(())),
             external_page_sync: Arc::new(Mutex::new(())),
             launching: false,
@@ -302,6 +300,7 @@ const HEALTH_DRAINING: u8 = 4;
 struct HealthState {
     snapshot: ArcSwap<HealthSnapshot>,
     inflight_tools: AtomicU64,
+    draining: AtomicBool,
     spawn_nonce: String,
     started_at: std::time::Instant,
 }
@@ -312,7 +311,6 @@ struct HealthSnapshot {
     state: u8,
     pages: u64,
     stalled_pages: u64,
-    draining: bool,
     recovery_attempts: Vec<std::time::Instant>,
     cooldown_until: Option<std::time::Instant>,
 }
@@ -326,11 +324,11 @@ impl HealthState {
                 state: HEALTH_ABSENT,
                 pages: 0,
                 stalled_pages: 0,
-                draining: false,
                 recovery_attempts: Vec::new(),
                 cooldown_until: None,
             }),
             inflight_tools: AtomicU64::new(0),
+            draining: AtomicBool::new(false),
             spawn_nonce: random_token(),
             started_at: std::time::Instant::now(),
         }
@@ -341,7 +339,7 @@ impl HealthState {
             .browser
             .clone()
             .or_else(|| state.retired_browser.clone());
-        let lifecycle_state = if state.draining {
+        let lifecycle_state = if self.is_draining() {
             HEALTH_DRAINING
         } else if state.launching {
             HEALTH_LAUNCHING
@@ -366,10 +364,17 @@ impl HealthState {
                 .values()
                 .filter(|entry| entry.stalled_at_ms.is_some())
                 .count() as u64,
-            draining: state.draining,
             recovery_attempts: state.recovery_attempts.iter().copied().collect(),
             cooldown_until: state.recovery_cooldown_until,
         }));
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    fn begin_draining(&self) {
+        self.draining.store(true, Ordering::Release);
     }
 
     fn begin_tool(self: &Arc<Self>) -> InflightToolGuard {
@@ -1092,7 +1097,7 @@ impl BrowserServer {
         let (existing, generation, retired, recovered, recovery_required, draining) = {
             let mut st = self.state.lock().await;
             let recovered = Self::reap_dead_browser(&mut st);
-            if st.browser.is_none() && !st.draining {
+            if st.browser.is_none() && !st.health.is_draining() {
                 st.launching = true;
             }
             st.health.publish(&st);
@@ -1102,7 +1107,7 @@ impl BrowserServer {
                 st.retired_browser.take(),
                 recovered,
                 st.recovery_required,
-                st.draining,
+                st.health.is_draining(),
             )
         };
 
@@ -1135,7 +1140,7 @@ impl BrowserServer {
         };
         let mut st = self.state.lock().await;
         st.launching = false;
-        if st.draining {
+        if st.health.is_draining() {
             st.health.publish(&st);
             drop(st);
             browser.close().await;
@@ -3502,13 +3507,17 @@ Env equivalents: AB_HTTP, AB_HTTP_CAPABILITY, AB_PROFILE, AB_HEADLESS, AB_NO_STE
 mod tests {
     use super::{
         bind_address_is_loopback, constant_time_secret_eq, enforce_scoped_owner,
-        enrich_browser_error, fail, force_scoped_owner_argument, parse_allowed_tools,
-        parse_cli_from, parse_connect_port, release_owner_claim, snapshot_diff, truncate_text,
-        validate_wheel_input, webdriver_value_is_human, BrowserServer, IframeTypeArgs, State,
-        TypeArgs, WebAuthnConfig, DEFAULT_MAX_OUTPUT_LIMIT, HEALTH_DRAINING, HEALTH_LAUNCHING,
-        REQUEST_OWNER,
+        enrich_browser_error, fail, force_scoped_owner_argument, initiate_shutdown,
+        parse_allowed_tools, parse_cli_from, parse_connect_port, release_owner_claim,
+        snapshot_diff, truncate_text, validate_wheel_input, webdriver_value_is_human,
+        BrowserServer, IframeTypeArgs, SseSessions, State, TypeArgs, WebAuthnConfig,
+        DEFAULT_MAX_OUTPUT_LIMIT, HEALTH_DRAINING, HEALTH_LAUNCHING, REQUEST_OWNER,
     };
     use rmcp::model::CallToolRequestParams;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn capability_comparison_requires_an_exact_match() {
@@ -3880,11 +3889,11 @@ mod tests {
         assert_eq!(health.snapshot.load().state, HEALTH_LAUNCHING);
 
         state.launching = false;
-        state.draining = true;
+        state.health.begin_draining();
         health.publish(&state);
         let snapshot = health.snapshot.load();
         assert_eq!(snapshot.state, HEALTH_DRAINING);
-        assert!(snapshot.draining);
+        assert!(health.is_draining());
     }
 
     #[test]
@@ -3904,8 +3913,8 @@ mod tests {
     async fn draining_state_rejects_launch_without_starting_chrome() {
         let server = BrowserServer::new();
         {
-            let mut state = server.state.lock().await;
-            state.draining = true;
+            let state = server.state.lock().await;
+            state.health.begin_draining();
             state.health.publish(&state);
         }
         let error = match server.ensure_browser().await {
@@ -3913,6 +3922,23 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.message.contains("draining"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_start_never_waits_for_browser_or_session_locks() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let health = state.lock().await.health.clone();
+        let sessions: SseSessions = Arc::new(Mutex::new(HashMap::new()));
+        let cancellation = CancellationToken::new();
+        let started = CancellationToken::new();
+
+        let _state_guard = state.lock().await;
+        let _sessions_guard = sessions.lock().await;
+        initiate_shutdown(&sessions, &health, &cancellation, &started);
+
+        assert!(health.is_draining());
+        assert!(cancellation.is_cancelled());
+        assert!(started.is_cancelled());
     }
 
     #[test]
@@ -4289,7 +4315,7 @@ async fn health(
             serde_json::json!({
                 "pid": std::process::id(),
                 "uptimeMs": health.started_at.elapsed().as_millis() as u64,
-                "draining": snapshot.draining,
+                "draining": health.is_draining(),
             }),
         );
         map.insert(
@@ -4341,7 +4367,7 @@ async fn admin_drain(
     let _lifecycle = lifecycle.lock().await;
     let browsers = {
         let mut st = state.browser.lock().await;
-        st.draining = true;
+        st.health.begin_draining();
         st.launching = false;
         st.pages.clear();
         st.owners.clear();
@@ -4370,7 +4396,7 @@ async fn admin_relaunch(
     let _lifecycle = lifecycle.lock().await;
     let old_browser = {
         let mut st = state.browser.lock().await;
-        if st.draining {
+        if st.health.is_draining() {
             return (
                 StatusCode::LOCKED,
                 axum::Json(serde_json::json!({ "ok": false, "error": "draining" })),
@@ -4428,7 +4454,7 @@ async fn admin_relaunch(
     };
     let generation = {
         let mut st = state.browser.lock().await;
-        if st.draining {
+        if st.health.is_draining() {
             st.launching = false;
             st.health.publish(&st);
             drop(st);
@@ -4592,16 +4618,63 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("browser-rs MCP server on http://{bind}/mcp (streamable HTTP) + http://{bind}/sse (legacy SSE)");
-    let shutdown_sessions = sse_state.sessions.clone();
-    let shutdown_browser = sse_state.browser.clone();
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(
-            shutdown_sessions,
-            shutdown_browser,
-            cancellation_token,
-        ))
-        .await?;
+    // The supervisor gives browser-rs three seconds to exit before SIGKILL.
+    // Keep our entire graceful path below that budget so shutdown never gets
+    // stuck behind an active SSE request, the State mutex, or Chrome flushing
+    // a busy profile to disk.
+    const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
+    const SERVER_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
+    let shutdown_started = CancellationToken::new();
+    let shutdown_sessions = sse_state.sessions.clone();
+    let shutdown_health = sse_state.health.clone();
+    let shutdown_notice = shutdown_started.clone();
+    let mut shutdown_requested = false;
+    {
+        let server = async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal(
+                    shutdown_sessions,
+                    shutdown_health,
+                    cancellation_token,
+                    shutdown_notice,
+                ))
+                .await
+        };
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result?,
+            _ = shutdown_started.cancelled() => {
+                shutdown_requested = true;
+                if tokio::time::timeout(SERVER_DRAIN_BUDGET, &mut server)
+                    .await
+                    .is_err()
+                {
+                    warn!("HTTP/SSE drain exceeded shutdown budget; dropping active connections");
+                }
+            }
+        }
+    }
+    shutdown_requested |= shutdown_started.is_cancelled();
+
+    if shutdown_requested {
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE - SERVER_DRAIN_BUDGET;
+        // HealthState publishes the current/retired Browser through ArcSwap,
+        // so shutdown can close Chrome without waiting for the State mutex.
+        let browser = sse_state.health.snapshot.load_full().browser.clone();
+        if let Some(browser) = browser {
+            if tokio::time::timeout_at(deadline, browser.close())
+                .await
+                .is_err()
+            {
+                warn!("Chrome close exceeded shutdown deadline; forcing exit via kill_on_drop");
+            }
+        }
+        return Ok(());
+    }
+
+    // Unexpected server termination (not a signal): preserve the full cleanup
+    // path because no supervisor deadline is currently counting down.
     let browser = {
         let mut state = sse_state.browser.lock().await;
         state.pages.clear();
@@ -4622,8 +4695,9 @@ async fn serve_http(addr: &str) -> anyhow::Result<()> {
 
 async fn shutdown_signal(
     sessions: SseSessions,
-    browser: Arc<Mutex<State>>,
+    health: Arc<HealthState>,
     cancellation_token: tokio_util::sync::CancellationToken,
+    shutdown_started: CancellationToken,
 ) {
     #[cfg(unix)]
     let terminate = async {
@@ -4649,11 +4723,23 @@ async fn shutdown_signal(
         }
         _ = terminate => {}
     }
-    {
-        let mut state = browser.lock().await;
-        state.draining = true;
-        state.health.publish(&state);
-    }
+    initiate_shutdown(&sessions, &health, &cancellation_token, &shutdown_started);
+}
+
+fn initiate_shutdown(
+    sessions: &SseSessions,
+    health: &HealthState,
+    cancellation_token: &CancellationToken,
+    shutdown_started: &CancellationToken,
+) {
+    // Never wait for browser State here. A stalled tool may own that mutex,
+    // and cancellation is precisely what must run to release such work.
+    health.begin_draining();
     cancellation_token.cancel();
-    sessions.lock().await.clear();
+    if let Ok(mut sessions) = sessions.try_lock() {
+        sessions.clear();
+    } else {
+        warn!("SSE session registry busy during shutdown; server drop will close connections");
+    }
+    shutdown_started.cancel();
 }

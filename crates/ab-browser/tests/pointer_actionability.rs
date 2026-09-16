@@ -73,6 +73,8 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
       <button id="drag-source">Drag source</button>
       <button id="drag-target">Drag target</button>
       <div id="drag-status">drag pending</div>
+      <button id="drag-vanish">Drag vanish source</button>
+      <button id="drag-vanish-target">Drag vanish target</button>
       <iframe id="action-frame" style="width: 360px; height: 180px;"></iframe>
       <script>
         const nested = document.querySelector('#nested');
@@ -105,6 +107,9 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         menuOption.addEventListener('click', () => menuStatus.textContent = 'menu clicked');
 
         vanish.addEventListener('mouseenter', () => vanish.remove());
+
+        const dragVanish = document.querySelector('#drag-vanish');
+        dragVanish.addEventListener('mouseenter', () => dragVanish.remove());
         replace.addEventListener('click', () => {
           replaceStatus.textContent = 'first click dispatched';
           const replacement = document.createElement('button');
@@ -127,13 +132,22 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         const frame = document.querySelector('#action-frame');
         frame.srcdoc = `<!doctype html>
           <style>
+            html { scroll-behavior: smooth; }
             body { margin: 0; font: 16px sans-serif; }
             button { width: 220px; height: 48px; margin: 8px; }
+            .spacer { height: 900px; }
           </style>
           <div id="shadow-host"></div>
           <div id="status">iframe pending</div>
+          <div class="spacer"></div>
+          <button id="smooth-target">Iframe smooth-scroll target</button>
+          <button id="iframe-vanish">Iframe vanish on hover</button>
           <script>
             const status = document.querySelector('#status');
+            document.querySelector('#smooth-target')
+              .addEventListener('click', () => status.textContent = 'iframe smooth target clicked');
+            const iframeVanish = document.querySelector('#iframe-vanish');
+            iframeVanish.addEventListener('mouseenter', () => iframeVanish.remove());
             const root = document.querySelector('#shadow-host').attachShadow({mode: 'closed'});
             const direct = document.createElement('button');
             direct.id = 'shadow-direct';
@@ -268,6 +282,27 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
         "drag move count escaped bounded binomial range: {drag_status}"
     );
 
+    // Regression: Drag must recheck the origin right before mousedown, same
+    // as Click/RightClick/DoubleClick — the humanized travel to the origin
+    // gives a hover-triggered removal plenty of time to fire, and Drag used
+    // to press mousedown at the stale point unconditionally.
+    let snapshot = page.snapshot().await?;
+    let error = page
+        .dispatch_pointer(&PointerRequest {
+            action: PointerAction::Drag,
+            origin: PointerLocation::Element(element(&snapshot, "Drag vanish source")?),
+            destination: Some(PointerLocation::Element(element(
+                &snapshot,
+                "Drag vanish target",
+            )?)),
+            delta_x: 0.0,
+            delta_y: 0.0,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("before the click landed"), "{error}");
+
     page.iframe_click("#action-frame", "#shadow-direct").await?;
     assert_eq!(
         page.iframe_read("#action-frame", "#status", ab_browser::ReadMode::Text)
@@ -282,6 +317,29 @@ async fn ref_pointer_actionability_regressions() -> anyhow::Result<()> {
             .await?,
         "iframe menu clicked"
     );
+
+    // Regression: the iframe pointer path used to scroll via JS
+    // `Element.scrollIntoView()` (which honors `scroll-behavior: smooth`)
+    // and read the bounding rect in the same callback, so a click on a
+    // smooth-scrolling target could compute coordinates mid-animation and
+    // miss. `#smooth-target` sits below a 900px spacer under
+    // `html { scroll-behavior: smooth }`.
+    page.iframe_click("#action-frame", "#smooth-target").await?;
+    assert_eq!(
+        page.iframe_read("#action-frame", "#status", ab_browser::ReadMode::Text)
+            .await?,
+        "iframe smooth target clicked"
+    );
+
+    // Regression: iframe_click used to press mousedown without rechecking
+    // that the target was still there after the humanized travel, unlike
+    // the top-level pointer path's require_click_target_after_move.
+    let error = page
+        .iframe_click("#action-frame", "#iframe-vanish")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("before the click landed"), "{error}");
 
     browser.close().await;
     Ok(())

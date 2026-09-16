@@ -574,6 +574,14 @@ failed probe marks the transport dead. Recovery is single-flight and limited
 to three attempts per ten minutes, followed by a five-minute circuit-open
 period.
 
+Process shutdown is independent of the shared browser-state mutex. SIGINT or
+SIGTERM atomically marks the process as draining, cancels MCP sessions, and
+starts HTTP connection drain immediately. The complete managed shutdown path
+has a 2.5-second deadline (shorter than the host supervisor's kill timeout);
+when Chrome does not close in time, dropping its process handle forces exit.
+This keeps a stalled CDP request or a busy profile flush from blocking process
+replacement.
+
 Administrative HTTP operations require the root `X-Browser-Capability`:
 
 - `POST /admin/relaunch?expected_generation=N` replaces Chrome only when the

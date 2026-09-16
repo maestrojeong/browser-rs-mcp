@@ -54,6 +54,36 @@ async fn bare_arrow_function_is_invoked_instead_of_returned_as_a_value() -> anyh
         "bare function literal was not invoked"
     );
 
+    // Named function declaration: valid on its own (evaluates to
+    // `undefined`), so it must also be wrapped and invoked.
+    let v = page.evaluate("function named() { return 41 + 1; }").await?;
+    assert_eq!(
+        v,
+        serde_json::json!(42),
+        "named function literal was not invoked"
+    );
+
+    let v = page
+        .evaluate("async function named() { return 41 + 1; }")
+        .await?;
+    assert_eq!(
+        v,
+        serde_json::json!(42),
+        "named async function literal was not invoked"
+    );
+
+    // A named declaration followed by more statements is not just that one
+    // function — wrapping the whole thing would be a SyntaxError, so this
+    // must fall back to plain (unwrapped) evaluation, exactly as before.
+    let v = page
+        .evaluate("function named() { return 1; } named() + 1")
+        .await?;
+    assert_eq!(
+        v,
+        serde_json::json!(2),
+        "multi-statement input starting with a named function must fall back to raw evaluation"
+    );
+
     // Ordinary expressions must be completely unaffected.
     let v = page.evaluate("1 + 1").await?;
     assert_eq!(v, serde_json::json!(2));
@@ -75,6 +105,72 @@ async fn bare_arrow_function_is_invoked_instead_of_returned_as_a_value() -> anyh
         serde_json::json!(5),
         "returning a function-from-a-function must not be recursively invoked"
     );
+
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    Ok(())
+}
+
+/// The auto-invoke retry re-executes caller-provided code, so it can throw
+/// just like any other evaluate() call. Regression test for a bug where the
+/// retry's `exceptionDetails` (and any transport failure) were silently
+/// swallowed, so `evaluate("() => { throw ... }")` returned `null` instead of
+/// propagating the error like every other failing evaluate() does.
+#[tokio::test]
+#[ignore = "requires a locally installed headful Chrome or Chromium"]
+async fn bare_arrow_function_exception_is_propagated_not_swallowed() -> anyhow::Result<()> {
+    let html = "<!doctype html><title>eval fn literal</title><body>hi</body>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let profile_dir = temporary_profile_dir();
+
+    let browser = Browser::launch(LaunchOptions {
+        headless: false,
+        user_data_dir: Some(profile_dir.clone()),
+        ..Default::default()
+    })
+    .await?;
+    let page = browser.new_page(&url).await?;
+
+    let err = page
+        .evaluate("() => { throw new Error('boom'); }")
+        .await
+        .expect_err("a thrown error inside the auto-invoked function must surface as an error");
+    assert!(
+        err.to_string().contains("boom"),
+        "expected the thrown error's message to propagate, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&profile_dir);
+    Ok(())
+}
+
+/// `NaN`/`Infinity`/`-0`/BigInt come back from CDP as `unserializableValue`,
+/// not `value`, since JSON can't represent them. Regression test for a bug
+/// where that was read as an absent `value` and silently returned as `null`.
+#[tokio::test]
+#[ignore = "requires a locally installed headful Chrome or Chromium"]
+async fn unserializable_results_error_instead_of_returning_null() -> anyhow::Result<()> {
+    let html = "<!doctype html><title>eval fn literal</title><body>hi</body>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let profile_dir = temporary_profile_dir();
+
+    let browser = Browser::launch(LaunchOptions {
+        headless: false,
+        user_data_dir: Some(profile_dir.clone()),
+        ..Default::default()
+    })
+    .await?;
+    let page = browser.new_page(&url).await?;
+
+    for expr in ["NaN", "1/0", "-0", "10n"] {
+        let err = page
+            .evaluate(expr)
+            .await
+            .expect_err(&format!("evaluate({expr:?}) must error, not return null"));
+        assert!(
+            err.to_string().contains("not JSON-serializable"),
+            "unexpected error for {expr:?}: {err}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&profile_dir);
     Ok(())

@@ -816,6 +816,7 @@ struct FramePointerTarget {
     session_id: String,
     root_point: (f64, f64),
     frame_point: (f64, f64),
+    backend: i64,
 }
 
 /// True when `expr` starts with an anonymous `function`/`async function`
@@ -830,6 +831,31 @@ fn looks_like_anonymous_function_statement(expr: &str) -> bool {
     t.strip_prefix("function")
         .map(str::trim_start)
         .is_some_and(|rest| rest.starts_with('('))
+}
+
+/// True when `expr` starts with `function`/`async function`, named or not
+/// (e.g. `function foo() {...}`). Unlike the anonymous case, a named
+/// function *declaration* is valid top-level script — it just evaluates to
+/// `undefined` rather than the function itself, so it silently discards a
+/// `page.evaluate(function named(){...})`-style caller intent instead of
+/// erroring. Parenthesizing is only safe to *try*, not assume: `expr` may be
+/// that declaration followed by more statements (`function foo(){} foo()`),
+/// which becomes a SyntaxError once wrapped — callers must fall back to the
+/// unwrapped source if the wrapped evaluate fails.
+fn looks_like_function_statement(expr: &str) -> bool {
+    let t = expr.trim_start();
+    let t = t.strip_prefix("async").map(str::trim_start).unwrap_or(t);
+    let Some(rest) = t.strip_prefix("function") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    if rest.starts_with('(') {
+        return true;
+    }
+    let name_end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    name_end > 0 && rest[name_end..].trim_start().starts_with('(')
 }
 
 impl Page {
@@ -1009,24 +1035,18 @@ impl Page {
     }
 
     async fn eval_raw(&self, expression: &str, isolated: bool) -> Result<Value> {
-        // `function() {...}` at the start of a statement parses as a
-        // (named) function *declaration*, which requires a name — it's a
-        // SyntaxError as a bare anonymous literal. Parenthesizing turns it
-        // into a function *expression*, which anonymous functions are fine
-        // as. This exact shape (`function`/`async function` immediately
-        // followed by `(`, i.e. no name in between) is never valid
-        // top-level script on its own, so wrapping it is unconditionally
-        // safe. Arrow functions have no such restriction and are left as-is
-        // here; they're handled below once we see the result is a Function.
-        let expression: std::borrow::Cow<'_, str> =
-            if looks_like_anonymous_function_statement(expression) {
-                std::borrow::Cow::Owned(format!("({expression})"))
-            } else {
-                std::borrow::Cow::Borrowed(expression)
-            };
-        let expression = expression.as_ref();
+        // Anonymous `function(){}` is always a SyntaxError unwrapped, so
+        // wrapping it in parens is unconditionally safe. A named function
+        // declaration is valid on its own but evaluates to `undefined`, not
+        // the function, so it's also worth wrapping — but only as an
+        // attempt: `expr` could be that declaration plus more statements,
+        // which becomes a SyntaxError once wrapped. The raw source is the
+        // fallback in that case (see below).
+        let is_anonymous_fn = looks_like_anonymous_function_statement(expression);
+        let wrapped = (is_anonymous_fn || looks_like_function_statement(expression))
+            .then(|| format!("({expression})"));
         let mut params = json!({
-            "expression": expression,
+            "expression": wrapped.as_deref().unwrap_or(expression),
             "returnByValue": true,
             "awaitPromise": true,
         });
@@ -1057,6 +1077,15 @@ impl Page {
             .client
             .send_on(&self.session_id, "Runtime.evaluate", params.clone())
             .await?;
+        let mut current_expr = wrapped.as_deref().unwrap_or(expression);
+        if res.get("exceptionDetails").is_some() && wrapped.is_some() && !is_anonymous_fn {
+            params["expression"] = json!(expression);
+            res = self
+                .client
+                .send_on(&self.session_id, "Runtime.evaluate", params.clone())
+                .await?;
+            current_expr = expression;
+        }
         if let Some(exc) = res.get("exceptionDetails") {
             return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
         }
@@ -1075,19 +1104,36 @@ impl Page {
             == Some("function")
         {
             let mut retry_params = params;
-            retry_params["expression"] = json!(format!("({expression})()"));
-            if let Ok(retry_res) = self
+            retry_params["expression"] = json!(format!("({current_expr})()"));
+            // The retry is a real re-execution of caller-provided code, not a
+            // side-effect-free formality: it can throw (`() => { throw ... }`)
+            // or the transport can fail. Both must surface like any other
+            // evaluate() failure — swallowing them previously turned a thrown
+            // error into a silently-wrong `null` result.
+            let retry_res = self
                 .client
                 .send_on(&self.session_id, "Runtime.evaluate", retry_params)
-                .await
-            {
-                if retry_res.get("exceptionDetails").is_none() {
-                    res = retry_res;
-                }
+                .await?;
+            if let Some(exc) = retry_res.get("exceptionDetails") {
+                return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
             }
+            res = retry_res;
         }
-        Ok(res
-            .get("result")
+        let result = res.get("result");
+        // JSON can't represent NaN/Infinity/-0/BigInt, so `returnByValue`
+        // reports them via `unserializableValue` (a display string like
+        // "NaN" or "10n") instead of `value`, which used to be silently
+        // read as absent and returned as `null`. Fail loudly instead so
+        // callers know to convert the value themselves (e.g. `String(x)`).
+        if let Some(unserializable) = result
+            .and_then(|r| r.get("unserializableValue"))
+            .and_then(Value::as_str)
+        {
+            return Err(BrowserError::Protocol(format!(
+                "evaluate() result is not JSON-serializable ({unserializable}); convert it in the expression first (e.g. wrap in String(...))"
+            )));
+        }
+        Ok(result
             .and_then(|r| r.get("value"))
             .cloned()
             .unwrap_or(Value::Null))
@@ -1416,11 +1462,26 @@ impl Page {
     /// main-world Runtime execution that a page can observe. Returns true when
     /// the point lands on the target or its accessibility ancestor chain.
     async fn point_hits_node(&self, backend: i64, x: f64, y: f64) -> Result<bool> {
+        self.point_hits_node_on(&self.session_id, backend, x, y)
+            .await
+    }
+
+    /// Same as [`point_hits_node`](Self::point_hits_node), scoped to an
+    /// arbitrary CDP session (e.g. an OOPIF's own target session, where
+    /// coordinates are relative to that frame's own viewport rather than the
+    /// top-level page's).
+    async fn point_hits_node_on(
+        &self,
+        session_id: &str,
+        backend: i64,
+        x: f64,
+        y: f64,
+    ) -> Result<bool> {
         // Input events use viewport coordinates, while DOM.getNodeForLocation
         // expects document coordinates.
         let metrics = self
             .client
-            .send_on(&self.session_id, "Page.getLayoutMetrics", json!({}))
+            .send_on(session_id, "Page.getLayoutMetrics", json!({}))
             .await?;
         let viewport = metrics
             .get("cssVisualViewport")
@@ -1436,7 +1497,7 @@ impl Page {
         let hit = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "DOM.getNodeForLocation",
                 json!({
                     "x": (x + page_x).round() as i64,
@@ -1457,7 +1518,7 @@ impl Page {
         let relatives = self
             .client
             .send_on(
-                &self.session_id,
+                session_id,
                 "Accessibility.getPartialAXTree",
                 json!({
                     "backendNodeId": hit_backend,
@@ -1936,11 +1997,16 @@ impl Page {
         let chain = require_frame_chain(frame_selector)?;
         let target = self.iframe_pointer_target(&chain, selector).await?;
         if target.session_id == self.session_id {
-            self.trusted_click_at(target.root_point.0, target.root_point.1)
+            self.trusted_click_at(target.backend, target.root_point.0, target.root_point.1)
                 .await
         } else {
-            self.trusted_frame_click_at(&target.session_id, target.root_point, target.frame_point)
-                .await
+            self.trusted_frame_click_at(
+                &target.session_id,
+                target.backend,
+                target.root_point,
+                target.frame_point,
+            )
+            .await
         }
     }
 
@@ -1964,7 +2030,8 @@ impl Page {
         let (context, _) = self.resolve_frame_chain_for_pointer(chain).await?;
         self.frame_selector_point(&context, selector).await?;
         let (context, root_offset) = self.resolve_frame_chain_for_pointer(chain).await?;
-        let (frame_point, half_size) = self.frame_selector_point(&context, selector).await?;
+        let (frame_point, half_size, backend) =
+            self.frame_selector_point(&context, selector).await?;
         let frame_point = (
             frame_point.0 + centered_offset(half_size.0),
             frame_point.1 + centered_offset(half_size.1),
@@ -1973,6 +2040,7 @@ impl Page {
             session_id: context.session_id,
             root_point: (root_offset.0 + frame_point.0, root_offset.1 + frame_point.1),
             frame_point,
+            backend,
         })
     }
 
@@ -2000,6 +2068,28 @@ impl Page {
                 .as_ref()
                 .map(|value| value.session_id.as_str())
                 .unwrap_or(&self.session_id);
+            // Scroll and rect-read used to happen in one JS callback via
+            // Element.scrollIntoView(), whose default `behavior: 'auto'`
+            // follows the page's CSS `scroll-behavior`. On a page/container
+            // with `scroll-behavior: smooth` that scroll animates for
+            // 150-400ms+, so a getBoundingClientRect() taken in the same
+            // callback could land mid-scroll. CDP's DOM.scrollIntoViewIfNeeded
+            // is implemented with an always-instant scroll (Blink forces
+            // ScrollBehavior::kInstant regardless of the page's CSS), so
+            // doing the scroll through it first and only then reading the
+            // rect avoids the race entirely.
+            // Best-effort, matching `scroll_into_view()`'s own handling: an
+            // element that's already visible or that CDP can't scroll (e.g.
+            // `position: fixed` edge cases) shouldn't fail iframe pointer
+            // resolution outright.
+            let _ = self
+                .client
+                .send_on(
+                    session_id,
+                    "DOM.scrollIntoViewIfNeeded",
+                    json!({ "objectId": object_id }),
+                )
+                .await;
             let rect = self
                 .client
                 .send_on(
@@ -2007,7 +2097,7 @@ impl Page {
                     "Runtime.callFunctionOn",
                     json!({
                         "objectId": object_id,
-                        "functionDeclaration": "function() { this.scrollIntoView({block:'center',inline:'center'}); const r=this.getBoundingClientRect(); return {x:r.left+(this.clientLeft||0),y:r.top+(this.clientTop||0)}; }",
+                        "functionDeclaration": "function() { const r=this.getBoundingClientRect(); return {x:r.left+(this.clientLeft||0),y:r.top+(this.clientTop||0)}; }",
                         "returnByValue": true,
                     }),
                 )
@@ -2060,7 +2150,7 @@ impl Page {
         &self,
         context: &FrameExecutionContext,
         selector: &str,
-    ) -> Result<((f64, f64), (f64, f64))> {
+    ) -> Result<((f64, f64), (f64, f64), i64)> {
         let backend = self
             .backend_for_piercing_selector(context, selector)
             .await?
@@ -2132,6 +2222,7 @@ impl Page {
                 })?,
             ),
             (width, height),
+            backend,
         ))
     }
 
