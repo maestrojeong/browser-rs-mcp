@@ -20,30 +20,34 @@ const SEP: char = '\u{1f}';
 type Rule = (&'static str, &'static str, bool);
 
 const RULES: &[Rule] = &[
+    // NOTE: every replacement must be UNIQUE (case-insensitive) and no
+    // replacement may be a prefix of another — `unmask` derives the original
+    // from `negotium-<replacement>` (see `replacements_are_unique`).
     // English
+    ("Verify", "Check", true),
     ("Verify you are human", "Complete the check", false),
-    ("Confirm you are human", "Complete the check", false),
+    ("Confirm you are human", "Finish the check", false),
     (
         "Press & Hold to confirm you are a human",
-        "Please continue",
+        "Hold to continue",
         false,
     ),
-    ("Human verification", "Check", false),
-    ("Please slide to verify", "Please continue", false),
-    ("Slide to verify", "Please continue", false),
-    ("I'm not a robot", "Continue", false),
-    ("I\u{2019}m not a robot", "Continue", false),
-    ("Are you a robot?", "Continue", false),
+    ("Human verification", "Review step", false),
+    ("Please slide to verify", "Please slide to continue", false),
+    ("Slide to verify", "Slide to continue", false),
+    ("I'm not a robot", "Continue here", false),
+    ("I\u{2019}m not a robot", "Proceed", false),
+    ("Are you a robot?", "Ready to go?", false),
     (
         "Checking if the site connection is secure",
         "Please wait",
         false,
     ),
-    ("CAPTCHA", "check", true),
+    ("CAPTCHA", "challenge", true),
     // Status messages
-    ("Validation successful", "Check complete", false),
-    ("Validation failed", "Check failed", false),
-    ("Validation expired", "Check expired", false),
+    ("Validation successful", "Result complete", false),
+    ("Validation failed", "Result failed", false),
+    ("Validation expired", "Result expired", false),
     // Widget class/id names (HTML attributes)
     ("capture-wrapper", "widget-wrapper", false),
     ("capture-box", "widget-box", false),
@@ -57,13 +61,95 @@ const RULES: &[Rule] = &[
     ("사람인지 확인", "확인 진행", false),
     ("보안 문자", "확인 문자", false),
     ("보안문자", "확인문자", false),
-    ("자동 입력 방지", "확인", false),
-    ("자동입력 방지", "확인", false),
-    ("자동입력방지", "확인", false),
+    ("자동 입력 방지", "입력 확인", false),
+    ("자동입력 방지", "입력확인", false),
+    ("자동입력방지", "입력검증", false),
     ("슬라이드하여 인증", "계속 진행", false),
-    ("캡차", "확인", false),
-    ("캡챠", "확인", false),
+    ("캡차", "체크", false),
+    ("캡챠", "점검", false),
 ];
+
+/// Replacements are emitted with a `negotium-` marker prefix (`negotium-Check`)
+/// so [`unmask`] can find and
+/// reverse them in tool *inputs* (selectors, ids, JS, text). The case of the
+/// matched text is followed (`verify` -> `negotium-check`, `VERIFY` -> `negotium-CHECK`).
+const OPEN: &str = "negotium-";
+const CLOSE: &str = "";
+
+fn follow_case(matched: &str, replace: &str) -> String {
+    let letters: Vec<char> = matched.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.len() > 1 && letters.iter().all(|c| c.is_uppercase()) {
+        replace.to_uppercase()
+    } else if !letters.is_empty() && letters.iter().all(|c| c.is_lowercase()) {
+        replace.to_lowercase()
+    } else {
+        replace.to_string()
+    }
+}
+
+/// Build the masked token for a match.
+fn render(c: &Compiled, raw: &str) -> String {
+    if c.replace == MASK {
+        return MASK.to_string();
+    }
+    format!("{OPEN}{}{CLOSE}", follow_case(raw, c.replace))
+}
+
+/// Reverse [`mask`] (deterministically, from `RULES`) for text the caller sends back (CSS selectors, ids, JS,
+/// typed text...). `[[Check]]-img-out` -> `verify-img-out`.
+pub fn unmask(text: String) -> String {
+    if !text.contains(OPEN) {
+        return text;
+    }
+    // Stateless: derive tokens from RULES (mixed-case originals restore to the
+    // rule's own casing).
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for &(phrase, replace, _) in RULES {
+        if replace.is_empty() {
+            continue;
+        }
+        for (r, p) in [
+            (replace.to_string(), phrase.to_string()),
+            (replace.to_lowercase(), phrase.to_lowercase()),
+            (replace.to_uppercase(), phrase.to_uppercase()),
+        ] {
+            // `[[x]]`, and the CSS-escaped form `\[\[x\]\]` a caller writes
+            // when using the token inside a selector.
+            pairs.push((format!("{OPEN}{r}{CLOSE}"), p.clone()));
+            pairs.push((format!("\\[\\[{r}\\]\\]"), p));
+        }
+    }
+    pairs.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+    let mut out = text;
+    for (k, v) in pairs {
+        if out.contains(&k) {
+            out = out.replace(&k, &v);
+        }
+    }
+    out
+}
+
+/// Mask every string inside a JSON value (structured tool results).
+pub fn mask_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => *s = mask(std::mem::take(s)),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(mask_json),
+        serde_json::Value::Object(o) => o.values_mut().for_each(mask_json),
+        _ => {}
+    }
+}
+
+/// Unmask every string inside a JSON value (tool arguments).
+pub fn unmask_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            *s = unmask(std::mem::take(s));
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(unmask_json),
+        serde_json::Value::Object(o) => o.values_mut().for_each(unmask_json),
+        _ => {}
+    }
+}
 
 pub fn mask(text: String) -> String {
     mask_rules(text, RULES)
@@ -104,7 +190,9 @@ fn gap_unit(s: &str, i: usize) -> usize {
     }
     if c == '&' {
         for ent in ["&nbsp;", "&#160;", "&#xa0;"] {
-            if rest.len() >= ent.len() && rest[..ent.len()].eq_ignore_ascii_case(ent) {
+            if rest.len() >= ent.len()
+                && rest.as_bytes()[..ent.len()].eq_ignore_ascii_case(ent.as_bytes())
+            {
                 return ent.len();
             }
         }
@@ -250,7 +338,7 @@ pub fn mask_rules(text: String, rules: &[Rule]) -> String {
     let mut copied = 0;
     for (s, e, k) in matches {
         out.push_str(&text[copied..s]);
-        out.push_str(compiled[k].replace);
+        out.push_str(&render(&compiled[k], &text[s..e]));
         copied = e;
     }
     out.push_str(&text[copied..]);
@@ -297,7 +385,7 @@ pub fn mask_segments_rules(segs: &[String], rules: &[Rule]) -> Vec<String> {
             }
             res.push_str(&joined[copied..os]);
             if !inserted[m] {
-                res.push_str(compiled[k].replace);
+                res.push_str(&render(&compiled[k], &joined[ms..me]));
                 inserted[m] = true;
             }
             copied = oe;
@@ -401,7 +489,7 @@ mod tests {
                     .into(),
                 rules
             ),
-            "Solve the check. <div class=\"g-recaptcha\"> reCAPTCHA Check"
+            "Solve the negotium-CHECK. <div class=\"g-recaptcha\"> reCAPTCHA negotium-check"
         );
     }
     #[test]
@@ -412,12 +500,11 @@ mod tests {
             .collect();
         assert_eq!(
             mask_segments_rules(&segs, &[("captcha", "check", true)]),
-            ["check", "", " x"]
+            ["negotium-CHECK", "", " x"]
         );
     }
     #[test]
     fn rules_are_fixed_points() {
-        // Re-masking already-masked output must not change it, for every rule.
         for &(phrase, _, _) in RULES {
             let once = mask(format!("x {phrase} y"));
             assert_eq!(
@@ -426,20 +513,96 @@ mod tests {
                 "rule {phrase:?} is not idempotent"
             );
         }
-        let ids = mask(
-            r#"<div class="capture-wrapper"><i id="verify-img-out"></i>Validation failed</div>"#
-                .into(),
+    }
+    #[test]
+    fn replacements_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for &(phrase, replace, _) in RULES {
+            assert!(
+                seen.insert(replace.to_lowercase()),
+                "duplicate replacement {replace:?} (rule {phrase:?}) breaks unmask"
+            );
+        }
+        for &(_, a, _) in RULES {
+            for &(_, b, _) in RULES {
+                assert!(
+                    a == b || !b.to_lowercase().starts_with(&a.to_lowercase()),
+                    "replacement {a:?} is a prefix of {b:?}: `negotium-{a}` would be ambiguous"
+                );
+            }
+        }
+    }
+    #[test]
+    fn every_rule_round_trips() {
+        for &(phrase, replace, _) in RULES {
+            if replace.is_empty() {
+                continue;
+            }
+            let masked = mask(format!("x {phrase} y"));
+            assert_ne!(
+                masked,
+                format!("x {phrase} y"),
+                "rule {phrase:?} did not mask"
+            );
+            assert_eq!(unmask(masked), format!("x {phrase} y"), "rule {phrase:?}");
+        }
+    }
+    #[test]
+    fn attribute_names_restore_in_selectors() {
+        for (input, want) in [
+            ("#negotium-widget-img-out", "#verify-img-out"),
+            (".negotium-widget-wrapper > div", ".capture-wrapper > div"),
+            (
+                r#"[id="negotium-widget-img-panel"]"#,
+                r#"[id="verify-img-panel"]"#,
+            ),
+            // no brackets = a real page name, never touched
+            ("#widget-img-out", "#widget-img-out"),
+            (".widget-box .widget-refresh", ".widget-box .widget-refresh"),
+            (
+                "document.querySelector('.negotium-widget-move-block')",
+                "document.querySelector('.verify-move-block')",
+            ),
+        ] {
+            assert_eq!(unmask(input.into()), want, "{input}");
+        }
+    }
+    #[test]
+    fn widget_ids_and_korean() {
+        assert_eq!(
+            mask(r#"<i id="verify-img-out"></i>Validation failed"#.into()),
+            r#"<i id="negotium-widget-img-out"></i>negotium-Result failed"#
         );
         assert_eq!(
-            ids,
-            r#"<div class="widget-wrapper"><i id="widget-img-out"></i>Check failed</div>"#
+            mask("캡차를 풀고 보안문자를 입력하세요".into()),
+            "negotium-체크를 풀고 negotium-확인문자를 입력하세요"
         );
     }
     #[test]
-    fn korean_rules_with_particles() {
+    fn verify_is_wrapped_and_reversible() {
+        let masked = mask(r#"<i id="verify-x">Verify now, VERIFY, verification</i>"#.into());
         assert_eq!(
-            mask("캡차를 풀고 보안문자를 입력하세요. 로봇이 아닙니다".into()),
-            "확인를 풀고 확인문자를 입력하세요. 확인을 완료해 주세요"
+            masked,
+            r#"<i id="negotium-check-x">negotium-Check now, negotium-CHECK, verification</i>"#
+        );
+        // selectors built from masked output are restored for execution
+        assert_eq!(unmask("#negotium-check-x".into()), "#verify-x");
+        assert_eq!(unmask("#negotium-widget-img-out".into()), "#verify-img-out");
+        assert_eq!(unmask("text=negotium-Check now".into()), "text=Verify now");
+        assert_eq!(unmask("plain".into()), "plain");
+    }
+    #[test]
+    fn gap_entity_check_is_utf8_safe() {
+        assert_eq!(mask_with("a &😀😀b".into(), &["a b"]), "a &😀😀b");
+    }
+    #[test]
+    fn unmask_json_walks_arguments() {
+        let mut v =
+            serde_json::json!({"selector": "#negotium-check-x", "n": [ "negotium-Check" ], "k": 1});
+        unmask_json(&mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({"selector": "#verify-x", "n": ["Verify"], "k": 1})
         );
     }
 }
