@@ -285,7 +285,11 @@ mod tests {
             st("4", "are Human"),
         ];
         let snap = render(&nodes);
-        assert!(snap.text.contains("[BLOCKED]"), "{}", snap.text);
+        assert!(
+            snap.text.contains("Please Complete the check"),
+            "{}",
+            snap.text
+        );
         assert!(!snap.text.to_lowercase().contains("human"), "{}", snap.text);
         assert!(!snap.text.contains("\"you\""), "{}", snap.text);
     }

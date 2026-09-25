@@ -1,7 +1,8 @@
-//! Phrase masking: replaces forbidden phrases with `[BLOCKED]` in any page
-//! content returned to the caller (snapshot, text, html, markdown, find, tool errors).
-//! Edit `BLOCKED_PHRASES` below. Matching is per-char simple-lowercase
-//! case-insensitive (no multi-char folds like ß/SS). Empty = no-op.
+//! Phrase rewriting: replaces configured phrases with a substitute (or
+//! `[BLOCKED]`) in any page content returned to the caller (snapshot, text,
+//! html, markdown, find, tool errors). Edit `RULES` below. Matching is
+//! per-char simple-lowercase case-insensitive (no multi-char folds like
+//! ß/SS). Empty = no-op.
 
 pub const MASK: &str = "[BLOCKED]";
 
@@ -10,16 +11,23 @@ pub const MASK: &str = "[BLOCKED]";
 /// gap unit between words.
 const SEP: char = '\u{1f}';
 
-/// Forbidden phrases — add yours here.
-const BLOCKED_PHRASES: &[&str] = &[
-    "Verify you are human",
-    "Please slide to verify",
-    "CAPTCHA",
-    "Human verification",
+/// `(phrase, replacement, whole_word)`.
+/// - `replacement`: text to put in place of the phrase; `""` = `[BLOCKED]`.
+///   A replacement must not itself contain any phrase (masking is applied on
+///   several layers, so it has to be a fixed point).
+/// - `whole_word`: only match when not embedded in a longer word
+///   (letters/digits/`_`), so `captcha` skips `recaptcha` / `g-recaptcha`.
+type Rule = (&'static str, &'static str, bool);
+
+const RULES: &[Rule] = &[
+    ("Verify you are human", "Complete the check", false),
+    ("Please slide to verify", "Please continue", false),
+    ("CAPTCHA", "check", true),
+    ("Human verification", "Check", false),
 ];
 
 pub fn mask(text: String) -> String {
-    mask_with(text, BLOCKED_PHRASES)
+    mask_rules(text, RULES)
 }
 
 /// One unit of a phrase pattern.
@@ -126,16 +134,38 @@ fn match_at(s: &str, start: usize, pat: &[Tok]) -> Option<usize> {
     Some(i)
 }
 
-fn compile_all(phrases: &[&str]) -> Vec<Vec<Tok>> {
-    phrases
+struct Compiled {
+    pat: Vec<Tok>,
+    replace: &'static str,
+    whole_word: bool,
+}
+
+fn compile_all(rules: &[Rule]) -> Vec<Compiled> {
+    rules
         .iter()
-        .map(|p| compile(p.trim()))
-        .filter(|p| !p.is_empty())
+        .map(|&(phrase, replace, whole_word)| Compiled {
+            pat: compile(phrase.trim()),
+            replace: if replace.is_empty() { MASK } else { replace },
+            whole_word,
+        })
+        .filter(|c| !c.pat.is_empty())
         .collect()
 }
 
-/// Leftmost, longest, non-overlapping matches as byte ranges.
-fn find_matches(text: &str, pats: &[Vec<Tok>]) -> Vec<(usize, usize)> {
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// True when `text[start..end]` is not glued to a neighbouring word char
+/// (node boundaries are looked through).
+fn at_word_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().rev().find(|&c| c != SEP);
+    let after = text[end..].chars().find(|&c| c != SEP);
+    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+}
+
+/// Leftmost, longest, non-overlapping matches: `(start, end, rule index)`.
+fn find_matches(text: &str, rules: &[Compiled]) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < text.len() {
@@ -143,8 +173,16 @@ fn find_matches(text: &str, pats: &[Vec<Tok>]) -> Vec<(usize, usize)> {
             i += SEP.len_utf8();
             continue;
         }
-        if let Some(end) = pats.iter().filter_map(|p| match_at(text, i, p)).max() {
-            out.push((i, end));
+        let best = rules
+            .iter()
+            .enumerate()
+            .filter_map(|(k, r)| {
+                let end = match_at(text, i, &r.pat)?;
+                (!r.whole_word || at_word_boundary(text, i, end)).then_some((end, k))
+            })
+            .max_by_key(|&(end, _)| end);
+        if let Some((end, k)) = best {
+            out.push((i, end, k));
             i = end;
         } else {
             i += text[i..].chars().next().map_or(1, char::len_utf8);
@@ -153,50 +191,56 @@ fn find_matches(text: &str, pats: &[Vec<Tok>]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Replace every occurrence of each phrase with `[BLOCKED]`. Matching is
-/// case-insensitive, and whitespace in a phrase matches any run of
-/// whitespace / `&nbsp;` / HTML tags (so `Verify <b>you</b> are human` and
-/// `Verify\n you  are human` are caught). Aria-labels and other attributes
-/// are covered wherever the raw HTML/AX text is returned.
+/// Apply `rules` to `text`. Matching is case-insensitive, and whitespace in a
+/// phrase matches any run of whitespace / `&nbsp;` / HTML tags (so
+/// `Verify <b>you</b> are human` and `Verify\n you  are human` are caught).
+/// Aria-labels and other attributes are covered wherever the raw HTML/AX text
+/// is returned.
 ///
 /// Single pass over the text; allocates the output only when a match exists.
-pub fn mask_with(text: String, phrases: &[&str]) -> String {
-    let pats = compile_all(phrases);
-    if pats.is_empty() {
+pub fn mask_rules(text: String, rules: &[Rule]) -> String {
+    let compiled = compile_all(rules);
+    if compiled.is_empty() {
         return text;
     }
-    let matches = find_matches(&text, &pats);
+    let matches = find_matches(&text, &compiled);
     if matches.is_empty() {
         return text;
     }
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
-    for (s, e) in matches {
+    for (s, e, k) in matches {
         out.push_str(&text[copied..s]);
-        out.push_str(MASK);
+        out.push_str(compiled[k].replace);
         copied = e;
     }
     out.push_str(&text[copied..]);
     out
 }
 
-/// Mask phrases that may span several adjacent text nodes (e.g. the
-/// accessibility tree splits `Verify <b>you</b> are human` into three
-/// `StaticText` nodes). The segments are matched as one joined text; for each
-/// match the first touched segment receives `[BLOCKED]` in place of its part
-/// and the other touched segments lose theirs. Returns one string per input
-/// segment.
-pub fn mask_segments(segs: &[String]) -> Vec<String> {
-    mask_segments_with(segs, BLOCKED_PHRASES)
+/// Convenience: mask plain phrases (no whole-word) with `[BLOCKED]`.
+pub fn mask_with(text: String, phrases: &[&'static str]) -> String {
+    let rules: Vec<Rule> = phrases.iter().map(|&p| (p, "", false)).collect();
+    mask_rules(text, &rules)
 }
 
-pub fn mask_segments_with(segs: &[String], phrases: &[&str]) -> Vec<String> {
-    let pats = compile_all(phrases);
-    if pats.is_empty() || segs.is_empty() {
+/// Rewrite phrases that may span several adjacent text nodes (e.g. the
+/// accessibility tree splits `Verify <b>you</b> are human` into three
+/// `StaticText` nodes). The segments are matched as one joined text; for each
+/// match the first touched segment receives the replacement in place of its
+/// part and the other touched segments lose theirs. Returns one string per
+/// input segment.
+pub fn mask_segments(segs: &[String]) -> Vec<String> {
+    mask_segments_rules(segs, RULES)
+}
+
+pub fn mask_segments_rules(segs: &[String], rules: &[Rule]) -> Vec<String> {
+    let compiled = compile_all(rules);
+    if compiled.is_empty() || segs.is_empty() {
         return segs.to_vec();
     }
     let joined = segs.join(&SEP.to_string());
-    let matches = find_matches(&joined, &pats);
+    let matches = find_matches(&joined, &compiled);
     if matches.is_empty() {
         return segs.to_vec();
     }
@@ -207,15 +251,15 @@ pub fn mask_segments_with(segs: &[String], phrases: &[&str]) -> Vec<String> {
         let end = start + seg.len();
         let mut res = String::with_capacity(seg.len());
         let mut copied = start;
-        for (k, &(ms, me)) in matches.iter().enumerate() {
+        for (m, &(ms, me, k)) in matches.iter().enumerate() {
             let (os, oe) = (ms.max(start), me.min(end));
             if os >= oe {
                 continue;
             }
             res.push_str(&joined[copied..os]);
-            if !inserted[k] {
-                res.push_str(MASK);
-                inserted[k] = true;
+            if !inserted[m] {
+                res.push_str(compiled[k].replace);
+                inserted[m] = true;
             }
             copied = oe;
         }
@@ -292,18 +336,52 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let out = mask_segments_with(&segs, &["verify you are human"]);
+        let out = mask_segments_rules(&segs, &[("verify you are human", "", false)]);
         assert_eq!(out, ["Hello. Please verify: [BLOCKED]", "", "", "x"]);
     }
     #[test]
     fn segments_split_mid_word() {
         let segs: Vec<String> = ["CAP", "TCHA now"].iter().map(|s| s.to_string()).collect();
-        let out = mask_segments_with(&segs, &["captcha"]);
+        let out = mask_segments_rules(&segs, &[("captcha", "", false)]);
         assert_eq!(out, ["[BLOCKED]", " now"]);
     }
     #[test]
     fn segments_without_match_unchanged() {
         let segs = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(mask_segments_with(&segs, &["zzz"]), segs);
+        assert_eq!(mask_segments_rules(&segs, &[("zzz", "", false)]), segs);
+    }
+    #[test]
+    fn replacement_and_whole_word() {
+        let rules: &[Rule] = &[
+            ("CAPTCHA", "check", true),
+            ("Human verification", "Check", false),
+        ];
+        assert_eq!(
+            mask_rules(
+                "Solve the CAPTCHA. <div class=\"g-recaptcha\"> reCAPTCHA human  verification"
+                    .into(),
+                rules
+            ),
+            "Solve the check. <div class=\"g-recaptcha\"> reCAPTCHA Check"
+        );
+    }
+    #[test]
+    fn whole_word_across_nodes() {
+        let segs: Vec<String> = ["CAP", "TCHA", " x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            mask_segments_rules(&segs, &[("captcha", "check", true)]),
+            ["check", "", " x"]
+        );
+    }
+    #[test]
+    fn rules_are_fixed_points() {
+        // Re-masking already-masked output must not change it.
+        let once = mask(
+            "Verify you are human, CAPTCHA, Human verification, Please slide to verify".into(),
+        );
+        assert_eq!(mask(once.clone()), once);
     }
 }
