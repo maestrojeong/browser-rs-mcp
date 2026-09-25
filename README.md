@@ -488,6 +488,19 @@ foreground fallback when browser-rs launched Chrome itself. Use
 real CDP `mouseWheel` event instead of DOM `window.scrollBy()`.
 Use `browser_pointer` for trusted right-click, double-click, scroll, and drag;
 v0.2 has no synthetic `input_route`.
+`browser_drag` is a one-shot press → curved path → release by default. Pass
+`until_js` to make it closed-loop: the button stays down and the pointer moves
+in small hops (`step_px`, default 6), and the expression is evaluated in the
+page's isolated world after each hop (it reads the DOM, not page globals). With
+`until_mode: "true"` (default) it stops as soon as the expression is `true`, or a
+number `>= threshold`; with `until_mode: "max"` it sweeps the range and settles
+on the best-scoring position. Numeric scores are re-scanned 1 px at a time
+around the best position, so a narrow peak is not hopped over. Give a target
+(`target_ref`/`target_selector`), or `direction` (`right|left|up|down`) plus
+`max_distance_px`, as the travel range. `dwell_ms` requires the condition to
+hold still for that long before release; `max_ms` (default 10000) caps the loop.
+The button is always released, even if the expression throws. Without
+`until_js`, behavior is unchanged.
 `browser_type` uses humanized per-character keys for short text and trusted
 atomic insertion for paste/IME-like text of 30 characters or more.
 `browser_iframe_type` applies the same input behavior after focusing the target

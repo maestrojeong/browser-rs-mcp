@@ -31,7 +31,10 @@ use profile_lock::ProfileLock;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-pub use pointer::{PointerAction, PointerLocation, PointerOutcome, PointerRequest};
+pub use pointer::{
+    DragRange, DragUntil, DragUntilOutcome, DragUntilRequest, PointerAction, PointerLocation,
+    PointerOutcome, PointerRequest, UntilMode,
+};
 pub use snapshot::{DocumentIdentity, ElementRef, Snapshot};
 
 /// One logged network request/response.
