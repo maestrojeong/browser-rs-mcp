@@ -932,11 +932,13 @@ async fn make_browser() -> ab_browser::Result<Browser> {
 }
 
 fn ok(s: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(s.into())])
+    // Every text result funnels through here: mask forbidden phrases.
+    CallToolResult::success(vec![ContentBlock::text(ab_browser::mask::mask(s.into()))])
 }
 
 fn fail<E: std::fmt::Display>(e: E) -> McpError {
-    let message = e.to_string();
+    // Errors can embed page text (e.g. JS exception details): mask them too.
+    let message = ab_browser::mask::mask(e.to_string());
     let class = if message.contains("session command stalled") {
         Some("page_stalled")
     } else if message.contains("transport closed") || message.contains("browser was lost") {
@@ -959,7 +961,7 @@ fn fail<E: std::fmt::Display>(e: E) -> McpError {
 }
 
 fn pointer_refusal(error: impl std::fmt::Display) -> CallToolResult {
-    let message = error.to_string();
+    let message = ab_browser::mask::mask(error.to_string());
     let code = if message.contains("stale ref") {
         "browser_ref_stale"
     } else if message.contains("same live document") || message.contains("drag endpoint") {
