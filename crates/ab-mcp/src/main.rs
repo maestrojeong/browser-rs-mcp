@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use ab_browser::{
-    Browser, ConsoleLog, ElementRef, LaunchOptions, NetworkLog, Page, PointerAction,
-    PointerLocation, PointerRequest,
+    Browser, ConsoleLog, DragRange, DragUntil, DragUntilRequest, ElementRef, LaunchOptions,
+    NetworkLog, Page, PointerAction, PointerLocation, PointerRequest, UntilMode,
 };
 use arc_swap::ArcSwap;
 use rmcp::handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters};
@@ -882,6 +882,35 @@ struct DragArgs {
     target_ref: Option<String>,
     #[serde(default)]
     target_selector: Option<String>,
+    /// Closed-loop mode: a JS expression evaluated in the page (isolated world) after every
+    /// small hop. Without it the drag is the plain one-shot source→target drag.
+    #[serde(default)]
+    until_js: Option<String>,
+    /// "true" (default): stop when the expression is true (boolean) or >= `threshold` (number).
+    /// "max": sweep the whole range with a numeric expression, then return to the best position.
+    #[serde(default)]
+    until_mode: Option<String>,
+    /// Score needed to count as satisfied for numeric expressions.
+    #[serde(default)]
+    threshold: Option<f64>,
+    /// With `until_js` and no target: travel direction — "right", "left", "up" or "down".
+    #[serde(default)]
+    direction: Option<String>,
+    /// With `direction`: maximum distance to travel in px.
+    #[serde(default)]
+    max_distance_px: Option<f64>,
+    /// Hop size in px (default 6).
+    #[serde(default)]
+    step_px: Option<f64>,
+    /// Wait after each hop before evaluating, in ms (default 40).
+    #[serde(default)]
+    settle_ms: Option<u64>,
+    /// The condition must hold, pointer still, this long before release (default 0).
+    #[serde(default)]
+    dwell_ms: Option<u64>,
+    /// Hard cap for the whole loop in ms (default 10000).
+    #[serde(default)]
+    max_ms: Option<u64>,
 }
 
 /// Build the browser per environment. Default: headful, real profile, and
@@ -927,6 +956,22 @@ fn fail<E: std::fmt::Display>(e: E) -> McpError {
         message,
         class.map(|class| serde_json::json!({ "class": class })),
     )
+}
+
+fn pointer_refusal(error: impl std::fmt::Display) -> CallToolResult {
+    let message = error.to_string();
+    let code = if message.contains("stale ref") {
+        "browser_ref_stale"
+    } else if message.contains("same live document") || message.contains("drag endpoint") {
+        "browser_wrong_target_refused"
+    } else {
+        "browser_action_unavailable"
+    };
+    CallToolResult::structured_error(serde_json::json!({
+        "status": "refused",
+        "refusal": { "code": code, "message": message },
+        "retryable": false,
+    }))
 }
 
 fn enrich_browser_error(mut error: McpError, health: &HealthState) -> McpError {
@@ -1871,23 +1916,7 @@ impl BrowserServer {
         };
         let outcome = match page.dispatch_pointer(&request).await {
             Ok(outcome) => outcome,
-            Err(error) => {
-                let message = error.to_string();
-                let code = if message.contains("stale ref") {
-                    "browser_ref_stale"
-                } else if message.contains("same live document")
-                    || message.contains("drag endpoint")
-                {
-                    "browser_wrong_target_refused"
-                } else {
-                    "browser_action_unavailable"
-                };
-                return Ok(CallToolResult::structured_error(serde_json::json!({
-                    "status": "refused",
-                    "refusal": { "code": code, "message": message },
-                    "retryable": false,
-                })));
-            }
+            Err(error) => return Ok(pointer_refusal(error)),
         };
         let diff = self.settle_diff(&page_id, &page).await?;
         let mut value = serde_json::to_value(outcome).map_err(fail)?;
@@ -2165,34 +2194,133 @@ impl BrowserServer {
         Ok(ok(format!("set {} file(s) on {}", a.paths.len(), a.page)))
     }
 
-    /// Drag from one element to another (by ref or selector).
+    /// Drag from one element to another (by ref or selector), optionally closed-loop.
     #[tool(
-        description = "Drag from source to target (each by ref or selector); returns settle-diff"
+        description = "Drag from source to target (each by ref or selector); returns settle-diff. Optional closed loop: pass until_js (an expression run in the page's isolated world after every small hop, so it reads the DOM, not page globals) to keep dragging until it is true (or >= threshold), or with until_mode=\"max\" sweep the range and settle on the best-scoring position. Give a target, or direction + max_distance_px for the travel range. Without until_js this is the plain one-shot drag."
     )]
     async fn browser_drag(
         &self,
         Parameters(a): Parameters<DragArgs>,
     ) -> Result<CallToolResult, McpError> {
+        if a.until_js.is_none() {
+            let extras = a.until_mode.is_some()
+                || a.threshold.is_some()
+                || a.direction.is_some()
+                || a.max_distance_px.is_some()
+                || a.step_px.is_some()
+                || a.settle_ms.is_some()
+                || a.dwell_ms.is_some()
+                || a.max_ms.is_some();
+            if extras {
+                return Err(fail(
+                    "until_mode, threshold, direction, max_distance_px, step_px, settle_ms, \
+                     dwell_ms and max_ms only apply together with until_js",
+                ));
+            }
+            let from = self
+                .resolve(&a.page, &a.source_ref, &a.source_selector)
+                .await?;
+            let to = self
+                .resolve(&a.page, &a.target_ref, &a.target_selector)
+                .await?;
+            let page = self.page_of(&a.page).await?;
+            let origin = page.element_ref_for_backend(from).await.map_err(fail)?;
+            let destination = page.element_ref_for_backend(to).await.map_err(fail)?;
+            page.dispatch_pointer(&PointerRequest {
+                action: PointerAction::Drag,
+                origin: PointerLocation::Element(origin),
+                destination: Some(PointerLocation::Element(destination)),
+                delta_x: 0.0,
+                delta_y: 0.0,
+            })
+            .await
+            .map_err(fail)?;
+            let diff = self.settle_diff(&a.page, &page).await?;
+            return Ok(ok(format!("dragged on {}\n\n{}", a.page, diff)));
+        }
+
+        let has_target = a.target_ref.is_some() || a.target_selector.is_some();
+        match (
+            has_target,
+            a.direction.is_some(),
+            a.max_distance_px.is_some(),
+        ) {
+            (true, true, _) | (true, _, true) => {
+                return Err(fail(
+                    "give either a target or direction + max_distance_px, not both",
+                ))
+            }
+            (false, true, true) => {}
+            (false, _, _) => {
+                return Err(fail(
+                    "until_js needs a target, or direction together with max_distance_px",
+                ))
+            }
+            (true, false, false) => {}
+        }
+        let mode = UntilMode::parse(a.until_mode.as_deref().unwrap_or("true")).map_err(fail)?;
+        let direction = if has_target {
+            None
+        } else {
+            Some(match a.direction.as_deref().expect("validated above") {
+                "right" => (1.0, 0.0),
+                "left" => (-1.0, 0.0),
+                "down" => (0.0, 1.0),
+                "up" => (0.0, -1.0),
+                other => {
+                    return Err(fail(format!(
+                        "unknown direction {other:?} (right, left, up or down)"
+                    )))
+                }
+            })
+        };
         let from = self
             .resolve(&a.page, &a.source_ref, &a.source_selector)
             .await?;
-        let to = self
-            .resolve(&a.page, &a.target_ref, &a.target_selector)
-            .await?;
         let page = self.page_of(&a.page).await?;
         let origin = page.element_ref_for_backend(from).await.map_err(fail)?;
-        let destination = page.element_ref_for_backend(to).await.map_err(fail)?;
-        page.dispatch_pointer(&PointerRequest {
-            action: PointerAction::Drag,
-            origin: PointerLocation::Element(origin),
-            destination: Some(PointerLocation::Element(destination)),
-            delta_x: 0.0,
-            delta_y: 0.0,
-        })
-        .await
-        .map_err(fail)?;
+        let destination = if has_target {
+            let to = self
+                .resolve(&a.page, &a.target_ref, &a.target_selector)
+                .await?;
+            Some(PointerLocation::Element(
+                page.element_ref_for_backend(to).await.map_err(fail)?,
+            ))
+        } else {
+            None
+        };
+
+        let expression = a.until_js.expect("checked above");
+        let range = match (destination, direction, a.max_distance_px) {
+            (Some(location), None, None) => DragRange::To(location),
+            (None, Some((dx, dy)), Some(distance)) => DragRange::Along { dx, dy, distance },
+            _ => unreachable!("validated above"),
+        };
+        let outcome = match page
+            .drag_until(&DragUntilRequest {
+                origin: PointerLocation::Element(origin),
+                range,
+                until: DragUntil {
+                    expression,
+                    mode,
+                    threshold: a.threshold,
+                    step_px: a.step_px.unwrap_or(6.0),
+                    settle_ms: a.settle_ms.unwrap_or(40),
+                    dwell_ms: a.dwell_ms.unwrap_or(0),
+                    max_ms: a.max_ms.unwrap_or(10_000),
+                },
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(pointer_refusal(error)),
+        };
         let diff = self.settle_diff(&a.page, &page).await?;
-        Ok(ok(format!("dragged on {}\n\n{}", a.page, diff)))
+        Ok(ok(format!(
+            "{}\n\n{}",
+            serde_json::to_string_pretty(&outcome).unwrap_or_default(),
+            diff
+        )))
     }
 
     // ---- cookies (granular) ----

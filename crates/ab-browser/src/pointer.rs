@@ -8,6 +8,9 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+mod drag_until;
+pub use drag_until::{DragRange, DragUntil, DragUntilOutcome, DragUntilRequest, UntilMode};
+
 use crate::{sample_lognormal_ms, BrowserError, ElementRef, Page, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
