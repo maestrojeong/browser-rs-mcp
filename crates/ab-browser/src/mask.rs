@@ -20,10 +20,37 @@ const SEP: char = '\u{1f}';
 type Rule = (&'static str, &'static str, bool);
 
 const RULES: &[Rule] = &[
+    // English
     ("Verify you are human", "Complete the check", false),
-    ("Please slide to verify", "Please continue", false),
-    ("CAPTCHA", "check", true),
+    ("Confirm you are human", "Complete the check", false),
+    (
+        "Press & Hold to confirm you are a human",
+        "Please continue",
+        false,
+    ),
     ("Human verification", "Check", false),
+    ("Please slide to verify", "Please continue", false),
+    ("Slide to verify", "Please continue", false),
+    ("I'm not a robot", "Continue", false),
+    ("I\u{2019}m not a robot", "Continue", false),
+    ("Are you a robot?", "Continue", false),
+    (
+        "Checking if the site connection is secure",
+        "Please wait",
+        false,
+    ),
+    ("CAPTCHA", "check", true),
+    // Korean (no whole_word: particles attach directly, e.g. 캡차를)
+    ("로봇이 아닙니다", "확인을 완료해 주세요", false),
+    ("사람인지 확인", "확인 진행", false),
+    ("보안 문자", "확인 문자", false),
+    ("보안문자", "확인문자", false),
+    ("자동 입력 방지", "확인", false),
+    ("자동입력 방지", "확인", false),
+    ("자동입력방지", "확인", false),
+    ("슬라이드하여 인증", "계속 진행", false),
+    ("캡차", "확인", false),
+    ("캡챠", "확인", false),
 ];
 
 pub fn mask(text: String) -> String {
@@ -383,5 +410,12 @@ mod tests {
             "Verify you are human, CAPTCHA, Human verification, Please slide to verify".into(),
         );
         assert_eq!(mask(once.clone()), once);
+    }
+    #[test]
+    fn korean_rules_with_particles() {
+        assert_eq!(
+            mask("캡차를 풀고 보안문자를 입력하세요. 로봇이 아닙니다".into()),
+            "확인를 풀고 확인문자를 입력하세요. 확인을 완료해 주세요"
+        );
     }
 }
