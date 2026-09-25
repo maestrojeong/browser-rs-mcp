@@ -1,6 +1,7 @@
 //! Phrase masking: replaces forbidden phrases with `[BLOCKED]` in any page
-//! content returned to the caller (snapshot, text, html, markdown, find).
-//! Edit `BLOCKED_PHRASES` below (ASCII case-insensitive). Empty = no-op.
+//! content returned to the caller (snapshot, text, html, markdown, find, tool errors).
+//! Edit `BLOCKED_PHRASES` below. Matching is per-char simple-lowercase
+//! case-insensitive (no multi-char folds like ß/SS). Empty = no-op.
 
 pub const MASK: &str = "[BLOCKED]";
 
@@ -26,6 +27,9 @@ enum Tok {
     Gap,
 }
 
+/// Longest tag we will skip as a gap unit (bounds worst-case scan cost).
+const MAX_TAG_BYTES: usize = 64 * 1024;
+
 fn compile(phrase: &str) -> Vec<Tok> {
     let mut out = Vec::new();
     for c in phrase.chars() {
@@ -40,51 +44,67 @@ fn compile(phrase: &str) -> Vec<Tok> {
     out
 }
 
-/// Length of one gap unit at `t[i..]`, or 0 if none.
-fn gap_unit(t: &[char], i: usize) -> usize {
-    let Some(&c) = t.get(i) else { return 0 };
+/// Byte length of one gap unit at `s[i..]`, or 0 if none.
+fn gap_unit(s: &str, i: usize) -> usize {
+    let rest = &s[i..];
+    let Some(c) = rest.chars().next() else {
+        return 0;
+    };
     if c.is_whitespace() || c == '\u{200b}' {
-        return 1;
+        return c.len_utf8();
     }
     if c == '&' {
         for ent in ["&nbsp;", "&#160;", "&#xa0;"] {
-            let e: Vec<char> = ent.chars().collect();
-            if t.len() >= i + e.len() && t[i..i + e.len()] == e[..] {
-                return e.len();
+            if rest.len() >= ent.len() && rest[..ent.len()].eq_ignore_ascii_case(ent) {
+                return ent.len();
             }
         }
         return 0;
     }
     if c == '<' {
-        // A tag: `<` ... `>` with no nested `<`, bounded length.
-        for (k, &d) in t.iter().enumerate().skip(i + 1).take(500) {
-            if d == '<' {
-                return 0;
-            }
-            if d == '>' {
-                return k + 1 - i;
+        // A tag: `<` ... `>`, ignoring `<`/`>` inside quoted attribute values.
+        let mut quote: Option<u8> = None;
+        for (k, &b) in rest
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(MAX_TAG_BYTES)
+        {
+            match quote {
+                Some(q) => {
+                    if b == q {
+                        quote = None;
+                    }
+                }
+                None => match b {
+                    b'"' | b'\'' => quote = Some(b),
+                    b'<' => return 0,
+                    b'>' => return k + 1,
+                    _ => {}
+                },
             }
         }
     }
     0
 }
 
-/// Try to match `pat` at `t[start..]`; returns the end index.
-fn match_at(t: &[char], start: usize, pat: &[Tok]) -> Option<usize> {
+/// Try to match `pat` at byte offset `start`; returns the end byte offset.
+fn match_at(s: &str, start: usize, pat: &[Tok]) -> Option<usize> {
     let mut i = start;
     for tok in pat {
         match tok {
             Tok::Ch(p) => {
-                let c = *t.get(i)?;
+                let c = s[i..].chars().next()?;
                 if !c.to_lowercase().eq(p.to_lowercase()) {
                     return None;
                 }
-                i += 1;
+                i += c.len_utf8();
             }
             Tok::Gap => {
                 let mut n = 0;
                 loop {
-                    let u = gap_unit(t, i);
+                    let u = gap_unit(s, i);
                     if u == 0 {
                         break;
                     }
@@ -105,32 +125,39 @@ fn match_at(t: &[char], start: usize, pat: &[Tok]) -> Option<usize> {
 /// whitespace / `&nbsp;` / HTML tags (so `Verify <b>you</b> are human` and
 /// `Verify\n you  are human` are caught). Aria-labels and other attributes
 /// are covered wherever the raw HTML/AX text is returned.
+///
+/// Single pass over the text; allocates the output only when a match exists.
 pub fn mask_with(text: String, phrases: &[&str]) -> String {
-    let mut out = text;
-    for p in phrases {
-        let pat = compile(p.trim());
-        if pat.is_empty() {
-            continue;
-        }
-        let t: Vec<char> = out.chars().collect();
-        let mut res = String::with_capacity(out.len());
-        let mut i = 0;
-        let mut hit = false;
-        while i < t.len() {
-            if let Some(end) = match_at(&t, i, &pat) {
-                res.push_str(MASK);
-                i = end;
-                hit = true;
-            } else {
-                res.push(t[i]);
-                i += 1;
-            }
-        }
-        if hit {
-            out = res;
+    let pats: Vec<Vec<Tok>> = phrases
+        .iter()
+        .map(|p| compile(p.trim()))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if pats.is_empty() {
+        return text;
+    }
+    let mut res: Option<String> = None;
+    let mut copied = 0; // bytes of `text` already flushed into `res`
+    let mut i = 0;
+    while i < text.len() {
+        let end = pats.iter().filter_map(|p| match_at(&text, i, p)).max();
+        if let Some(end) = end {
+            let out = res.get_or_insert_with(|| String::with_capacity(text.len()));
+            out.push_str(&text[copied..i]);
+            out.push_str(MASK);
+            copied = end;
+            i = end;
+        } else {
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
         }
     }
-    out
+    match res {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            out
+        }
+        None => text,
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +199,25 @@ mod tests {
     #[test]
     fn no_partial_gap_match() {
         assert_eq!(mask_with("youare".into(), &["you are"]), "youare");
+    }
+    #[test]
+    fn quoted_gt_in_tag() {
+        assert_eq!(
+            mask_with(
+                r#"Verify <span title="a > b">you</span> are human"#.into(),
+                &["verify you are human"]
+            ),
+            "[BLOCKED]"
+        );
+    }
+    #[test]
+    fn multiple_phrases_one_pass() {
+        assert_eq!(
+            mask_with(
+                "CAPTCHA and captcha, Human  verification".into(),
+                &["captcha", "human verification"]
+            ),
+            "[BLOCKED] and [BLOCKED], [BLOCKED]"
+        );
     }
 }
