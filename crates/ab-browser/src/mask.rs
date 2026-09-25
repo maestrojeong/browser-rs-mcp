@@ -40,6 +40,18 @@ const RULES: &[Rule] = &[
         false,
     ),
     ("CAPTCHA", "check", true),
+    // Status messages
+    ("Validation successful", "Check complete", false),
+    ("Validation failed", "Check failed", false),
+    ("Validation expired", "Check expired", false),
+    // Widget class/id names (HTML attributes)
+    ("capture-wrapper", "widget-wrapper", false),
+    ("capture-box", "widget-box", false),
+    ("verify-img-out", "widget-img-out", false),
+    ("verify-img-panel", "widget-img-panel", false),
+    ("verify-refresh", "widget-refresh", false),
+    ("verify-bar-area", "widget-bar-area", false),
+    ("verify-move-block", "widget-move-block", false),
     // Korean (no whole_word: particles attach directly, e.g. 캡차를)
     ("로봇이 아닙니다", "확인을 완료해 주세요", false),
     ("사람인지 확인", "확인 진행", false),
@@ -405,11 +417,23 @@ mod tests {
     }
     #[test]
     fn rules_are_fixed_points() {
-        // Re-masking already-masked output must not change it.
-        let once = mask(
-            "Verify you are human, CAPTCHA, Human verification, Please slide to verify".into(),
+        // Re-masking already-masked output must not change it, for every rule.
+        for &(phrase, _, _) in RULES {
+            let once = mask(format!("x {phrase} y"));
+            assert_eq!(
+                mask(once.clone()),
+                once,
+                "rule {phrase:?} is not idempotent"
+            );
+        }
+        let ids = mask(
+            r#"<div class="capture-wrapper"><i id="verify-img-out"></i>Validation failed</div>"#
+                .into(),
         );
-        assert_eq!(mask(once.clone()), once);
+        assert_eq!(
+            ids,
+            r#"<div class="widget-wrapper"><i id="widget-img-out"></i>Check failed</div>"#
+        );
     }
     #[test]
     fn korean_rules_with_particles() {
