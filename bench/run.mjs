@@ -91,5 +91,12 @@ for (const c of result.checks) {
 }
 const ok = result.passed === result.total;
 console.log(`\n  score: ${result.passed}/${result.total} ${ok ? "— native surfaces intact ✓" : "— RESIDUE DETECTED ✗"}\n`);
-rmSync(profile, { recursive: true, force: true });
+// Chrome helper processes can still be flushing into the profile right after the parent exits,
+// which makes the first rmdir fail with ENOTEMPTY. Retry, and never let a leftover temp dir turn a
+// passing benchmark into a failing one.
+try {
+  rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+} catch (error) {
+  console.warn(`  (could not remove temp profile ${profile}: ${error.code ?? error.message})`);
+}
 process.exit(ok ? 0 : 1);
