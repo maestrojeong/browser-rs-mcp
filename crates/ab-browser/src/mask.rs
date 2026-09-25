@@ -19,9 +19,6 @@ const BLOCKED_PHRASES: &[&str] = &[
 ];
 
 pub fn mask(text: String) -> String {
-    if BLOCKED_PHRASES.is_empty() {
-        return text;
-    }
     mask_with(text, BLOCKED_PHRASES)
 }
 
