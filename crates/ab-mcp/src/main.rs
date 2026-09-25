@@ -1927,6 +1927,8 @@ impl BrowserServer {
             object.insert("page".into(), serde_json::json!(page_id));
             object.insert("diff".into(), serde_json::json!(diff));
         }
+        // structured results bypass `ok()`, so mask them explicitly
+        ab_browser::mask::mask_json(&mut value);
         Ok(CallToolResult::structured(value))
     }
 
@@ -3425,6 +3427,13 @@ impl rmcp::ServerHandler for BrowserServer {
             .or_else(|| self.default_owner.clone());
         if let Some(owner) = owner.as_ref() {
             force_scoped_owner_argument(&mut request, owner);
+        }
+        // Reverse output masking (`[[Check]]` -> original) so selectors, ids,
+        // JS and text taken from masked output (before the broker/policy see them) still hit the real page.
+        if let Some(arguments) = request.arguments.as_mut() {
+            for value in arguments.values_mut() {
+                ab_browser::mask::unmask_json(value);
+            }
         }
         self.enforce_detectable_argument_policy(&request)?;
         let broker_context = if let Some(broker) = self.secret_broker.as_ref() {

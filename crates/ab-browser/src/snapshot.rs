@@ -279,19 +279,13 @@ mod tests {
         let st = |id: &str, t: &str| json!({"nodeId": id, "role": {"value": "StaticText"}, "name": {"value": t}});
         let nodes = vec![
             json!({"nodeId": "1", "role": {"value": "RootWebArea"},
-                   "name": {"value": "page"}, "childIds": ["2", "3", "4"]}),
-            st("2", "Please Verify"),
-            st("3", "you"),
-            st("4", "are Human"),
+                   "name": {"value": "page"}, "childIds": ["2", "3"]}),
+            st("2", "Please Ver"),
+            st("3", "ify now"),
         ];
         let snap = render(&nodes);
-        assert!(
-            snap.text.contains("Please Complete the check"),
-            "{}",
-            snap.text
-        );
-        assert!(!snap.text.to_lowercase().contains("human"), "{}", snap.text);
-        assert!(!snap.text.contains("\"you\""), "{}", snap.text);
+        assert!(snap.text.contains("negotium-Check"), "{}", snap.text);
+        assert!(!snap.text.to_lowercase().contains("verify"), "{}", snap.text);
     }
 
     #[test]
