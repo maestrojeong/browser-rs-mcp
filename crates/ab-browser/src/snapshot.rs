@@ -47,7 +47,11 @@ struct RenderContext<'a> {
 /// splits inline markup into separate nodes, so per-line masking would miss
 /// `Verify <b>you</b> are human`. Walks in render order and returns nodeId ->
 /// masked name for the nodes whose text changed.
-fn mask_static_text(root: &str, by_id: &HashMap<&str, &Value>) -> HashMap<String, String> {
+fn mask_static_text(
+    root: &str,
+    by_id: &HashMap<&str, &Value>,
+    rules: &[crate::mask::Rule],
+) -> HashMap<String, String> {
     let mut ids: Vec<&str> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut stack = vec![root];
@@ -81,7 +85,7 @@ fn mask_static_text(root: &str, by_id: &HashMap<&str, &Value>) -> HashMap<String
             }
         }
     }
-    let masked = crate::mask::mask_segments(&names);
+    let masked = crate::mask::mask_segments_rules(&names, rules);
     ids.into_iter()
         .zip(names.into_iter().zip(masked))
         .filter(|(_, (old, new))| old != new)
@@ -150,6 +154,14 @@ pub(crate) fn render_with_document(
     nodes: &[Value],
     document: Option<DocumentIdentity>,
 ) -> Snapshot {
+    render_with_rules(nodes, document, crate::mask::RULES)
+}
+
+fn render_with_rules(
+    nodes: &[Value],
+    document: Option<DocumentIdentity>,
+    rules: &[crate::mask::Rule],
+) -> Snapshot {
     // Index nodes by their AX nodeId and remember child order.
     let mut by_id: HashMap<&str, &Value> = HashMap::new();
     let mut root_id: Option<&str> = None;
@@ -173,7 +185,7 @@ pub(crate) fn render_with_document(
     let mut refs = HashMap::new();
     let mut counter = 0u32;
     let name_overrides = root_id
-        .map(|rid| mask_static_text(rid, &by_id))
+        .map(|rid| mask_static_text(rid, &by_id, rules))
         .unwrap_or_default();
     let context = RenderContext {
         snapshot_id: NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
@@ -284,7 +296,8 @@ mod tests {
             st("3", "you"),
             st("4", "are Human"),
         ];
-        let snap = render(&nodes);
+        let rules: &[crate::mask::Rule] = &[("verify you are human", "Complete the check", false)];
+        let snap = super::render_with_rules(&nodes, None, rules);
         assert!(
             snap.text.contains("Please Complete the check"),
             "{}",
@@ -292,6 +305,9 @@ mod tests {
         );
         assert!(!snap.text.to_lowercase().contains("human"), "{}", snap.text);
         assert!(!snap.text.contains("\"you\""), "{}", snap.text);
+        // No rules: snapshot is untouched.
+        let plain = render(&nodes);
+        assert!(plain.text.contains("\"you\""), "{}", plain.text);
     }
 
     #[test]

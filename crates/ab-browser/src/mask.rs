@@ -1,69 +1,28 @@
 //! Phrase rewriting: replaces configured phrases with a substitute (or
-//! `[BLOCKED]`) in any page content returned to the caller (snapshot, text,
-//! html, markdown, find, tool errors). Edit `RULES` below. Matching is
-//! per-char simple-lowercase case-insensitive (no multi-char folds like
-//! ß/SS). Empty = no-op.
+//! `[BLOCKED]`) in text returned to the caller. Edit `RULES` below; it is
+//! empty by default, which makes everything here a no-op.
+//!
+//! Matching is per-char simple-lowercase case-insensitive, and whitespace in a
+//! phrase matches any run of whitespace / `&nbsp;` / HTML tags.
 
 pub const MASK: &str = "[BLOCKED]";
 
 /// Boundary marker between separate text nodes when segments are joined
-/// (see [`mask_segments`]). It is transparent inside words and counts as a
+/// (see [`mask_segments_rules`]). It is transparent inside words and counts as a
 /// gap unit between words.
 const SEP: char = '\u{1f}';
 
 /// `(phrase, replacement, whole_word)`.
 /// - `replacement`: text to put in place of the phrase; `""` = `[BLOCKED]`.
-///   A replacement must not itself contain any phrase (masking is applied on
-///   several layers, so it has to be a fixed point).
+///   It must not itself contain any phrase (masking is applied on several
+///   layers, so the output has to be a fixed point).
 /// - `whole_word`: only match when not embedded in a longer word
-///   (letters/digits/`_`), so `captcha` skips `recaptcha` / `g-recaptcha`.
-type Rule = (&'static str, &'static str, bool);
+///   (letters/digits/`_`).
+pub type Rule = (&'static str, &'static str, bool);
 
-const RULES: &[Rule] = &[
-    // English
-    ("Verify you are human", "Complete the check", false),
-    ("Confirm you are human", "Complete the check", false),
-    (
-        "Press & Hold to confirm you are a human",
-        "Please continue",
-        false,
-    ),
-    ("Human verification", "Check", false),
-    ("Please slide to verify", "Please continue", false),
-    ("Slide to verify", "Please continue", false),
-    ("I'm not a robot", "Continue", false),
-    ("I\u{2019}m not a robot", "Continue", false),
-    ("Are you a robot?", "Continue", false),
-    (
-        "Checking if the site connection is secure",
-        "Please wait",
-        false,
-    ),
-    ("CAPTCHA", "check", true),
-    // Status messages
-    ("Validation successful", "Check complete", false),
-    ("Validation failed", "Check failed", false),
-    ("Validation expired", "Check expired", false),
-    // Widget class/id names (HTML attributes)
-    ("capture-wrapper", "widget-wrapper", false),
-    ("capture-box", "widget-box", false),
-    ("verify-img-out", "widget-img-out", false),
-    ("verify-img-panel", "widget-img-panel", false),
-    ("verify-refresh", "widget-refresh", false),
-    ("verify-bar-area", "widget-bar-area", false),
-    ("verify-move-block", "widget-move-block", false),
-    // Korean (no whole_word: particles attach directly, e.g. 캡차를)
-    ("로봇이 아닙니다", "확인을 완료해 주세요", false),
-    ("사람인지 확인", "확인 진행", false),
-    ("보안 문자", "확인 문자", false),
-    ("보안문자", "확인문자", false),
-    ("자동 입력 방지", "확인", false),
-    ("자동입력 방지", "확인", false),
-    ("자동입력방지", "확인", false),
-    ("슬라이드하여 인증", "계속 진행", false),
-    ("캡차", "확인", false),
-    ("캡챠", "확인", false),
-];
+/// Rules applied to everything returned to the caller. Example entry:
+/// `("some phrase", "replacement", false),`
+pub const RULES: &[Rule] = &[];
 
 pub fn mask(text: String) -> String {
     mask_rules(text, RULES)
@@ -257,22 +216,12 @@ pub fn mask_rules(text: String, rules: &[Rule]) -> String {
     out
 }
 
-/// Convenience: mask plain phrases (no whole-word) with `[BLOCKED]`.
-pub fn mask_with(text: String, phrases: &[&'static str]) -> String {
-    let rules: Vec<Rule> = phrases.iter().map(|&p| (p, "", false)).collect();
-    mask_rules(text, &rules)
-}
-
 /// Rewrite phrases that may span several adjacent text nodes (e.g. the
 /// accessibility tree splits `Verify <b>you</b> are human` into three
 /// `StaticText` nodes). The segments are matched as one joined text; for each
 /// match the first touched segment receives the replacement in place of its
 /// part and the other touched segments lose theirs. Returns one string per
 /// input segment.
-pub fn mask_segments(segs: &[String]) -> Vec<String> {
-    mask_segments_rules(segs, RULES)
-}
-
 pub fn mask_segments_rules(segs: &[String], rules: &[Rule]) -> Vec<String> {
     let compiled = compile_all(rules);
     if compiled.is_empty() || segs.is_empty() {
@@ -312,134 +261,74 @@ pub fn mask_segments_rules(segs: &[String], rules: &[Rule]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_RULES: &[Rule] = &[
+        ("verify you are human", "Complete the check", false),
+        ("captcha", "check", true),
+        ("secret-id", "", false),
+        ("금지어", "대체어", false),
+    ];
+
     #[test]
-    fn masks_case_insensitive_and_korean() {
+    fn no_rules_is_noop() {
         assert_eq!(
-            mask_with("a Secret b 금지어 c SECRET".into(), &["secret", "금지어"]),
-            "a [BLOCKED] b [BLOCKED] c [BLOCKED]"
+            mask_rules("Verify you are human".into(), &[]),
+            "Verify you are human"
         );
     }
     #[test]
-    fn empty_is_noop() {
-        assert_eq!(mask_with("x".into(), &[]), "x");
+    fn replaces_case_insensitive_with_default_marker() {
+        assert_eq!(
+            mask_rules("a SECRET-ID b 금지어".into(), TEST_RULES),
+            "a [BLOCKED] b 대체어"
+        );
     }
     #[test]
     fn whitespace_and_tags() {
-        let p = ["verify you are human"];
         assert_eq!(
-            mask_with("Verify\n  you\u{a0}are human!".into(), &p),
-            "[BLOCKED]!"
+            mask_rules("Verify\n  you\u{a0}are human!".into(), TEST_RULES),
+            "Complete the check!"
         );
-        assert_eq!(
-            mask_with("Verify <b>you</b> are&nbsp;human".into(), &p),
-            "[BLOCKED]"
-        );
-    }
-    #[test]
-    fn aria_label_attribute() {
-        assert_eq!(
-            mask_with(
-                r#"<div aria-label="Please slide to verify">x</div>"#.into(),
-                &["please slide to verify"]
-            ),
-            r#"<div aria-label="[BLOCKED]">x</div>"#
-        );
-    }
-    #[test]
-    fn no_partial_gap_match() {
-        assert_eq!(mask_with("youare".into(), &["you are"]), "youare");
-    }
-    #[test]
-    fn quoted_gt_in_tag() {
-        assert_eq!(
-            mask_with(
-                r#"Verify <span title="a > b">you</span> are human"#.into(),
-                &["verify you are human"]
-            ),
-            "[BLOCKED]"
-        );
-    }
-    #[test]
-    fn multiple_phrases_one_pass() {
-        assert_eq!(
-            mask_with(
-                "CAPTCHA and captcha, Human  verification".into(),
-                &["captcha", "human verification"]
-            ),
-            "[BLOCKED] and [BLOCKED], [BLOCKED]"
-        );
-    }
-    #[test]
-    fn segments_split_across_nodes() {
-        let segs: Vec<String> = ["Hello. Please verify: Verify", "you", "are human", "x"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let out = mask_segments_rules(&segs, &[("verify you are human", "", false)]);
-        assert_eq!(out, ["Hello. Please verify: [BLOCKED]", "", "", "x"]);
-    }
-    #[test]
-    fn segments_split_mid_word() {
-        let segs: Vec<String> = ["CAP", "TCHA now"].iter().map(|s| s.to_string()).collect();
-        let out = mask_segments_rules(&segs, &[("captcha", "", false)]);
-        assert_eq!(out, ["[BLOCKED]", " now"]);
-    }
-    #[test]
-    fn segments_without_match_unchanged() {
-        let segs = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(mask_segments_rules(&segs, &[("zzz", "", false)]), segs);
-    }
-    #[test]
-    fn replacement_and_whole_word() {
-        let rules: &[Rule] = &[
-            ("CAPTCHA", "check", true),
-            ("Human verification", "Check", false),
-        ];
         assert_eq!(
             mask_rules(
-                "Solve the CAPTCHA. <div class=\"g-recaptcha\"> reCAPTCHA human  verification"
-                    .into(),
-                rules
+                r#"Verify <span title="a > b">you</span> are&nbsp;human"#.into(),
+                TEST_RULES
             ),
-            "Solve the check. <div class=\"g-recaptcha\"> reCAPTCHA Check"
+            "Complete the check"
+        );
+        assert_eq!(
+            mask_rules("verifyyou are human".into(), TEST_RULES),
+            "verifyyou are human"
         );
     }
     #[test]
-    fn whole_word_across_nodes() {
-        let segs: Vec<String> = ["CAP", "TCHA", " x"]
+    fn whole_word() {
+        assert_eq!(
+            mask_rules("CAPTCHA reCAPTCHA g-recaptcha".into(), TEST_RULES),
+            "check reCAPTCHA g-recaptcha"
+        );
+    }
+    #[test]
+    fn segments_across_nodes() {
+        let segs: Vec<String> = ["Hi Verify", "you", "are human", "x"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert_eq!(
-            mask_segments_rules(&segs, &[("captcha", "check", true)]),
-            ["check", "", " x"]
+            mask_segments_rules(&segs, TEST_RULES),
+            ["Hi Complete the check", "", "", "x"]
         );
+        let mid: Vec<String> = ["CAP", "TCHA", " x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(mask_segments_rules(&mid, TEST_RULES), ["check", "", " x"]);
     }
     #[test]
     fn rules_are_fixed_points() {
-        // Re-masking already-masked output must not change it, for every rule.
-        for &(phrase, _, _) in RULES {
-            let once = mask(format!("x {phrase} y"));
-            assert_eq!(
-                mask(once.clone()),
-                once,
-                "rule {phrase:?} is not idempotent"
-            );
+        for &(phrase, _, _) in TEST_RULES {
+            let once = mask_rules(format!("x {phrase} y"), TEST_RULES);
+            assert_eq!(mask_rules(once.clone(), TEST_RULES), once);
         }
-        let ids = mask(
-            r#"<div class="capture-wrapper"><i id="verify-img-out"></i>Validation failed</div>"#
-                .into(),
-        );
-        assert_eq!(
-            ids,
-            r#"<div class="widget-wrapper"><i id="widget-img-out"></i>Check failed</div>"#
-        );
-    }
-    #[test]
-    fn korean_rules_with_particles() {
-        assert_eq!(
-            mask("캡차를 풀고 보안문자를 입력하세요. 로봇이 아닙니다".into()),
-            "확인를 풀고 확인문자를 입력하세요. 확인을 완료해 주세요"
-        );
     }
 }
