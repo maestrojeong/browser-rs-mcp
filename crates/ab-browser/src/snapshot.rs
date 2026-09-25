@@ -285,7 +285,11 @@ mod tests {
         ];
         let snap = render(&nodes);
         assert!(snap.text.contains("negotium-Check"), "{}", snap.text);
-        assert!(!snap.text.to_lowercase().contains("verify"), "{}", snap.text);
+        assert!(
+            !snap.text.to_lowercase().contains("verify"),
+            "{}",
+            snap.text
+        );
     }
 
     #[test]

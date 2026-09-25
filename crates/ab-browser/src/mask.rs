@@ -191,7 +191,8 @@ fn gap_unit(s: &str, i: usize) -> usize {
     if c == '&' {
         for ent in ["&nbsp;", "&#160;", "&#xa0;"] {
             if rest.len() >= ent.len()
-                && rest.as_bytes()[..ent.len()].eq_ignore_ascii_case(ent.as_bytes()) {
+                && rest.as_bytes()[..ent.len()].eq_ignore_ascii_case(ent.as_bytes())
+            {
                 return ent.len();
             }
         }
@@ -493,7 +494,10 @@ mod tests {
     }
     #[test]
     fn whole_word_across_nodes() {
-        let segs: Vec<String> = ["CAP", "TCHA", " x"].iter().map(|s| s.to_string()).collect();
+        let segs: Vec<String> = ["CAP", "TCHA", " x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
             mask_segments_rules(&segs, &[("captcha", "check", true)]),
             ["negotium-CHECK", "", " x"]
@@ -503,7 +507,11 @@ mod tests {
     fn rules_are_fixed_points() {
         for &(phrase, _, _) in RULES {
             let once = mask(format!("x {phrase} y"));
-            assert_eq!(mask(once.clone()), once, "rule {phrase:?} is not idempotent");
+            assert_eq!(
+                mask(once.clone()),
+                once,
+                "rule {phrase:?} is not idempotent"
+            );
         }
     }
     #[test]
@@ -531,7 +539,11 @@ mod tests {
                 continue;
             }
             let masked = mask(format!("x {phrase} y"));
-            assert_ne!(masked, format!("x {phrase} y"), "rule {phrase:?} did not mask");
+            assert_ne!(
+                masked,
+                format!("x {phrase} y"),
+                "rule {phrase:?} did not mask"
+            );
             assert_eq!(unmask(masked), format!("x {phrase} y"), "rule {phrase:?}");
         }
     }
@@ -540,7 +552,10 @@ mod tests {
         for (input, want) in [
             ("#negotium-widget-img-out", "#verify-img-out"),
             (".negotium-widget-wrapper > div", ".capture-wrapper > div"),
-            (r#"[id="negotium-widget-img-panel"]"#, r#"[id="verify-img-panel"]"#),
+            (
+                r#"[id="negotium-widget-img-panel"]"#,
+                r#"[id="verify-img-panel"]"#,
+            ),
             // no brackets = a real page name, never touched
             ("#widget-img-out", "#widget-img-out"),
             (".widget-box .widget-refresh", ".widget-box .widget-refresh"),
@@ -582,8 +597,12 @@ mod tests {
     }
     #[test]
     fn unmask_json_walks_arguments() {
-        let mut v = serde_json::json!({"selector": "#negotium-check-x", "n": [ "negotium-Check" ], "k": 1});
+        let mut v =
+            serde_json::json!({"selector": "#negotium-check-x", "n": [ "negotium-Check" ], "k": 1});
         unmask_json(&mut v);
-        assert_eq!(v, serde_json::json!({"selector": "#verify-x", "n": ["Verify"], "k": 1}));
+        assert_eq!(
+            v,
+            serde_json::json!({"selector": "#verify-x", "n": ["Verify"], "k": 1})
+        );
     }
 }
