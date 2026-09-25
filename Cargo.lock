@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ab-browser"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ab-cdp",
  "anyhow",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "ab-cdp"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "arc-swap",
  "futures-util",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "ab-mcp"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ab-browser",
  "ab-cdp",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "serde_urlencoded"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
 dependencies = [

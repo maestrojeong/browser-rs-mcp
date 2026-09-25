@@ -39,6 +39,54 @@ static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 struct RenderContext<'a> {
     snapshot_id: u64,
     document: Option<&'a DocumentIdentity>,
+    /// Masked replacement names for text nodes, keyed by AX nodeId.
+    name_overrides: HashMap<String, String>,
+}
+
+/// Mask forbidden phrases that span adjacent `StaticText` nodes. The AX tree
+/// splits inline markup into separate nodes, so per-line masking would miss
+/// `Verify <b>you</b> are human`. Walks in render order and returns nodeId ->
+/// masked name for the nodes whose text changed.
+fn mask_static_text(root: &str, by_id: &HashMap<&str, &Value>) -> HashMap<String, String> {
+    let mut ids: Vec<&str> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(node) = by_id.get(id) else { continue };
+        let ignored = node
+            .get("ignored")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let role = node
+            .get("role")
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !ignored && role == "StaticText" {
+            let name = str_prop(node, "name");
+            if !name.is_empty() {
+                ids.push(id);
+                names.push(name);
+            }
+        }
+        if let Some(children) = node.get("childIds").and_then(Value::as_array) {
+            for c in children.iter().rev() {
+                if let Some(cid) = c.as_str() {
+                    stack.push(cid);
+                }
+            }
+        }
+    }
+    let masked = crate::mask::mask_segments(&names);
+    ids.into_iter()
+        .zip(names.into_iter().zip(masked))
+        .filter(|(_, (old, new))| old != new)
+        .map(|(id, (_, new))| (id.to_string(), new))
+        .collect()
 }
 
 /// Roles that are interactive enough to warrant a [ref].
@@ -124,9 +172,13 @@ pub(crate) fn render_with_document(
     let mut out = String::new();
     let mut refs = HashMap::new();
     let mut counter = 0u32;
+    let name_overrides = root_id
+        .map(|rid| mask_static_text(rid, &by_id))
+        .unwrap_or_default();
     let context = RenderContext {
         snapshot_id: NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
         document: document.as_ref(),
+        name_overrides,
     };
 
     if let Some(rid) = root_id {
@@ -157,7 +209,10 @@ fn walk(
         .and_then(|v| v.get("value"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let name = str_prop(node, "name");
+    let name = match context.name_overrides.get(id) {
+        Some(masked) => masked.clone(),
+        None => crate::mask::mask(str_prop(node, "name")),
+    };
 
     // Decide whether this node earns a printed line. Iframes are always
     // printed (even nameless, childless ones) — see `is_iframe`.
@@ -218,6 +273,22 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::{render, render_with_document, DocumentIdentity};
     use serde_json::json;
+
+    #[test]
+    fn phrase_split_across_static_text_nodes_is_masked() {
+        let st = |id: &str, t: &str| json!({"nodeId": id, "role": {"value": "StaticText"}, "name": {"value": t}});
+        let nodes = vec![
+            json!({"nodeId": "1", "role": {"value": "RootWebArea"},
+                   "name": {"value": "page"}, "childIds": ["2", "3", "4"]}),
+            st("2", "Please Verify"),
+            st("3", "you"),
+            st("4", "are Human"),
+        ];
+        let snap = render(&nodes);
+        assert!(snap.text.contains("[BLOCKED]"), "{}", snap.text);
+        assert!(!snap.text.to_lowercase().contains("human"), "{}", snap.text);
+        assert!(!snap.text.contains("\"you\""), "{}", snap.text);
+    }
 
     #[test]
     fn nameless_childless_iframe_is_still_printed() {

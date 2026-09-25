@@ -5,6 +5,11 @@
 
 pub const MASK: &str = "[BLOCKED]";
 
+/// Boundary marker between separate text nodes when segments are joined
+/// (see [`mask_segments`]). It is transparent inside words and counts as a
+/// gap unit between words.
+const SEP: char = '\u{1f}';
+
 /// Forbidden phrases — add yours here.
 const BLOCKED_PHRASES: &[&str] = &[
     "Verify you are human",
@@ -50,7 +55,7 @@ fn gap_unit(s: &str, i: usize) -> usize {
     let Some(c) = rest.chars().next() else {
         return 0;
     };
-    if c.is_whitespace() || c == '\u{200b}' {
+    if c.is_whitespace() || c == '\u{200b}' || c == SEP {
         return c.len_utf8();
     }
     if c == '&' {
@@ -95,6 +100,10 @@ fn match_at(s: &str, start: usize, pat: &[Tok]) -> Option<usize> {
     for tok in pat {
         match tok {
             Tok::Ch(p) => {
+                // Node boundaries are invisible inside a word.
+                while s[i..].starts_with(SEP) {
+                    i += SEP.len_utf8();
+                }
                 let c = s[i..].chars().next()?;
                 if !c.to_lowercase().eq(p.to_lowercase()) {
                     return None;
@@ -120,6 +129,33 @@ fn match_at(s: &str, start: usize, pat: &[Tok]) -> Option<usize> {
     Some(i)
 }
 
+fn compile_all(phrases: &[&str]) -> Vec<Vec<Tok>> {
+    phrases
+        .iter()
+        .map(|p| compile(p.trim()))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Leftmost, longest, non-overlapping matches as byte ranges.
+fn find_matches(text: &str, pats: &[Vec<Tok>]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(SEP) {
+            i += SEP.len_utf8();
+            continue;
+        }
+        if let Some(end) = pats.iter().filter_map(|p| match_at(text, i, p)).max() {
+            out.push((i, end));
+            i = end;
+        } else {
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
+}
+
 /// Replace every occurrence of each phrase with `[BLOCKED]`. Matching is
 /// case-insensitive, and whitespace in a phrase matches any run of
 /// whitespace / `&nbsp;` / HTML tags (so `Verify <b>you</b> are human` and
@@ -128,36 +164,69 @@ fn match_at(s: &str, start: usize, pat: &[Tok]) -> Option<usize> {
 ///
 /// Single pass over the text; allocates the output only when a match exists.
 pub fn mask_with(text: String, phrases: &[&str]) -> String {
-    let pats: Vec<Vec<Tok>> = phrases
-        .iter()
-        .map(|p| compile(p.trim()))
-        .filter(|p| !p.is_empty())
-        .collect();
+    let pats = compile_all(phrases);
     if pats.is_empty() {
         return text;
     }
-    let mut res: Option<String> = None;
-    let mut copied = 0; // bytes of `text` already flushed into `res`
-    let mut i = 0;
-    while i < text.len() {
-        let end = pats.iter().filter_map(|p| match_at(&text, i, p)).max();
-        if let Some(end) = end {
-            let out = res.get_or_insert_with(|| String::with_capacity(text.len()));
-            out.push_str(&text[copied..i]);
-            out.push_str(MASK);
-            copied = end;
-            i = end;
-        } else {
-            i += text[i..].chars().next().map_or(1, char::len_utf8);
-        }
+    let matches = find_matches(&text, &pats);
+    if matches.is_empty() {
+        return text;
     }
-    match res {
-        Some(mut out) => {
-            out.push_str(&text[copied..]);
-            out
-        }
-        None => text,
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (s, e) in matches {
+        out.push_str(&text[copied..s]);
+        out.push_str(MASK);
+        copied = e;
     }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Mask phrases that may span several adjacent text nodes (e.g. the
+/// accessibility tree splits `Verify <b>you</b> are human` into three
+/// `StaticText` nodes). The segments are matched as one joined text; for each
+/// match the first touched segment receives `[BLOCKED]` in place of its part
+/// and the other touched segments lose theirs. Returns one string per input
+/// segment.
+pub fn mask_segments(segs: &[String]) -> Vec<String> {
+    mask_segments_with(segs, BLOCKED_PHRASES)
+}
+
+pub fn mask_segments_with(segs: &[String], phrases: &[&str]) -> Vec<String> {
+    let pats = compile_all(phrases);
+    if pats.is_empty() || segs.is_empty() {
+        return segs.to_vec();
+    }
+    let joined = segs.join(&SEP.to_string());
+    let matches = find_matches(&joined, &pats);
+    if matches.is_empty() {
+        return segs.to_vec();
+    }
+    let mut inserted = vec![false; matches.len()];
+    let mut out = Vec::with_capacity(segs.len());
+    let mut start = 0;
+    for seg in segs {
+        let end = start + seg.len();
+        let mut res = String::with_capacity(seg.len());
+        let mut copied = start;
+        for (k, &(ms, me)) in matches.iter().enumerate() {
+            let (os, oe) = (ms.max(start), me.min(end));
+            if os >= oe {
+                continue;
+            }
+            res.push_str(&joined[copied..os]);
+            if !inserted[k] {
+                res.push_str(MASK);
+                inserted[k] = true;
+            }
+            copied = oe;
+        }
+        res.push_str(&joined[copied..end]);
+        out.push(res);
+        start = end + SEP.len_utf8();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -219,5 +288,25 @@ mod tests {
             ),
             "[BLOCKED] and [BLOCKED], [BLOCKED]"
         );
+    }
+    #[test]
+    fn segments_split_across_nodes() {
+        let segs: Vec<String> = ["Hello. Please verify: Verify", "you", "are human", "x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = mask_segments_with(&segs, &["verify you are human"]);
+        assert_eq!(out, ["Hello. Please verify: [BLOCKED]", "", "", "x"]);
+    }
+    #[test]
+    fn segments_split_mid_word() {
+        let segs: Vec<String> = ["CAP", "TCHA now"].iter().map(|s| s.to_string()).collect();
+        let out = mask_segments_with(&segs, &["captcha"]);
+        assert_eq!(out, ["[BLOCKED]", " now"]);
+    }
+    #[test]
+    fn segments_without_match_unchanged() {
+        let segs = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(mask_segments_with(&segs, &["zzz"]), segs);
     }
 }
