@@ -4,6 +4,7 @@
 //! attached tab (flatten-mode session). Everything is designed so an LLM agent
 //! can run the loop: `snapshot -> act -> verify`.
 
+pub mod mask;
 pub mod pointer;
 mod profile_lock;
 pub mod snapshot;
@@ -1167,7 +1168,9 @@ impl Page {
             .cloned()
             .unwrap_or_default();
         let document = self.current_main_document_identity().await?;
-        Ok(snapshot::render_with_document(&nodes, Some(document)))
+        let mut snap = snapshot::render_with_document(&nodes, Some(document));
+        snap.text = mask::mask(snap.text);
+        Ok(snap)
     }
 
     async fn current_main_document_identity(&self) -> Result<DocumentIdentity> {
@@ -1256,12 +1259,13 @@ impl Page {
 
     /// Extract readable page text (best-effort, main content).
     pub async fn text(&self) -> Result<String> {
-        Ok(self
-            .evaluate("document.body ? document.body.innerText : ''")
-            .await?
-            .as_str()
-            .unwrap_or("")
-            .to_string())
+        Ok(mask::mask(
+            self.evaluate("document.body ? document.body.innerText : ''")
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        ))
     }
 
     /// Extract the page as Markdown (headings, links, lists, code, quotes).
@@ -1301,7 +1305,9 @@ impl Page {
           walk(document.body || document.documentElement);
           return out.join('\n\n');
         })()"#;
-        Ok(self.evaluate(js).await?.as_str().unwrap_or("").to_string())
+        Ok(mask::mask(
+            self.evaluate(js).await?.as_str().unwrap_or("").to_string(),
+        ))
     }
 }
 
@@ -1458,7 +1464,19 @@ impl Page {
             ic = ignore_case,
             max = max,
         );
-        self.evaluate(&js).await
+        let v = self.evaluate(&js).await?;
+        Ok(match v {
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(|i| match i {
+                        Value::String(s) => Value::String(mask::mask(s)),
+                        o => o,
+                    })
+                    .collect(),
+            ),
+            o => o,
+        })
     }
 
     /// Actionability hit-test using only browser protocol domains, avoiding
@@ -3555,12 +3573,13 @@ impl Page {
 
     /// Full serialized HTML of the current document.
     pub async fn html(&self) -> Result<String> {
-        Ok(self
-            .evaluate("document.documentElement.outerHTML")
-            .await?
-            .as_str()
-            .unwrap_or("")
-            .to_string())
+        Ok(mask::mask(
+            self.evaluate("document.documentElement.outerHTML")
+                .await?
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        ))
     }
 
     /// Current document title.

@@ -932,7 +932,8 @@ async fn make_browser() -> ab_browser::Result<Browser> {
 }
 
 fn ok(s: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(s.into())])
+    // Every text result funnels through here: mask forbidden phrases.
+    CallToolResult::success(vec![ContentBlock::text(ab_browser::mask::mask(s.into()))])
 }
 
 fn fail<E: std::fmt::Display>(e: E) -> McpError {
