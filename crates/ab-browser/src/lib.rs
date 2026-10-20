@@ -559,7 +559,7 @@ pub enum ReadMode {
 }
 
 /// Action to perform on the element resolved at the bottom of an iframe chain
-/// (see `Page::descend_and_act`).
+/// (see `Page::act_on_iframe_element`).
 enum FrameAction {
     Focus { clear: bool },
     Read(ReadMode),
@@ -588,7 +588,7 @@ fn split_frame_chain(frame_selector: &str) -> Vec<&str> {
 /// Split and validate a `frame_selector` argument, rejecting empty/
 /// whitespace/`>>`-only input up front. Without this, an accidentally empty
 /// `frame_selector` (e.g. a caller-side templating bug) would silently
-/// resolve to a zero-length chain and `descend_and_act` would act directly
+/// resolve to a zero-length chain and the iframe helpers would act directly
 /// on the *top-level* document — which for iframe actions means acting on
 /// something on the main page while the caller
 /// believes they're targeting content inside an iframe.
@@ -603,52 +603,26 @@ fn require_frame_chain(frame_selector: &str) -> Result<Vec<&str>> {
     Ok(chain)
 }
 
-/// Build the JS body executed at each hop of `descend_and_act`. It walks
-/// `chain` from the current document, hopping through `contentDocument` at
-/// each step. If every hop is same-origin, it performs `action` on
-/// `selector` in the innermost document and returns `{ok:true, ...}` (with a
-/// `value` field for `FrameAction::Read`). The first time `contentDocument`
-/// comes back null — cross-origin — it stops and returns
-/// `{ok:false, index, src, name}` describing the boundary iframe element
-/// (whose attributes remain readable even though its document does not), so
-/// the caller can resume via CDP.
-fn build_descend_js(chain: &[&str], selector: &str, action: &FrameAction) -> String {
-    let chain_json = serde_json::to_string(chain).unwrap_or_else(|_| "[]".into());
-    let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
-    let act_js = match action {
-        FrameAction::Focus { clear } => {
-            let select_js = if *clear {
-                " if (typeof el.select === 'function') el.select(); else if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, (el.value || '').length);"
-            } else {
-                ""
-            };
-            format!("el.focus();{select_js} return {{ ok: true }};")
+/// `Runtime.callFunctionOn` declaration and arguments that perform `action`
+/// on an element already resolved (through the shadow-piercing CDP DOM walk,
+/// see `Page::backend_for_piercing_selector`) inside the innermost frame of an
+/// iframe chain. `this` is bound to the element, so this works identically for
+/// light-DOM nodes and for nodes inside open or closed shadow roots — unlike a
+/// `document.querySelector` lookup, which cannot see into shadow trees.
+fn frame_action_call(action: &FrameAction) -> (&'static str, Value) {
+    match action {
+        FrameAction::Focus { clear } => (
+            "function(clear) { this.focus(); if (clear) { if (typeof this.select === 'function') this.select(); else if (typeof this.setSelectionRange === 'function') this.setSelectionRange(0, (this.value || '').length); } return true; }",
+            json!([{ "value": clear }]),
+        ),
+        FrameAction::Read(ReadMode::Html) => {
+            ("function() { return this.outerHTML; }", json!([]))
         }
-        FrameAction::Read(ReadMode::Html) => "return { ok: true, value: el.outerHTML };".to_string(),
-        FrameAction::Read(ReadMode::Text) => {
-            "return { ok: true, value: (el.innerText !== undefined ? el.innerText : (el.textContent || '')) };"
-                .to_string()
-        }
-    };
-    format!(
-        r#"(() => {{
-  const chain = {chain_json};
-  let doc = document;
-  for (let i = 0; i < chain.length; i++) {{
-    const f = doc.querySelector(chain[i]);
-    if (!f) throw new Error('iframe not found at step ' + i + ': ' + chain[i]);
-    let inner = null;
-    try {{ inner = f.contentDocument; }} catch (e) {{ inner = null; }}
-    if (!inner) {{
-      return {{ ok: false, index: i, src: f.src || f.getAttribute('src') || '', name: f.name || f.getAttribute('name') || '' }};
-    }}
-    doc = inner;
-  }}
-  const el = doc.querySelector({sel_json});
-  if (!el) throw new Error('element not found: ' + {sel_json});
-  {act_js}
-}})()"#,
-    )
+        FrameAction::Read(ReadMode::Text) => (
+            "function() { return this.innerText !== undefined ? this.innerText : (this.textContent || ''); }",
+            json!([]),
+        ),
+    }
 }
 
 /// Build an expression that returns the iframe element at `index`, walking
@@ -2069,6 +2043,24 @@ impl Page {
         &self,
         chain: &[&str],
     ) -> Result<(FrameExecutionContext, (f64, f64))> {
+        self.enter_frame_chain(chain, true).await
+    }
+
+    /// Walk `chain` hop by hop, entering each iframe through a fresh isolated
+    /// execution context created *inside* that frame (OOPIF targets are
+    /// attached on demand), and return the innermost frame's context. Every
+    /// hop goes through CDP rather than `contentDocument`, so the innermost
+    /// frame always has its own context/session in which shadow-piercing
+    /// selector resolution (`backend_for_piercing_selector`) can run.
+    ///
+    /// With `measure`, each iframe is scrolled into view and its viewport
+    /// offset accumulated into the returned top-level offset (pointer input
+    /// needs it). Without it, no scrolling happens and the offset is `(0, 0)`.
+    async fn enter_frame_chain(
+        &self,
+        chain: &[&str],
+        measure: bool,
+    ) -> Result<(FrameExecutionContext, (f64, f64))> {
         let mut context: Option<FrameExecutionContext> = None;
         let mut root_offset = (0.0, 0.0);
         for selector in chain {
@@ -2103,26 +2095,31 @@ impl Page {
             // element that's already visible or that CDP can't scroll (e.g.
             // `position: fixed` edge cases) shouldn't fail iframe pointer
             // resolution outright.
-            let _ = self
-                .client
-                .send_on(
-                    session_id,
-                    "DOM.scrollIntoViewIfNeeded",
-                    json!({ "objectId": object_id }),
+            let rect = if measure {
+                let _ = self
+                    .client
+                    .send_on(
+                        session_id,
+                        "DOM.scrollIntoViewIfNeeded",
+                        json!({ "objectId": object_id }),
+                    )
+                    .await;
+                Some(
+                    self.client
+                        .send_on(
+                            session_id,
+                            "Runtime.callFunctionOn",
+                            json!({
+                                "objectId": object_id,
+                                "functionDeclaration": "function() { const r=this.getBoundingClientRect(); return {x:r.left+(this.clientLeft||0),y:r.top+(this.clientTop||0)}; }",
+                                "returnByValue": true,
+                            }),
+                        )
+                        .await,
                 )
-                .await;
-            let rect = self
-                .client
-                .send_on(
-                    session_id,
-                    "Runtime.callFunctionOn",
-                    json!({
-                        "objectId": object_id,
-                        "functionDeclaration": "function() { const r=this.getBoundingClientRect(); return {x:r.left+(this.clientLeft||0),y:r.top+(this.clientTop||0)}; }",
-                        "returnByValue": true,
-                    }),
-                )
-                .await?;
+            } else {
+                None
+            };
             let desc = self
                 .client
                 .send_on(
@@ -2131,6 +2128,32 @@ impl Page {
                     json!({ "objectId": object_id }),
                 )
                 .await;
+            let frame_id = desc
+                .as_ref()
+                .ok()
+                .and_then(|desc| desc.pointer("/node/frameId"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            // Compatibility fallback for frames whose owner element does not
+            // report a frameId: match the iframe's name/src against the frame
+            // tree (ambiguous matches are rejected by `resolve_frame_id`).
+            let hint = if frame_id.is_none() {
+                self.client
+                    .send_on(
+                        session_id,
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "objectId": object_id,
+                            "functionDeclaration": "function() { return { src: this.src || this.getAttribute('src') || '', name: this.name || this.getAttribute('name') || '' }; }",
+                            "returnByValue": true,
+                        }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|res| res.pointer("/result/value").cloned())
+            } else {
+                None
+            };
             let _ = self
                 .client
                 .send_on(
@@ -2139,24 +2162,50 @@ impl Page {
                     json!({ "objectId": object_id }),
                 )
                 .await;
-            let rect = rect.pointer("/result/value").ok_or_else(|| {
-                BrowserError::Protocol(format!("iframe `{selector}` has no viewport box"))
-            })?;
-            root_offset.0 += rect.get("x").and_then(Value::as_f64).ok_or_else(|| {
-                BrowserError::Protocol(format!("iframe `{selector}` has no viewport x"))
-            })?;
-            root_offset.1 += rect.get("y").and_then(Value::as_f64).ok_or_else(|| {
-                BrowserError::Protocol(format!("iframe `{selector}` has no viewport y"))
-            })?;
-            let frame_id = desc?
-                .pointer("/node/frameId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    BrowserError::Protocol(format!(
-                        "iframe element `{selector}` has no CDP frame id"
-                    ))
-                })?
-                .to_string();
+            if let Some(rect) = rect {
+                let rect = rect?;
+                let rect = rect.pointer("/result/value").ok_or_else(|| {
+                    BrowserError::Protocol(format!("iframe `{selector}` has no viewport box"))
+                })?;
+                root_offset.0 += rect.get("x").and_then(Value::as_f64).ok_or_else(|| {
+                    BrowserError::Protocol(format!("iframe `{selector}` has no viewport x"))
+                })?;
+                root_offset.1 += rect.get("y").and_then(Value::as_f64).ok_or_else(|| {
+                    BrowserError::Protocol(format!("iframe `{selector}` has no viewport y"))
+                })?;
+            }
+            let frame_id = match frame_id {
+                Some(frame_id) => frame_id,
+                None => {
+                    let field = |key: &str| {
+                        hint.as_ref()
+                            .and_then(|hint| hint.get(key))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let (name, src) = (field("name"), field("src"));
+                    let node_err = match desc {
+                        Ok(_) => "DOM.describeNode returned no frameId".to_string(),
+                        Err(err) => err.to_string(),
+                    };
+                    if name.is_empty() && src.is_empty() {
+                        return Err(BrowserError::Protocol(format!(
+                            "iframe element `{selector}` has no CDP frame id ({node_err}) \
+                             and no name/src fallback"
+                        )));
+                    }
+                    self.frame_id_by_hint(&name, &src)
+                        .await
+                        .map_err(|hint_err| {
+                            BrowserError::Protocol(format!(
+                                "iframe element `{selector}` has no CDP frame id ({node_err}); \
+                             frame-tree hint lookup also failed (name={name:?}, src={src:?}): \
+                             {hint_err}"
+                            ))
+                        })?
+                }
+            };
             context = Some(
                 self.create_isolated_world_for_frame(&frame_id, session_id)
                     .await?,
@@ -2350,7 +2399,7 @@ impl Page {
     ) -> Result<()> {
         let chain = require_frame_chain(frame_selector)?;
         let (_, session_id) = self
-            .descend_and_act_with_session(&chain, selector, &FrameAction::Focus { clear })
+            .act_on_iframe_element(&chain, selector, &FrameAction::Focus { clear })
             .await?;
         self.dispatch_text_cancellable(&session_id, text, clear, cancel)
             .await
@@ -2361,8 +2410,8 @@ impl Page {
     /// single CSS selector or a `>>`-separated chain for nested iframes, and
     /// `selector` targets the element inside the innermost one (pass `"html"`
     /// to read the whole frame document). Same-origin and cross-origin
-    /// frames are both supported — see `iframe_click` for the resolution
-    /// mechanism, which this reuses verbatim.
+    /// frames are both supported, and `selector` pierces open and closed
+    /// shadow roots — the same resolution path as `iframe_click`.
     pub async fn iframe_read(
         &self,
         frame_selector: &str,
@@ -2370,117 +2419,76 @@ impl Page {
         mode: ReadMode,
     ) -> Result<String> {
         let chain = require_frame_chain(frame_selector)?;
-        let result = self
-            .descend_and_act(&chain, selector, &FrameAction::Read(mode))
+        let (value, _) = self
+            .act_on_iframe_element(&chain, selector, &FrameAction::Read(mode))
             .await?;
-        Ok(result
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string())
+        Ok(value.as_str().unwrap_or("").to_string())
     }
 
-    /// Descend through a chain of iframe selectors and perform `action` on
-    /// `selector` inside the innermost one, returning the JS result object
-    /// (`{ok:true, value?}` for `FrameAction::Read`; `{ok:true}` otherwise).
-    /// Each hop first tries same-origin DOM access (`contentDocument`,
-    /// cheap, one round trip per contiguous same-origin run). When that
-    /// returns null — the SOP signature of a cross-origin frame — the
-    /// boundary iframe element is resolved directly to its CDP `frameId` via
-    /// `DOM.describeNode`; URL/name matching in `Page.getFrameTree` remains a
-    /// compatibility fallback. A fresh isolated execution context is then
-    /// created *inside that frame's own origin* via
-    /// `Page.createIsolatedWorld`. CDP frame contexts are not subject to the
-    /// Same-Origin Policy, so the loop can repeat across multiple origin
-    /// boundaries until the full chain is consumed.
-    async fn descend_and_act(
-        &self,
-        chain: &[&str],
-        selector: &str,
-        action: &FrameAction,
-    ) -> Result<Value> {
-        self.descend_and_act_with_session(chain, selector, action)
-            .await
-            .map(|(value, _)| value)
-    }
-
-    /// Variant of `descend_and_act` that also returns the CDP session owning
-    /// the innermost frame. Keyboard input must be dispatched on that session
-    /// when Site Isolation places the target frame in an OOPIF renderer.
-    async fn descend_and_act_with_session(
+    /// Descend through `chain` (see `enter_frame_chain`), resolve `selector`
+    /// in the innermost frame with the same shadow-piercing CDP DOM walk used
+    /// by `iframe_click`/`iframe_hover`, and perform `action` on the resolved
+    /// element through `Runtime.callFunctionOn` in that frame's isolated
+    /// world. Returns the call's by-value result together with the CDP
+    /// session owning the innermost frame — keyboard input must be dispatched
+    /// on that session when Site Isolation places the frame in an OOPIF.
+    async fn act_on_iframe_element(
         &self,
         chain: &[&str],
         selector: &str,
         action: &FrameAction,
     ) -> Result<(Value, String)> {
-        let mut context: Option<FrameExecutionContext> = None;
-        let mut remaining: Vec<&str> = chain.to_vec();
-        // Bound the loop: at most one CDP hop per chain element, plus one.
-        for _ in 0..=chain.len() {
-            let js = build_descend_js(&remaining, selector, action);
-            let result = match context.as_ref() {
-                None => self.evaluate(&js).await?,
-                Some(ctx) => self.eval_with_context(&js, ctx).await?,
-            };
-            if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                let session_id = context
-                    .as_ref()
-                    .map(|ctx| ctx.session_id.clone())
-                    .unwrap_or_else(|| self.session_id.clone());
-                return Ok((result, session_id));
-            }
-            let index = result.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let src = result
-                .get("src")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let name = result
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            // Resolve the exact DOM element first. Besides avoiding ambiguous
-            // URL/name matching, this works when a nested frame is absent from
-            // the frame tree returned for this CDP session.
-            let frame_id = match self
-                .frame_id_by_node(&remaining, index, context.as_ref())
-                .await
-            {
-                Ok(id) => id,
-                Err(node_err) if !name.is_empty() || !src.is_empty() => {
-                    match self.frame_id_by_hint(&name, &src).await {
-                        Ok(id) => id,
-                        Err(hint_err) => {
-                            return Err(BrowserError::Protocol(format!(
-                                "cross-origin iframe could not be resolved from its DOM node: \
-                                 {node_err}; frame-tree hint lookup also failed \
-                                 (name={name:?}, src={src:?}): {hint_err}"
-                            )));
-                        }
-                    }
-                }
-                Err(node_err) => {
-                    return Err(BrowserError::Protocol(format!(
-                        "cross-origin iframe `{}` has no name/src fallback and could not be \
-                         resolved from its DOM node: {node_err}",
-                        remaining.get(index).copied().unwrap_or("")
-                    )));
-                }
-            };
-            let parent_session = context
-                .as_ref()
-                .map(|ctx| ctx.session_id.as_str())
-                .unwrap_or(&self.session_id);
-            context = Some(
-                self.create_isolated_world_for_frame(&frame_id, parent_session)
-                    .await?,
-            );
-            remaining = remaining[index + 1..].to_vec();
+        let (context, _) = self.enter_frame_chain(chain, false).await?;
+        let backend = self
+            .backend_for_piercing_selector(&context, selector)
+            .await?
+            .ok_or_else(|| BrowserError::Protocol(format!("element not found: {selector}")))?;
+        let resolved = self
+            .client
+            .send_on(
+                &context.session_id,
+                "DOM.resolveNode",
+                json!({
+                    "backendNodeId": backend,
+                    "executionContextId": context.context_id,
+                }),
+            )
+            .await?;
+        let object_id = resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::Protocol(format!("iframe element `{selector}` did not resolve"))
+            })?;
+        let (function_declaration, arguments) = frame_action_call(action);
+        let res = self
+            .client
+            .send_on(
+                &context.session_id,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "arguments": arguments,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await;
+        let _ = self
+            .client
+            .send_on(
+                &context.session_id,
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+            )
+            .await;
+        let res = res?;
+        if let Some(exc) = res.get("exceptionDetails") {
+            return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
         }
-        Err(BrowserError::Protocol(
-            "iframe descent exceeded max depth (possible frame-tree cycle)".into(),
-        ))
+        let value = res.pointer("/result/value").cloned().unwrap_or(Value::Null);
+        Ok((value, context.session_id))
     }
 
     /// Find a frame in the CDP frame tree by iframe `name` or `src` hint.
@@ -2612,111 +2620,10 @@ impl Page {
         }
     }
 
-    /// Resolve a cross-origin iframe to its `frameId` by querying the iframe
-    /// element from its *parent* document (the current execution context) and
-    /// using `DOM.describeNode` to read the `frameId` directly.
-    ///
-    /// This bypasses `Page.getFrameTree` entirely and binds the selected DOM
-    /// element to its frame without relying on non-unique URL/name hints.
-    ///
-    /// `chain[..=index]` is the path from the current execution context down
-    /// to the cross-origin iframe element. The last hop (`chain[index]`) is the
-    /// target iframe whose frameId we want; earlier hops are walked via
-    /// same-origin `contentDocument` access (which the caller has already
-    /// verified is possible).
-    async fn frame_id_by_node(
-        &self,
-        chain: &[&str],
-        index: usize,
-        context: Option<&FrameExecutionContext>,
-    ) -> Result<String> {
-        let js = build_frame_element_js(chain, index);
-        let res = self.eval_remote(&js, context).await?;
-        let result = res
-            .get("result")
-            .ok_or_else(|| BrowserError::Protocol("DOM query returned no result".into()))?;
-        let object_id = result
-            .get("objectId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                BrowserError::Protocol(format!(
-                    "iframe element `{}` did not return a remote object \
-                     (type: {:?}, subtype: {:?}); the selector may not match \
-                     an <iframe> element",
-                    chain.get(index).copied().unwrap_or(""),
-                    result.get("type").and_then(Value::as_str),
-                    result.get("subtype").and_then(Value::as_str),
-                ))
-            })?;
-        let session_id = context
-            .map(|ctx| ctx.session_id.as_str())
-            .unwrap_or(&self.session_id);
-        let desc = self
-            .client
-            .send_on(
-                session_id,
-                "DOM.describeNode",
-                json!({ "objectId": object_id }),
-            )
-            .await;
-        // Runtime object handles otherwise remain alive until their context is
-        // destroyed. Ignore release failures so they do not mask the result.
-        let _ = self
-            .client
-            .send_on(
-                session_id,
-                "Runtime.releaseObject",
-                json!({ "objectId": object_id }),
-            )
-            .await;
-        let desc = desc?;
-        desc.get("node")
-            .and_then(|n| n.get("frameId"))
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| {
-                BrowserError::Protocol(format!(
-                    "iframe element `{}` resolved but DOM.describeNode returned no frameId \
-                     (the element may not be an iframe, or it hasn't finished loading)",
-                    chain.get(index).copied().unwrap_or("")
-                ))
-            })
-    }
-
-    /// Evaluate `expression` in a specific execution context (used for the
-    /// isolated worlds created for cross-origin frames above).
-    async fn eval_with_context(
-        &self,
-        expression: &str,
-        context: &FrameExecutionContext,
-    ) -> Result<Value> {
-        let res = self
-            .client
-            .send_on(
-                &context.session_id,
-                "Runtime.evaluate",
-                json!({
-                    "expression": expression,
-                    "contextId": context.context_id,
-                    "returnByValue": true,
-                    "awaitPromise": true,
-                }),
-            )
-            .await?;
-        if let Some(exc) = res.get("exceptionDetails") {
-            return Err(BrowserError::Protocol(format!("JS exception: {exc}")));
-        }
-        Ok(res
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .cloned()
-            .unwrap_or(Value::Null))
-    }
-
-    /// Like `eval_with_context` / `evaluate_main`, but with
+    /// Like `evaluate_main`, but evaluated in an optional frame context and with
     /// `returnByValue: false` so the result may include `objectId`
     /// references for non-primitive values (e.g. DOM elements).
-    /// Used by `frame_id_by_node` to resolve an iframe element to its
+    /// Used by `enter_frame_chain` to resolve an iframe element to its
     /// CDP frame id via `DOM.describeNode`.
     async fn eval_remote(
         &self,
@@ -4331,12 +4238,12 @@ async fn discover_ws_url(port: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        activation_verified, ax_hit_has_backend_ancestor, build_descend_js, build_frame_element_js,
-        collect_piercing_query_roots, drag_step_probability, fitts_duration_ms, minimum_jerk,
-        movement_step_count, parse_key_combo, paste_probability, push_capped, push_net_entry,
-        require_frame_chain, resolve_frame_id, shortcut_command, should_paste_text_for_draw,
-        split_frame_chain, type_ahead_key, us_qwerty_key, FrameAction, KeyCombo, KeyModifier,
-        NetEntry, NetState, PageLifecycle, ReadMode, LOG_CAP,
+        activation_verified, ax_hit_has_backend_ancestor, build_frame_element_js,
+        collect_piercing_query_roots, drag_step_probability, fitts_duration_ms, frame_action_call,
+        minimum_jerk, movement_step_count, parse_key_combo, paste_probability, push_capped,
+        push_net_entry, require_frame_chain, resolve_frame_id, shortcut_command,
+        should_paste_text_for_draw, split_frame_chain, type_ahead_key, us_qwerty_key, FrameAction,
+        KeyCombo, KeyModifier, NetEntry, NetState, PageLifecycle, ReadMode, LOG_CAP,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -4503,38 +4410,47 @@ mod tests {
     }
 
     #[test]
-    fn descend_js_focus_selects_only_when_clear_is_requested() {
-        let append = build_descend_js(
-            &["iframe#f"],
-            "input#phone",
-            &FrameAction::Focus { clear: false },
-        );
-        assert!(append.contains("el.focus();"));
-        assert!(!append.contains("el.select()"));
+    fn frame_action_focus_selects_only_when_clear_is_requested() {
+        let (append, args) = frame_action_call(&FrameAction::Focus { clear: false });
+        assert!(append.contains("this.focus();"));
+        assert_eq!(args, json!([{ "value": false }]));
 
-        let replace = build_descend_js(
-            &["iframe#f"],
-            "input#phone",
-            &FrameAction::Focus { clear: true },
-        );
-        assert!(replace.contains("el.focus();"));
-        assert!(replace.contains("el.select()"));
-        assert!(!replace.contains("el.value="));
+        let (replace, args) = frame_action_call(&FrameAction::Focus { clear: true });
+        assert!(replace.contains("this.focus();"));
+        assert!(replace.contains("this.select()"));
+        assert_eq!(args, json!([{ "value": true }]));
+        assert!(!replace.contains("this.value="));
         assert!(!replace.contains("dispatchEvent"));
     }
 
     #[test]
-    fn descend_js_read_html_returns_outer_html() {
-        let js = build_descend_js(&["iframe#f"], "body", &FrameAction::Read(ReadMode::Html));
-        assert!(js.contains("value: el.outerHTML"));
-        assert!(js.contains("ok: true"));
+    fn frame_action_read_html_returns_outer_html() {
+        let (js, args) = frame_action_call(&FrameAction::Read(ReadMode::Html));
+        assert!(js.contains("return this.outerHTML"));
+        assert_eq!(args, json!([]));
     }
 
     #[test]
-    fn descend_js_read_text_falls_back_to_text_content() {
-        let js = build_descend_js(&[], "#result", &FrameAction::Read(ReadMode::Text));
-        assert!(js.contains("el.innerText"));
-        assert!(js.contains("el.textContent"));
+    fn frame_action_read_text_falls_back_to_text_content() {
+        let (js, _) = frame_action_call(&FrameAction::Read(ReadMode::Text));
+        assert!(js.contains("this.innerText"));
+        assert!(js.contains("this.textContent"));
+    }
+
+    #[test]
+    fn frame_actions_never_query_the_document() {
+        // Type/read must act on the element resolved by the shadow-piercing
+        // CDP DOM walk; a `querySelector` here could not see into shadow roots.
+        for action in [
+            FrameAction::Focus { clear: true },
+            FrameAction::Focus { clear: false },
+            FrameAction::Read(ReadMode::Html),
+            FrameAction::Read(ReadMode::Text),
+        ] {
+            let (js, _) = frame_action_call(&action);
+            assert!(!js.contains("querySelector"), "{js}");
+            assert!(!js.contains("document"), "{js}");
+        }
     }
 
     #[test]
