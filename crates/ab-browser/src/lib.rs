@@ -5,6 +5,7 @@
 //! can run the loop: `snapshot -> act -> verify`.
 
 pub mod mask;
+mod motion;
 pub mod pointer;
 mod profile_lock;
 pub mod snapshot;
@@ -1595,6 +1596,29 @@ impl Page {
         target_width: f64,
         buttons: u8,
     ) -> Result<()> {
+        if buttons == 0 {
+            // Free travel follows a human motion template (see motion.rs).
+            // Plan synchronously: ThreadRng must not live across an await.
+            let plan = motion::plan_travel(sx, sy, x, y, &mut thread_rng());
+            if let Some(steps) = plan {
+                for step in steps {
+                    let ms = step.delay_ms.round().clamp(0.0, 400.0) as u64;
+                    if ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                    }
+                    self.client
+                        .send_on(
+                            &self.session_id,
+                            "Input.dispatchMouseEvent",
+                            json!({ "type": "mouseMoved", "x": step.x.max(0.0), "y": step.y.max(0.0) }),
+                        )
+                        .await?;
+                }
+                *self.pointer.lock().unwrap() = Some((x, y));
+                return Ok(());
+            }
+        }
+
         let dx = x - sx;
         let dy = y - sy;
         let dist = (dx * dx + dy * dy).sqrt().max(1.0);
