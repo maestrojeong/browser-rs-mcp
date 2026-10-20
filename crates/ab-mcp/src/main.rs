@@ -863,6 +863,21 @@ struct IframeReadArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct IframeUploadArgs {
+    page: String,
+    /// CSS selector for the <iframe> element, or a " >> "-separated chain
+    /// for nested iframes. Same-origin and cross-origin frames are both
+    /// supported and require no special handling from the caller. See the
+    /// `frame_selector` known-limitations note above this struct.
+    frame_selector: String,
+    /// CSS selector for the file input inside the innermost iframe.
+    /// Resolution pierces open and closed shadow roots.
+    selector: String,
+    /// Absolute file paths to set on the file input.
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct RunCodeArgs {
     page: String,
     /// JavaScript body. Receives `args` (your provided array) in scope.
@@ -3006,6 +3021,25 @@ impl BrowserServer {
             .await
             .map_err(fail)?;
         Ok(ok(truncate_text(content, a.max_length.unwrap_or(100_000))))
+    }
+
+    /// Set files on a file input inside an iframe (by selector).
+    #[tool(
+        description = "Upload files to a file input inside a same-origin or cross-origin iframe by selector; pierces open and closed shadow roots; chain nested iframes in frame_selector with ' >> '"
+    )]
+    async fn browser_iframe_file_upload(
+        &self,
+        Parameters(a): Parameters<IframeUploadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let page = self.page_of(&a.page).await?;
+        page.iframe_upload_files(&a.frame_selector, &a.selector, &a.paths)
+            .await
+            .map_err(fail)?;
+        Ok(ok(format!(
+            "set {} file(s) inside iframe on {}",
+            a.paths.len(),
+            a.page
+        )))
     }
 
     /// Run arbitrary JavaScript with args (isolated world). Returns the result.

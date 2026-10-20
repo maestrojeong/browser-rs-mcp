@@ -2449,6 +2449,42 @@ impl Page {
         Ok(value.as_str().unwrap_or("").to_string())
     }
 
+    /// Set files on a file `<input>` inside a same-origin, cross-origin, or
+    /// OOPIF iframe. `frame_selector` may chain multiple CSS selectors with
+    /// `>>` to descend through nested iframes, matching `iframe_click`. The
+    /// target `<input type="file">` is resolved with the same shadow-piercing
+    /// CDP DOM walk used by `iframe_click`/`iframe_type`/`iframe_read`, so
+    /// inputs hidden behind open or closed shadow roots are supported too.
+    /// Unlike `upload_files`, `DOM.setFileInputFiles` is sent on the
+    /// innermost frame's own CDP session (not the top-level `self.session_id`)
+    /// — required for cross-origin/OOPIF frames, where the input's backend
+    /// node id only resolves against its owning frame's session.
+    pub async fn iframe_upload_files(
+        &self,
+        frame_selector: &str,
+        selector: &str,
+        paths: &[String],
+    ) -> Result<()> {
+        let chain = require_frame_chain(frame_selector)?;
+        let (context, _offset) = self.enter_frame_chain(&chain, false).await?;
+        let backend = self
+            .backend_for_piercing_selector(&context, selector)
+            .await?
+            .ok_or_else(|| {
+                BrowserError::Protocol(format!(
+                    "no element matches selector {selector:?} inside iframe"
+                ))
+            })?;
+        self.client
+            .send_on(
+                &context.session_id,
+                "DOM.setFileInputFiles",
+                json!({ "files": paths, "backendNodeId": backend }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Descend through `chain` (see `enter_frame_chain`), resolve `selector`
     /// in the innermost frame with the same shadow-piercing CDP DOM walk used
     /// by `iframe_click`/`iframe_hover`, and perform `action` on the resolved
