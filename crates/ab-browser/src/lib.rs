@@ -1775,8 +1775,8 @@ impl Page {
         // simulated-paste path (`Input.insertText`) — fall back to real
         // per-character keydown dispatch regardless of length. See
         // `focused_element_is_terminal_like`.
-        let force_char_mode = session_id == self.session_id
-            && self.focused_element_is_terminal_like().await;
+        let force_char_mode =
+            session_id == self.session_id && self.focused_element_is_terminal_like().await;
         if !force_char_mode
             && should_paste_text(
                 text,
@@ -4249,7 +4249,9 @@ async fn write_system_clipboard(text: &str) -> Result<()> {
         .await
         .map_err(|e| BrowserError::Protocol(format!("pbcopy did not exit: {e}")))?;
     if !status.success() {
-        return Err(BrowserError::Protocol(format!("pbcopy exited with {status}")));
+        return Err(BrowserError::Protocol(format!(
+            "pbcopy exited with {status}"
+        )));
     }
     Ok(())
 }
@@ -4267,8 +4269,7 @@ async fn read_system_clipboard() -> Option<String> {
 /// guaranteed to be installed.
 #[cfg(all(unix, not(target_os = "macos")))]
 async fn write_system_clipboard(text: &str) -> Result<()> {
-    let attempts: &[(&str, &[&str])] =
-        &[("xclip", &["-selection", "clipboard"]), ("wl-copy", &[])];
+    let attempts: &[(&str, &[&str])] = &[("xclip", &["-selection", "clipboard"]), ("wl-copy", &[])];
     let mut last_error = String::from("no clipboard tool attempted");
     for (cmd, args) in attempts {
         let spawned = Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn();
