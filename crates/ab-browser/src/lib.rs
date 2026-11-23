@@ -969,15 +969,34 @@ impl Page {
     }
 
     async fn wait_for_load(&self) -> Result<()> {
-        let mut rx = self.client.events();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let rx = self.client.events();
+        self.wait_for_load_on(rx).await
+    }
+
+    /// Wait for the page's load event on an already-subscribed event stream.
+    /// Once the DOM is ready (DOMContentLoaded), the load event gets at most
+    /// a few more seconds: heavy pages (ads, trackers, endless images) may not
+    /// fire it for tens of seconds although the document is usable, and every
+    /// act tool waited the full 30 s for them.
+    async fn wait_for_load_on(
+        &self,
+        mut rx: tokio::sync::broadcast::Receiver<CdpEvent>,
+    ) -> Result<()> {
+        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut dom_ready = false;
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Ok(ev)) => {
-                    if ev.session_id.as_deref() == Some(&self.session_id)
-                        && ev.method == "Page.loadEventFired"
-                    {
+                    if ev.session_id.as_deref() != Some(&self.session_id) {
+                        continue;
+                    }
+                    if ev.method == "Page.loadEventFired" {
                         return Ok(());
+                    }
+                    if ev.method == "Page.domContentEventFired" && !dom_ready {
+                        dom_ready = true;
+                        deadline =
+                            deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
                     }
                 }
                 Ok(Err(_)) => return Ok(()), // lagged/closed: proceed best-effort
@@ -1817,7 +1836,7 @@ impl Page {
                     .send_on(
                         session_id,
                         "Input.dispatchKeyEvent",
-                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 8 }),
+                        json!({ "type": "keyDown", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": modifier_native_key_code(16), "modifiers": 8 }),
                     )
                     .await?;
                 shift_held = true;
@@ -1913,7 +1932,7 @@ impl Page {
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyDown", "key": modifier_key, "code": modifier_code, "windowsVirtualKeyCode": modifier_vk, "nativeVirtualKeyCode": modifier_vk, "modifiers": modifiers }),
+                json!({ "type": "keyDown", "key": modifier_key, "code": modifier_code, "windowsVirtualKeyCode": modifier_vk, "nativeVirtualKeyCode": modifier_native_key_code(modifier_vk), "modifiers": modifiers }),
             )
             .await?;
         if typing_delay(cancel, sample_lognormal_ms(34.0, 0.28, 15, 90))
@@ -2002,7 +2021,7 @@ impl Page {
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": 0 }),
+                json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": modifier_native_key_code(vk), "modifiers": 0 }),
             )
             .await?;
         Ok(())
@@ -2013,7 +2032,7 @@ impl Page {
             .send_on(
                 session_id,
                 "Input.dispatchKeyEvent",
-                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": 0 }),
+                json!({ "type": "keyUp", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": modifier_native_key_code(16), "modifiers": 0 }),
             )
             .await?;
         Ok(())
@@ -2026,14 +2045,19 @@ impl Page {
         let mut rx = self.client.events();
         let sid = self.session_id.clone();
         // Phase 1: within a short window, detect whether a navigation began.
+        // A same-document navigation (history.pushState in a single-page app)
+        // never fires Page.loadEventFired, so it must not wait for a load: it
+        // takes the no-navigation path below (DOM grace + two paint frames).
+        // Waiting for the load there cost the full 30 s on every SPA link click.
         let detected = tokio::time::timeout(Duration::from_millis(400), async {
             loop {
                 match rx.recv().await {
                     Ok(ev) if ev.session_id.as_deref() == Some(&sid) => match ev.method.as_str() {
                         "Page.loadEventFired" => return Some(true),
-                        "Page.frameStartedLoading"
-                        | "Page.frameRequestedNavigation"
-                        | "Page.navigatedWithinDocument" => return Some(false),
+                        "Page.frameStartedLoading" | "Page.frameRequestedNavigation" => {
+                            return Some(false)
+                        }
+                        "Page.navigatedWithinDocument" => return None,
                         _ => {}
                     },
                     Ok(_) => {}
@@ -3253,6 +3277,10 @@ impl Page {
         let entries = hist.get("entries").and_then(Value::as_array);
         if let Some(entry) = entries.and_then(|e| e.get((idx - 1) as usize)) {
             if let Some(id) = entry.get("id").and_then(Value::as_i64) {
+                // Subscribe before navigating so no event is missed. Going back
+                // within a single-page app is a same-document navigation that
+                // never fires a load event: waiting for one cost 30 s.
+                let mut rx = self.client.events();
                 self.client
                     .send_on(
                         &self.session_id,
@@ -3260,7 +3288,40 @@ impl Page {
                         json!({ "entryId": id }),
                     )
                     .await?;
-                let _ = self.wait_for_load().await;
+                // Done when: the traversal stayed in the document, the frame
+                // stopped loading, or the load event fired. Nothing at all
+                // within 1 s: nothing is loading. Once the DOM is ready the
+                // load gets at most 5 s more (as in wait_for_load_on).
+                let sid = self.session_id.clone();
+                let mut deadline = tokio::time::Instant::now() + Duration::from_millis(1_000);
+                let mut loading = false;
+                let mut dom_ready = false;
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Ok(ev)) if ev.session_id.as_deref() == Some(&sid) => {
+                            match ev.method.as_str() {
+                                "Page.navigatedWithinDocument"
+                                | "Page.frameStoppedLoading"
+                                | "Page.loadEventFired" => break,
+                                "Page.frameStartedLoading" | "Page.frameRequestedNavigation"
+                                    if !loading =>
+                                {
+                                    loading = true;
+                                    deadline =
+                                        tokio::time::Instant::now() + Duration::from_secs(30);
+                                }
+                                "Page.domContentEventFired" if !dom_ready => {
+                                    dom_ready = true;
+                                    deadline = deadline
+                                        .min(tokio::time::Instant::now() + Duration::from_secs(5));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
+                }
             }
         }
         Ok(())
@@ -4002,6 +4063,25 @@ fn minimum_jerk(u: f64) -> f64 {
     10.0 * u.powi(3) - 15.0 * u.powi(4) + 6.0 * u.powi(5)
 }
 
+/// Native key code for a standalone modifier key event (Shift, Control, Alt,
+/// Meta).
+///
+/// On macOS Chrome reads `nativeVirtualKeyCode` as an AppKit key code and
+/// routes unhandled key-downs through the application menu's key
+/// equivalents. A modifier-only key-down carrying any non-zero native code
+/// (the Windows VK 16, or even the AppKit Shift code 56) is matched against
+/// the menu and opens `chrome://settings/help`, stealing focus from the page
+/// mid-typing whenever a shifted character (uppercase, `@`, ...) is typed.
+/// Real AppKit modifier presses arrive as `flagsChanged`, never as key-downs,
+/// so 0 is the faithful value there. Pages never observe this field.
+fn modifier_native_key_code(windows_vk: u32) -> u32 {
+    if cfg!(target_os = "macos") {
+        0
+    } else {
+        windows_vk
+    }
+}
+
 /// Whether producing this character on a US keyboard requires the Shift key
 /// (uppercase letters and the shifted symbol row). Typing e.g. '@' without a
 /// modifier is physically impossible for a human — a behavioral tell.
@@ -4572,6 +4652,14 @@ mod tests {
         assert_eq!(minimum_jerk(0.0), 0.0);
         assert_eq!(minimum_jerk(0.5), 0.5);
         assert_eq!(minimum_jerk(1.0), 1.0);
+    }
+
+    #[test]
+    fn modifier_events_carry_no_native_code_on_macos() {
+        for vk in [16, 17, 18, 91] {
+            let expected = if cfg!(target_os = "macos") { 0 } else { vk };
+            assert_eq!(super::modifier_native_key_code(vk), expected);
+        }
     }
 
     #[test]
