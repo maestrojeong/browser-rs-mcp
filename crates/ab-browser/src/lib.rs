@@ -23,6 +23,7 @@ use rand::thread_rng;
 use rand_distr::{Binomial, Distribution, LogNormal, Normal};
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -1529,6 +1530,28 @@ impl Page {
     }
 
     /// Resolve a backend node to a Runtime objectId (for JS calls on it).
+    /// Whether the focused element belongs to a canvas-rendered terminal
+    /// emulator (xterm.js is the overwhelming majority of these in the wild —
+    /// RunPod, Jupyter, code-server, GitHub Codespaces web terminals all
+    /// embed it). These emulators keep a decoy off-screen `<textarea>`
+    /// purely to capture OS keyboard/IME events and then drive the visible
+    /// `<canvas>` themselves; they don't rely on the browser's native text-
+    /// editing/composition pipeline the way a normal `<input>`/`<textarea>`
+    /// does. `dispatch_paste_cancellable`'s `Input.insertText` step never
+    /// reaches them, so long text silently vanishes. Only checks the
+    /// top-level page's focus — same documented limitation as
+    /// `reject_if_key_would_open_focused_select_popup`.
+    async fn focused_element_is_terminal_like(&self) -> bool {
+        self.evaluate(
+            "(() => { const el = document.activeElement; if (!el) return false; \
+             return !!(el.closest && el.closest('.xterm, .xterm-helper-textarea')); })()",
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    }
+
     async fn resolve_object(&self, backend: i64) -> Result<Option<String>> {
         let res = self
             .client
@@ -1748,11 +1771,19 @@ impl Page {
         }
 
         ensure_typing_active(cancel)?;
-        if should_paste_text(
-            text,
-            self.input_profile.paste_midpoint_chars,
-            self.input_profile.paste_slope,
-        ) {
+        // Canvas-based terminal emulators (xterm.js) don't react to the
+        // simulated-paste path (`Input.insertText`) — fall back to real
+        // per-character keydown dispatch regardless of length. See
+        // `focused_element_is_terminal_like`.
+        let force_char_mode = session_id == self.session_id
+            && self.focused_element_is_terminal_like().await;
+        if !force_char_mode
+            && should_paste_text(
+                text,
+                self.input_profile.paste_midpoint_chars,
+                self.input_profile.paste_slope,
+            )
+        {
             return self
                 .dispatch_paste_cancellable(session_id, text, cancel)
                 .await;
@@ -1859,6 +1890,19 @@ impl Page {
         ensure_typing_active(cancel)?;
         typing_delay(cancel, sample_lognormal_ms(145.0, 0.30, 60, 400)).await?;
 
+        // Prefer the real OS clipboard (see `write_system_clipboard`); if no
+        // clipboard tool is available in this environment, fall back to the
+        // old `Input.insertText` behavior rather than failing the whole
+        // typing action.
+        let previous_clipboard = read_system_clipboard().await;
+        let use_real_clipboard = match write_system_clipboard(text).await {
+            Ok(()) => true,
+            Err(error) => {
+                warn!("clipboard write failed, falling back to Input.insertText: {error}");
+                false
+            }
+        };
+
         #[cfg(target_os = "macos")]
         let (modifier_key, modifier_code, modifier_vk, modifiers) = ("Meta", "MetaLeft", 91, 4);
         #[cfg(not(target_os = "macos"))]
@@ -1878,6 +1922,9 @@ impl Page {
         {
             self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
                 .await?;
+            if use_real_clipboard {
+                restore_system_clipboard(previous_clipboard).await;
+            }
             return Err(BrowserError::TypingCancelled);
         }
 
@@ -1901,6 +1948,9 @@ impl Page {
         if cancelled {
             self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
                 .await?;
+            if use_real_clipboard {
+                restore_system_clipboard(previous_clipboard).await;
+            }
             return Err(BrowserError::TypingCancelled);
         }
 
@@ -1910,15 +1960,31 @@ impl Page {
         {
             self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
                 .await?;
+            if use_real_clipboard {
+                restore_system_clipboard(previous_clipboard).await;
+            }
             return Err(BrowserError::TypingCancelled);
         }
         self.release_modifier_on(session_id, modifier_key, modifier_code, modifier_vk)
             .await?;
-        ensure_typing_active(cancel)?;
 
-        // CDP cannot populate a trusted ClipboardEvent's clipboardData without
-        // an OS clipboard or observable main-world JS. insertText carries the
-        // content after the trusted shortcut while preserving stealth policy.
+        if use_real_clipboard {
+            // Give the browser a beat to actually process the paste before
+            // putting the user's previous clipboard contents back.
+            let _ = typing_delay(cancel, sample_lognormal_ms(60.0, 0.25, 30, 150)).await;
+            restore_system_clipboard(previous_clipboard).await;
+            return if cancel.is_cancelled() {
+                Err(BrowserError::TypingCancelled)
+            } else {
+                Ok(())
+            };
+        }
+
+        ensure_typing_active(cancel)?;
+        // No working clipboard tool in this environment: fall back to
+        // `Input.insertText`. This works for native `<input>`/`<textarea>`/
+        // `contenteditable` targets but is silently ignored by canvas-based
+        // terminal emulators (xterm.js) — see `write_system_clipboard`.
         self.client
             .send_on(session_id, "Input.insertText", json!({ "text": text }))
             .await?;
@@ -2801,18 +2867,24 @@ impl Page {
             .await?;
 
         let (event_key, code, vk) = key_definition(key);
+        // Printable single characters need `text`/`unmodifiedText` or Chromium
+        // never synthesizes a character insertion (no beforeinput/input
+        // fires) — control keys like Enter/Tab/Escape don't need it since
+        // consumers (e.g. xterm.js) branch on `code`/`key` for those instead.
+        let is_printable = event_key.chars().count() == 1;
+        let mut key_down_payload = json!({
+            "type": "keyDown",
+            "key": event_key,
+            "code": code,
+            "windowsVirtualKeyCode": vk,
+            "nativeVirtualKeyCode": vk,
+        });
+        if is_printable {
+            key_down_payload["text"] = json!(event_key);
+            key_down_payload["unmodifiedText"] = json!(event_key);
+        }
         self.client
-            .send_on(
-                session_id,
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyDown",
-                    "key": event_key,
-                    "code": code,
-                    "windowsVirtualKeyCode": vk,
-                    "nativeVirtualKeyCode": vk,
-                }),
-            )
+            .send_on(session_id, "Input.dispatchKeyEvent", key_down_payload)
             .await?;
         tokio::time::sleep(Duration::from_millis(sample_lognormal_ms(
             48.0, 0.35, 15, 150,
@@ -4150,6 +4222,142 @@ fn should_paste_text_for_draw(text: &str, midpoint_chars: f64, slope: f64, draw:
 fn should_paste_text(text: &str, midpoint_chars: f64, slope: f64) -> bool {
     let draw = rand::random::<f64>();
     should_paste_text_for_draw(text, midpoint_chars, slope, draw)
+}
+
+/// Write `text` to the real OS clipboard so a Cmd+V/Ctrl+V keyboard shortcut
+/// produces a genuinely trusted browser `paste` event with real
+/// `clipboardData` — the only thing canvas-rendered apps (xterm.js
+/// terminals, custom rich-text editors with their own paste handling)
+/// actually react to; `Input.insertText` silently misses them. Shelling out
+/// to the platform clipboard tool, instead of
+/// `navigator.clipboard.writeText()` via `Runtime.evaluate`, keeps this
+/// invisible to the page's own JS.
+#[cfg(target_os = "macos")]
+async fn write_system_clipboard(text: &str) -> Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| BrowserError::Protocol(format!("failed to spawn pbcopy: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| BrowserError::Protocol(format!("failed to write to pbcopy: {e}")))?;
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| BrowserError::Protocol(format!("pbcopy did not exit: {e}")))?;
+    if !status.success() {
+        return Err(BrowserError::Protocol(format!("pbcopy exited with {status}")));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn read_system_clipboard() -> Option<String> {
+    let output = Command::new("pbpaste").output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Tries `xclip` first, then `wl-copy` (Wayland), since neither is
+/// guaranteed to be installed.
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn write_system_clipboard(text: &str) -> Result<()> {
+    let attempts: &[(&str, &[&str])] =
+        &[("xclip", &["-selection", "clipboard"]), ("wl-copy", &[])];
+    let mut last_error = String::from("no clipboard tool attempted");
+    for (cmd, args) in attempts {
+        let spawned = Command::new(cmd).args(*args).stdin(Stdio::piped()).spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                last_error = format!("{cmd}: {e}");
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(text.as_bytes()).await {
+                last_error = format!("{cmd}: write failed: {e}");
+                continue;
+            }
+        }
+        match child.wait().await {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_error = format!("{cmd} exited with {status}"),
+            Err(e) => last_error = format!("{cmd} did not exit: {e}"),
+        }
+    }
+    Err(BrowserError::Protocol(format!(
+        "no working clipboard tool found (tried xclip, wl-copy): {last_error}"
+    )))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn read_system_clipboard() -> Option<String> {
+    let attempts: &[(&str, &[&str])] = &[
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("wl-paste", &["--no-newline"]),
+    ];
+    for (cmd, args) in attempts {
+        if let Ok(output) = Command::new(cmd).args(*args).output().await {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+async fn write_system_clipboard(text: &str) -> Result<()> {
+    // `Set-Clipboard` reads its value from argv, not stdin; escape embedded
+    // single quotes for the surrounding PowerShell literal.
+    let escaped = text.replace('\'', "''");
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("Set-Clipboard -Value '{escaped}'"),
+        ])
+        .status()
+        .await
+        .map_err(|e| BrowserError::Protocol(format!("Set-Clipboard failed: {e}")))?;
+    if !status.success() {
+        return Err(BrowserError::Protocol(format!(
+            "Set-Clipboard exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn read_system_clipboard() -> Option<String> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Best-effort restore; a failure here would otherwise surface as a
+/// confusing error on an action that already succeeded from the caller's
+/// point of view.
+async fn restore_system_clipboard(previous: Option<String>) {
+    let Some(previous) = previous else { return };
+    if let Err(error) = write_system_clipboard(&previous).await {
+        warn!("failed to restore previous clipboard contents: {error}");
+    }
 }
 
 fn ensure_typing_active(cancel: &CancellationToken) -> Result<()> {
